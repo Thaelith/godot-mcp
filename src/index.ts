@@ -151,6 +151,11 @@ class GodotServer {
     'include_groups': 'includeGroups',
     'include_resource_paths': 'includeResourcePaths',
     'include_info': 'includeInfo',
+    'asset_path': 'assetPath',
+    'asset_paths': 'assetPaths',
+    'include_dependencies': 'includeDependencies',
+    'include_scene_preview': 'includeScenePreview',
+    'include_placement_hints': 'includePlacementHints',
     'check_resources': 'checkResources',
     'check_scripts': 'checkScripts',
     'check_node_basics': 'checkNodeBasics',
@@ -347,6 +352,31 @@ class GodotServer {
   }
 
   /**
+   * Create a get_asset_info-specific JSON error response while preserving MCP text content style.
+   */
+  private createGetAssetInfoErrorResponse(error: string, message: string): any {
+    console.error(`[SERVER] get_asset_info error response: ${error}: ${message}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error,
+              message,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  /**
    * Validate a path to prevent path traversal attacks
    */
   private validatePath(path: string): boolean {
@@ -466,6 +496,54 @@ class GodotServer {
     const normalizedRelativePath = normalize(relativePath).replace(/\\/g, '/');
     if (normalizedRelativePath === '.' || normalizedRelativePath === '..' || normalizedRelativePath.startsWith('../')) {
       return { relativePath: '', resourcePath: '', error: 'scenePath must not escape the Godot project.' };
+    }
+
+    return {
+      relativePath: normalizedRelativePath,
+      resourcePath: `res://${normalizedRelativePath}`,
+    };
+  }
+
+  /**
+   * Convert a Godot asset path such as res://assets/player.png or assets/player.png
+   * into a safe project-relative path.
+   */
+  private normalizeAssetPath(assetPath: string): { relativePath: string; resourcePath: string; error?: string } {
+    const rawAssetPath = assetPath.trim();
+    if (!rawAssetPath) {
+      return { relativePath: '', resourcePath: '', error: 'assetPath must not be empty.' };
+    }
+
+    if (rawAssetPath.includes('\0')) {
+      return { relativePath: '', resourcePath: '', error: 'assetPath must not contain null bytes.' };
+    }
+
+    const slashNormalizedPath = rawAssetPath.replace(/\\/g, '/');
+    let relativePath = slashNormalizedPath;
+
+    if (slashNormalizedPath.startsWith('res://')) {
+      relativePath = slashNormalizedPath.slice('res://'.length);
+    } else if (slashNormalizedPath.includes('://')) {
+      return { relativePath: '', resourcePath: '', error: 'Only res:// asset paths are allowed.' };
+    }
+
+    if (
+      isAbsolute(relativePath) ||
+      relativePath.startsWith('/') ||
+      /^[A-Za-z]:[\\/]/.test(relativePath) ||
+      relativePath.includes(':')
+    ) {
+      return { relativePath: '', resourcePath: '', error: 'assetPath must be relative to the Godot project.' };
+    }
+
+    const pathParts = relativePath.split('/').filter(Boolean);
+    if (pathParts.length === 0 || pathParts.includes('..')) {
+      return { relativePath: '', resourcePath: '', error: 'assetPath must not escape the Godot project.' };
+    }
+
+    const normalizedRelativePath = normalize(relativePath).replace(/\\/g, '/');
+    if (normalizedRelativePath === '.' || normalizedRelativePath === '..' || normalizedRelativePath.startsWith('../')) {
+      return { relativePath: '', resourcePath: '', error: 'assetPath must not escape the Godot project.' };
     }
 
     return {
@@ -1217,6 +1295,47 @@ class GodotServer {
           },
         },
         {
+          name: 'get_asset_info',
+          description: 'Inspect specific Godot assets read-only and return metadata for scene placement',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Absolute path to the Godot project directory',
+              },
+              assetPath: {
+                type: 'string',
+                description: 'Single Godot asset path such as res://assets/player.png or assets/player.png',
+              },
+              assetPaths: {
+                type: 'array',
+                items: {
+                  type: 'string',
+                },
+                description: 'Multiple Godot asset paths to inspect',
+              },
+              includeDependencies: {
+                type: 'boolean',
+                description: 'Whether to include res:// dependency paths (default: true)',
+              },
+              includeScenePreview: {
+                type: 'boolean',
+                description: 'Whether to include lightweight scene previews for scenes/models (default: true)',
+              },
+              includePlacementHints: {
+                type: 'boolean',
+                description: 'Whether to include suggested node and placement hints (default: true)',
+              },
+              maxResults: {
+                type: 'number',
+                description: 'Maximum number of assets to return (default: 50, max: 200)',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
           name: 'read_scene_tree',
           description: 'Load a Godot scene read-only and return a structured scene tree description',
           inputSchema: {
@@ -1500,6 +1619,8 @@ class GodotServer {
           return await this.handleGetProjectInfo(request.params.arguments);
         case 'scan_assets':
           return await this.handleScanAssets(request.params.arguments);
+        case 'get_asset_info':
+          return await this.handleGetAssetInfo(request.params.arguments);
         case 'read_scene_tree':
           return await this.handleReadSceneTree(request.params.arguments);
         case 'validate_scene':
@@ -2326,6 +2447,241 @@ class GodotServer {
       return this.createScanAssetsErrorResponse(
         'SCAN_ASSETS_FAILED',
         `Failed to scan assets: ${error?.message || 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * Handle the get_asset_info tool
+   */
+  private async handleGetAssetInfo(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || typeof args.projectPath !== 'string') {
+      return this.createGetAssetInfoErrorResponse(
+        'MISSING_PROJECT_PATH',
+        'projectPath is required and must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    if (args.projectPath.includes('\0')) {
+      return this.createGetAssetInfoErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must not contain null bytes.'
+      );
+    }
+
+    if (!isAbsolute(args.projectPath)) {
+      return this.createGetAssetInfoErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    const requestedAssetPaths: string[] = [];
+    if (args.assetPath !== undefined) {
+      if (typeof args.assetPath !== 'string') {
+        return this.createGetAssetInfoErrorResponse(
+          'INVALID_ASSET_PATHS',
+          'assetPath must be a string when provided.'
+        );
+      }
+      requestedAssetPaths.push(args.assetPath);
+    }
+
+    if (args.assetPaths !== undefined) {
+      if (!Array.isArray(args.assetPaths)) {
+        return this.createGetAssetInfoErrorResponse(
+          'INVALID_ASSET_PATHS',
+          'assetPaths must be an array of strings when provided.'
+        );
+      }
+
+      for (const assetPath of args.assetPaths) {
+        if (typeof assetPath !== 'string') {
+          return this.createGetAssetInfoErrorResponse(
+            'INVALID_ASSET_PATHS',
+            'assetPaths must contain only strings.'
+          );
+        }
+        requestedAssetPaths.push(assetPath);
+      }
+    }
+
+    if (requestedAssetPaths.length === 0) {
+      return this.createGetAssetInfoErrorResponse(
+        'MISSING_ASSET_PATH',
+        'Provide assetPath, assetPaths, or both.'
+      );
+    }
+
+    const maxResultsRequested = args.maxResults !== undefined ? args.maxResults : null;
+    let maxResultsApplied = 50;
+    let maxResultsClamped = false;
+    if (args.maxResults !== undefined) {
+      if (typeof args.maxResults !== 'number' || !Number.isFinite(args.maxResults) || args.maxResults < 1) {
+        return this.createGetAssetInfoErrorResponse(
+          'INVALID_MAX_RESULTS',
+          'maxResults must be a number between 1 and 200.'
+        );
+      }
+
+      if (args.maxResults > 200) {
+        maxResultsApplied = 200;
+        maxResultsClamped = true;
+      } else {
+        maxResultsApplied = Math.floor(args.maxResults);
+      }
+    }
+
+    const booleanOptions = [
+      'includeDependencies',
+      'includeScenePreview',
+      'includePlacementHints',
+    ];
+    for (const option of booleanOptions) {
+      if (args[option] !== undefined && typeof args[option] !== 'boolean') {
+        return this.createGetAssetInfoErrorResponse(
+          'GET_ASSET_INFO_FAILED',
+          `${option} must be a boolean.`
+        );
+      }
+    }
+
+    const includeDependencies = args.includeDependencies !== undefined ? args.includeDependencies : true;
+    const includeScenePreview = args.includeScenePreview !== undefined ? args.includeScenePreview : true;
+    const includePlacementHints = args.includePlacementHints !== undefined ? args.includePlacementHints : true;
+
+    try {
+      const normalizedProjectPath = resolve(args.projectPath);
+      if (!existsSync(normalizedProjectPath)) {
+        return this.createGetAssetInfoErrorResponse(
+          'PROJECT_PATH_NOT_FOUND',
+          `Project path does not exist: ${args.projectPath}`
+        );
+      }
+
+      const projectStats = statSync(normalizedProjectPath);
+      if (!projectStats.isDirectory()) {
+        return this.createGetAssetInfoErrorResponse(
+          'PROJECT_PATH_NOT_DIRECTORY',
+          `Project path is not a directory: ${args.projectPath}`
+        );
+      }
+
+      const projectRoot = realpathSync(normalizedProjectPath);
+      const projectFile = join(projectRoot, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createGetAssetInfoErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          `Not a valid Godot project: ${args.projectPath}. The directory must contain a project.godot file.`
+        );
+      }
+
+      const seenAssetPaths = new Set<string>();
+      const normalizedAssetPaths: string[] = [];
+      for (const requestedPath of requestedAssetPaths) {
+        const assetPathResult = this.normalizeAssetPath(requestedPath);
+        if (assetPathResult.error) {
+          return this.createGetAssetInfoErrorResponse(
+            'UNSAFE_ASSET_PATH',
+            assetPathResult.error
+          );
+        }
+
+        if (seenAssetPaths.has(assetPathResult.resourcePath)) {
+          continue;
+        }
+        seenAssetPaths.add(assetPathResult.resourcePath);
+
+        const assetFilePath = resolve(projectRoot, assetPathResult.relativePath);
+        if (!this.isPathInside(projectRoot, assetFilePath)) {
+          return this.createGetAssetInfoErrorResponse(
+            'UNSAFE_ASSET_PATH',
+            'assetPath must stay inside the Godot project directory.'
+          );
+        }
+
+        if (!existsSync(assetFilePath)) {
+          return this.createGetAssetInfoErrorResponse(
+            'ASSET_PATH_NOT_FOUND',
+            `Asset file does not exist: ${assetPathResult.resourcePath}`
+          );
+        }
+
+        const assetStats = lstatSync(assetFilePath);
+        if (assetStats.isSymbolicLink()) {
+          return this.createGetAssetInfoErrorResponse(
+            'UNSAFE_ASSET_PATH',
+            'assetPath must not be a symbolic link.'
+          );
+        }
+
+        if (!assetStats.isFile()) {
+          return this.createGetAssetInfoErrorResponse(
+            'ASSET_PATH_NOT_FILE',
+            `Asset path is not a file: ${assetPathResult.resourcePath}`
+          );
+        }
+
+        const realAssetPath = realpathSync(assetFilePath);
+        if (!this.isPathInside(projectRoot, realAssetPath)) {
+          return this.createGetAssetInfoErrorResponse(
+            'UNSAFE_ASSET_PATH',
+            'assetPath must stay inside the Godot project directory.'
+          );
+        }
+
+        normalizedAssetPaths.push(assetPathResult.resourcePath);
+      }
+
+      if (normalizedAssetPaths.length === 0) {
+        return this.createGetAssetInfoErrorResponse(
+          'MISSING_ASSET_PATH',
+          'No asset paths remained after de-duplication.'
+        );
+      }
+
+      const selectedAssetPaths = normalizedAssetPaths.slice(0, maxResultsApplied);
+      const params = {
+        projectPath: projectRoot.replace(/\\/g, '/'),
+        assetPaths: selectedAssetPaths,
+        totalRequested: normalizedAssetPaths.length,
+        maxResultsRequested,
+        maxResultsApplied,
+        maxResultsClamped,
+        includeDependencies,
+        includeScenePreview,
+        includePlacementHints,
+      };
+
+      const { stdout, stderr } = await this.executeOperation('get_asset_info', params, projectRoot);
+      const parsedResult = this.extractLastJsonObject(stdout);
+
+      if (!parsedResult) {
+        const stderrText = stderr?.trim();
+        return this.createGetAssetInfoErrorResponse(
+          'GET_ASSET_INFO_FAILED',
+          stderrText
+            ? `Godot did not return valid JSON for get_asset_info. Stderr: ${stderrText}`
+            : 'Godot did not return valid JSON for get_asset_info.'
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(parsedResult, null, 2),
+          },
+        ],
+        ...(parsedResult.success === false ? { isError: true } : {}),
+      };
+    } catch (error: any) {
+      return this.createGetAssetInfoErrorResponse(
+        'GET_ASSET_INFO_FAILED',
+        `Failed to get asset info: ${error?.message || 'Unknown error'}`
       );
     }
   }

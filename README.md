@@ -70,6 +70,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 - **Project Analysis**: Get detailed information about project structure
 - **Asset Catalog**:
   - Scan project assets into a structured, read-only catalog for AI-safe asset selection
+  - Inspect selected assets for metadata, dependencies, scene previews, and placement hints
 - **Scene Inspection**:
   - Read existing scene trees into structured, read-only JSON before making changes
   - Validate scenes read-only and return structured issues before AI-assisted edits
@@ -129,6 +130,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "list_projects",
         "get_project_info",
         "scan_assets",
+        "get_asset_info",
         "read_scene_tree",
         "validate_scene",
         "create_scene",
@@ -320,6 +322,106 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Then call `scan_assets` from the inspector with a local Godot project path.
+
+### `get_asset_info`
+
+Inspects one or more specific Godot asset paths through Godot and returns structured metadata for scene generation and asset placement. This tool is read-only: it does not scan the project, save files, import or reimport assets, or modify project files.
+
+Single asset input:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "assetPath": "res://assets/player.png",
+  "includeDependencies": true,
+  "includeScenePreview": true,
+  "includePlacementHints": true,
+  "maxResults": 50
+}
+```
+
+Multiple asset input:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "assetPaths": [
+    "assets/player.png",
+    "res://scenes/Player.tscn"
+  ]
+}
+```
+
+`assetPath` and `assetPaths` can both be provided; paths are de-duplicated in order. Asset paths must stay inside the Godot project and can be written as either `res://assets/player.png` or `assets/player.png`. `maxResults` defaults to `50`; values below `1` return a validation error, and values above `200` are clamped to `200`.
+
+Supported asset types include images (`.png`, `.jpg`, `.jpeg`, `.webp`, `.svg`, `.tga`, `.bmp`), scenes (`.tscn`, `.scn`), models (`.glb`, `.gltf`, `.obj`, `.fbx`), audio (`.wav`, `.ogg`, `.mp3`), fonts (`.ttf`, `.otf`), scripts (`.gd`), and data/resources (`.json`, `.cfg`, `.tres`, `.res`).
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "totalRequested": 1,
+  "totalReturned": 1,
+  "maxResultsRequested": null,
+  "maxResultsApplied": 50,
+  "maxResultsClamped": false,
+  "assets": [
+    {
+      "success": true,
+      "path": "res://assets/player.png",
+      "fileName": "player.png",
+      "name": "player",
+      "extension": ".png",
+      "exists": true,
+      "resourceLoadable": true,
+      "resourceType": "CompressedTexture2D",
+      "assetType": "texture",
+      "metadata": {
+        "width": 32,
+        "height": 48,
+        "size": [32, 48],
+        "aspectRatio": 0.6666666667
+      },
+      "dependencies": [],
+      "scenePreview": null,
+      "placementHints": {
+        "suggestedNode": "Sprite2D",
+        "defaultAnchor": "bottom_center",
+        "suggestedPivot": "bottom_center",
+        "alignmentNotes": [
+          "Use Sprite2D.texture for this asset.",
+          "For character-like textures, consider bottom-center placement manually."
+        ]
+      }
+    }
+  ],
+  "summary": {
+    "texture": 1,
+    "scene": 0,
+    "model": 0,
+    "audio": 0,
+    "font": 0,
+    "script": 0,
+    "data": 0,
+    "resource": 0,
+    "unknown": 0,
+    "failed": 0
+  }
+}
+```
+
+Placement hints are suggestions for choosing node types and pivots. They are not exact positions and should not be treated as automatic placement instructions.
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Then call `get_asset_info` from the inspector with a local Godot project path and one or more existing asset paths.
 
 ## Scene Inspection
 

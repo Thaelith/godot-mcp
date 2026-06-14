@@ -28,7 +28,7 @@ func _init():
     
     var operation = args[operation_index]
     var params_json = args[params_index]
-    var quiet_output = operation == "read_scene_tree" or operation == "validate_scene"
+    var quiet_output = operation == "read_scene_tree" or operation == "validate_scene" or operation == "get_asset_info"
 
     if quiet_output:
         debug_mode = false
@@ -67,6 +67,8 @@ func _init():
             read_scene_tree(params)
         "validate_scene":
             validate_scene(params)
+        "get_asset_info":
+            get_asset_info(params)
         "create_scene":
             create_scene(params)
         "add_node":
@@ -804,6 +806,312 @@ func validate_scene(params):
     var result = finish_validation_result(project_path, scene_path, scene_root, issues, summary, limits, options)
     print(JSON.stringify(result))
     scene_root.free()
+
+func get_asset_type_from_extension(extension):
+    if [".png", ".jpg", ".jpeg", ".webp", ".svg", ".tga", ".bmp"].has(extension):
+        return "texture"
+    if [".tscn", ".scn"].has(extension):
+        return "scene"
+    if [".glb", ".gltf", ".obj", ".fbx"].has(extension):
+        return "model"
+    if [".wav", ".ogg", ".mp3"].has(extension):
+        return "audio"
+    if [".ttf", ".otf"].has(extension):
+        return "font"
+    if extension == ".gd":
+        return "script"
+    if [".json", ".cfg"].has(extension):
+        return "data"
+    if [".tres", ".res"].has(extension):
+        return "resource"
+    return "unknown"
+
+func create_empty_asset_info_summary():
+    return {
+        "texture": 0,
+        "scene": 0,
+        "model": 0,
+        "audio": 0,
+        "font": 0,
+        "script": 0,
+        "data": 0,
+        "resource": 0,
+        "unknown": 0,
+        "failed": 0
+    }
+
+func collect_asset_dependencies(asset_path):
+    var dependencies = []
+    var raw_dependencies = ResourceLoader.get_dependencies(asset_path)
+    for dependency in raw_dependencies:
+        var dependency_path = str(dependency)
+        if dependency_path.begins_with("res://") and not dependencies.has(dependency_path):
+            dependencies.append(dependency_path)
+    return dependencies
+
+func accumulate_scene_preview_node(node, preview):
+    var node_type = node.get_class()
+    preview["totalNodes"] += 1
+    if not preview["nodeTypes"].has(node_type):
+        preview["nodeTypes"][node_type] = 0
+    preview["nodeTypes"][node_type] += 1
+
+    for child in node.get_children():
+        accumulate_scene_preview_node(child, preview)
+
+func build_scene_preview_from_root(root):
+    var preview = {
+        "rootName": str(root.name),
+        "rootType": root.get_class(),
+        "childCount": root.get_child_count(),
+        "totalNodes": 0,
+        "nodeTypes": {}
+    }
+    accumulate_scene_preview_node(root, preview)
+    return preview
+
+func build_scene_preview_from_packed_scene(packed_scene):
+    if packed_scene == null or not (packed_scene is PackedScene):
+        return null
+
+    var scene_root = packed_scene.instantiate()
+    if scene_root == null:
+        return null
+
+    var preview = build_scene_preview_from_root(scene_root)
+    scene_root.free()
+    return preview
+
+func build_mesh_metadata(mesh):
+    var metadata = {
+        "meshType": mesh.get_class(),
+        "surfaceCount": mesh.get_surface_count()
+    }
+
+    var aabb = mesh.get_aabb()
+    metadata["approximateAabb"] = {
+        "position": vector3_to_array(aabb.position),
+        "size": vector3_to_array(aabb.size)
+    }
+    return metadata
+
+func build_texture_metadata(asset_path, resource):
+    var metadata = {}
+    var width = 0
+    var height = 0
+
+    if resource != null and resource is Texture2D:
+        width = resource.get_width()
+        height = resource.get_height()
+    else:
+        var image = Image.new()
+        if image.load(asset_path) == OK:
+            width = image.get_width()
+            height = image.get_height()
+
+    if width > 0 and height > 0:
+        metadata["width"] = width
+        metadata["height"] = height
+        metadata["size"] = [width, height]
+        metadata["aspectRatio"] = float(width) / float(height)
+
+    return metadata
+
+func build_audio_metadata(resource):
+    var metadata = {}
+    if resource != null and resource is AudioStream:
+        metadata["resourceType"] = resource.get_class()
+        if resource.has_method("get_length"):
+            metadata["length"] = resource.get_length()
+    return metadata
+
+func build_placement_hints(asset_path, asset_type, resource):
+    var lower_path = asset_path.to_lower()
+    var suggested_node = "unknown"
+    var default_anchor = "unknown"
+    var suggested_pivot = "unknown"
+    var notes = []
+
+    if asset_type == "texture":
+        suggested_node = "Sprite2D"
+        default_anchor = "center"
+        suggested_pivot = "center"
+        notes.append("Use Sprite2D.texture for this asset.")
+        if lower_path.contains("character") or lower_path.contains("player") or lower_path.contains("npc") or lower_path.contains("enemy"):
+            default_anchor = "bottom_center"
+            suggested_pivot = "bottom_center"
+            notes.append("For character-like textures, consider bottom-center placement manually.")
+        elif lower_path.contains("ui") or lower_path.contains("button") or lower_path.contains("panel") or lower_path.contains("icon") or lower_path.contains("hud") or lower_path.contains("menu"):
+            notes.append("For UI textures, consider TextureRect if the asset is used in a Control layout.")
+    elif asset_type == "scene":
+        suggested_node = "PackedScene instance"
+        default_anchor = "scene_root"
+        suggested_pivot = "scene_root"
+        notes.append("Instantiate this PackedScene as a scene child.")
+    elif asset_type == "model":
+        if resource != null and resource is PackedScene:
+            suggested_node = "PackedScene instance"
+            default_anchor = "scene_root"
+            suggested_pivot = "scene_root"
+            notes.append("Instantiate this model scene as a child in 3D space.")
+        else:
+            suggested_node = "MeshInstance3D"
+            default_anchor = "origin"
+            suggested_pivot = "origin"
+            notes.append("Assign this mesh to MeshInstance3D.mesh.")
+    elif asset_type == "audio":
+        suggested_node = "AudioStreamPlayer"
+        default_anchor = "none"
+        suggested_pivot = "none"
+        notes.append("Assign this stream to an AudioStreamPlayer node.")
+    elif asset_type == "font":
+        suggested_node = "Label"
+        default_anchor = "baseline"
+        suggested_pivot = "label"
+        notes.append("Use this font with Label or other Control text theme settings.")
+    elif asset_type == "script":
+        suggested_node = "Node"
+        default_anchor = "none"
+        suggested_pivot = "none"
+        notes.append("Attach this script to a compatible node type; do not instantiate script paths blindly.")
+
+    return {
+        "suggestedNode": suggested_node,
+        "defaultAnchor": default_anchor,
+        "suggestedPivot": suggested_pivot,
+        "alignmentNotes": notes
+    }
+
+func build_asset_failure(asset_path, asset_type, error_code, message, exists):
+    var file_name = asset_path.get_file()
+    var extension = "." + asset_path.get_extension().to_lower()
+    return {
+        "success": false,
+        "path": asset_path,
+        "fileName": file_name,
+        "name": file_name.get_basename(),
+        "extension": extension,
+        "exists": exists,
+        "resourceLoadable": false,
+        "assetType": asset_type,
+        "error": error_code,
+        "message": message
+    }
+
+func inspect_asset(asset_path, options):
+    var file_name = asset_path.get_file()
+    var extension = "." + asset_path.get_extension().to_lower()
+    var asset_type = get_asset_type_from_extension(extension)
+
+    if not FileAccess.file_exists(asset_path):
+        return build_asset_failure(asset_path, asset_type, "ASSET_NOT_FOUND", "Asset file does not exist.", false)
+
+    var resource_exists = ResourceLoader.exists(asset_path)
+    var resource = ResourceLoader.load(asset_path)
+    if resource == null:
+        if asset_type == "texture":
+            var fallback_metadata = build_texture_metadata(asset_path, null)
+            if fallback_metadata.has("width") and fallback_metadata.has("height"):
+                var fallback_placement_hints = null
+                if options["includePlacementHints"]:
+                    fallback_placement_hints = build_placement_hints(asset_path, asset_type, null)
+                return {
+                    "success": true,
+                    "path": asset_path,
+                    "fileName": file_name,
+                    "name": file_name.get_basename(),
+                    "extension": extension,
+                    "exists": true,
+                    "resourceLoadable": false,
+                    "resourceType": "Image",
+                    "assetType": asset_type,
+                    "metadata": fallback_metadata,
+                    "dependencies": [],
+                    "scenePreview": null,
+                    "placementHints": fallback_placement_hints
+                }
+        return build_asset_failure(asset_path, asset_type, "ASSET_LOAD_FAILED", "Asset could not be loaded by Godot ResourceLoader.", true)
+
+    var metadata = {}
+    if asset_type == "texture":
+        metadata = build_texture_metadata(asset_path, resource)
+    elif asset_type == "model" and resource is Mesh:
+        metadata = build_mesh_metadata(resource)
+    elif asset_type == "audio":
+        metadata = build_audio_metadata(resource)
+    elif resource != null:
+        metadata["resourceType"] = resource.get_class()
+
+    if resource != null and not metadata.has("resourceType"):
+        metadata["resourceType"] = resource.get_class()
+
+    var scene_preview = null
+    if options["includeScenePreview"]:
+        if asset_type == "scene" and resource is PackedScene:
+            scene_preview = build_scene_preview_from_packed_scene(resource)
+        elif asset_type == "model" and resource is PackedScene:
+            scene_preview = build_scene_preview_from_packed_scene(resource)
+
+    var dependencies = []
+    if options["includeDependencies"]:
+        dependencies = collect_asset_dependencies(asset_path)
+
+    var placement_hints = null
+    if options["includePlacementHints"]:
+        placement_hints = build_placement_hints(asset_path, asset_type, resource)
+
+    return {
+        "success": true,
+        "path": asset_path,
+        "fileName": file_name,
+        "name": file_name.get_basename(),
+        "extension": extension,
+        "exists": true,
+        "resourceLoadable": resource != null,
+        "resourceType": resource.get_class(),
+        "assetType": asset_type,
+        "metadata": metadata,
+        "dependencies": dependencies,
+        "scenePreview": scene_preview,
+        "placementHints": placement_hints
+    }
+
+func get_asset_info(params):
+    if not params.has("asset_paths"):
+        print_json_error("MISSING_ASSET_PATH", "asset_paths is required.")
+        return
+
+    var asset_paths = params.asset_paths
+    var options = {
+        "includeDependencies": params.include_dependencies if params.has("include_dependencies") else true,
+        "includeScenePreview": params.include_scene_preview if params.has("include_scene_preview") else true,
+        "includePlacementHints": params.include_placement_hints if params.has("include_placement_hints") else true
+    }
+
+    var assets = []
+    var summary = create_empty_asset_info_summary()
+    for asset_path in asset_paths:
+        var normalized_asset_path = normalize_resource_scene_path(asset_path)
+        var item = inspect_asset(normalized_asset_path, options)
+        assets.append(item)
+        if item["success"]:
+            summary[item["assetType"]] += 1
+        else:
+            summary["failed"] += 1
+
+    var result = {
+        "success": true,
+        "projectPath": params.project_path if params.has("project_path") else ProjectSettings.globalize_path("res://"),
+        "totalRequested": params.total_requested if params.has("total_requested") else asset_paths.size(),
+        "totalReturned": assets.size(),
+        "maxResultsRequested": params.max_results_requested if params.has("max_results_requested") else null,
+        "maxResultsApplied": params.max_results_applied if params.has("max_results_applied") else assets.size(),
+        "maxResultsClamped": params.max_results_clamped if params.has("max_results_clamped") else false,
+        "assets": assets,
+        "summary": summary
+    }
+
+    print(JSON.stringify(result))
 
 # Create a new scene with a specified root node type
 func create_scene(params):
