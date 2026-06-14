@@ -26,16 +26,21 @@ func _init():
         log_error("Not enough command-line arguments provided.")
         quit(1)
     
+    var operation = args[operation_index]
+    var params_json = args[params_index]
+    var quiet_output = operation == "read_scene_tree"
+
+    if quiet_output:
+        debug_mode = false
+
     # Log all arguments for debugging
     log_debug("All arguments: " + str(args))
     log_debug("Script index: " + str(script_index))
     log_debug("Operation index: " + str(operation_index))
     log_debug("Params index: " + str(params_index))
-    
-    var operation = args[operation_index]
-    var params_json = args[params_index]
-    
-    log_info("Operation: " + operation)
+
+    if not quiet_output:
+        log_info("Operation: " + operation)
     log_debug("Params JSON: " + params_json)
     
     # Parse JSON using Godot 4.x API
@@ -54,9 +59,12 @@ func _init():
         log_error("Failed to parse JSON parameters: " + params_json)
         quit(1)
     
-    log_info("Executing operation: " + operation)
+    if not quiet_output:
+        log_info("Executing operation: " + operation)
     
     match operation:
+        "read_scene_tree":
+            read_scene_tree(params)
         "create_scene":
             create_scene(params)
         "add_node":
@@ -160,6 +168,254 @@ func instantiate_class(name_of_class):
         print("Successfully instantiated class: " + name_of_class + " of type: " + result.get_class())
     
     return result
+
+func print_json_error(error_code, message):
+    print(JSON.stringify({
+        "success": false,
+        "error": error_code,
+        "message": message
+    }))
+
+func vector2_to_array(value):
+    return [value.x, value.y]
+
+func vector3_to_array(value):
+    return [value.x, value.y, value.z]
+
+func normalize_resource_scene_path(scene_path):
+    var normalized_path = scene_path
+    if not normalized_path.begins_with("res://"):
+        normalized_path = "res://" + normalized_path
+    return normalized_path
+
+func get_scene_node_path(node, root):
+    if node == root:
+        return str(root.name)
+    return str(root.name) + "/" + str(root.get_path_to(node))
+
+func add_resource_reference(resources, summary, property_name, resource):
+    if resource == null or not (resource is Resource):
+        return
+    if resource.resource_path.is_empty():
+        return
+
+    resources.append({
+        "property": property_name,
+        "type": resource.get_class(),
+        "path": resource.resource_path
+    })
+    summary["resourceReferenceCount"] += 1
+
+func get_script_info(node):
+    var script = node.get_script()
+    if script == null:
+        return null
+
+    var script_class_name = null
+    if script.has_method("get_global_name"):
+        var global_name = script.get_global_name()
+        if str(global_name) != "":
+            script_class_name = str(global_name)
+
+    return {
+        "path": script.resource_path if not script.resource_path.is_empty() else null,
+        "className": script_class_name
+    }
+
+func get_node_groups(node):
+    var groups = []
+    for group_name in node.get_groups():
+        var group_string = str(group_name)
+        if group_string.begins_with("_"):
+            continue
+        groups.append(group_string)
+    return groups
+
+func get_common_node_properties(node, include_resource_paths):
+    var properties = {}
+
+    if node is Node2D:
+        properties["position"] = vector2_to_array(node.position)
+        properties["rotation"] = node.rotation
+        properties["scale"] = vector2_to_array(node.scale)
+        properties["visible"] = node.visible
+        properties["z_index"] = node.z_index
+
+    if node is Control:
+        properties["position"] = vector2_to_array(node.position)
+        properties["size"] = vector2_to_array(node.size)
+        properties["scale"] = vector2_to_array(node.scale)
+        properties["visible"] = node.visible
+        properties["anchors"] = {
+            "left": node.anchor_left,
+            "top": node.anchor_top,
+            "right": node.anchor_right,
+            "bottom": node.anchor_bottom
+        }
+        properties["offsets"] = {
+            "left": node.offset_left,
+            "top": node.offset_top,
+            "right": node.offset_right,
+            "bottom": node.offset_bottom
+        }
+
+    if node is Node3D:
+        properties["position"] = vector3_to_array(node.position)
+        properties["rotation"] = vector3_to_array(node.rotation)
+        properties["scale"] = vector3_to_array(node.scale)
+        properties["visible"] = node.visible
+
+    if node is Sprite2D:
+        if include_resource_paths and node.texture != null and not node.texture.resource_path.is_empty():
+            properties["texture"] = node.texture.resource_path
+        properties["centered"] = node.centered
+        properties["offset"] = vector2_to_array(node.offset)
+        properties["flip_h"] = node.flip_h
+        properties["flip_v"] = node.flip_v
+
+    if node is CollisionShape2D:
+        properties["disabled"] = node.disabled
+        if node.shape != null:
+            properties["shapeType"] = node.shape.get_class()
+            if include_resource_paths and not node.shape.resource_path.is_empty():
+                properties["shape"] = node.shape.resource_path
+
+    if node is Camera2D:
+        properties["enabled"] = node.enabled
+        properties["zoom"] = vector2_to_array(node.zoom)
+
+    if node is AudioStreamPlayer:
+        if include_resource_paths and node.stream != null and not node.stream.resource_path.is_empty():
+            properties["stream"] = node.stream.resource_path
+        properties["volume_db"] = node.volume_db
+        properties["autoplay"] = node.autoplay
+
+    if node is AudioStreamPlayer2D:
+        if include_resource_paths and node.stream != null and not node.stream.resource_path.is_empty():
+            properties["stream"] = node.stream.resource_path
+        properties["volume_db"] = node.volume_db
+        properties["autoplay"] = node.autoplay
+
+    return properties
+
+func collect_node_resources(node, summary):
+    var resources = []
+
+    if node is Sprite2D:
+        add_resource_reference(resources, summary, "texture", node.texture)
+    if node is TextureRect:
+        add_resource_reference(resources, summary, "texture", node.texture)
+    if node is CollisionShape2D:
+        add_resource_reference(resources, summary, "shape", node.shape)
+    if node is MeshInstance3D:
+        add_resource_reference(resources, summary, "mesh", node.mesh)
+    if node is AudioStreamPlayer:
+        add_resource_reference(resources, summary, "stream", node.stream)
+    if node is AudioStreamPlayer2D:
+        add_resource_reference(resources, summary, "stream", node.stream)
+
+    return resources
+
+func build_scene_tree_node(node, root, depth, max_depth, options, summary, limits):
+    var node_type = node.get_class()
+    summary["totalNodes"] += 1
+    summary["maxDepthReached"] = max(summary["maxDepthReached"], depth)
+
+    if not summary["nodeTypes"].has(node_type):
+        summary["nodeTypes"][node_type] = 0
+    summary["nodeTypes"][node_type] += 1
+
+    var script_info = get_script_info(node)
+    if script_info != null:
+        summary["scriptCount"] += 1
+
+    var node_data = {
+        "name": str(node.name),
+        "type": node_type,
+        "path": get_scene_node_path(node, root),
+        "childCount": node.get_child_count(),
+        "children": []
+    }
+
+    if options["includeScripts"]:
+        node_data["script"] = script_info
+
+    if options["includeGroups"]:
+        node_data["groups"] = get_node_groups(node)
+
+    if options["includeProperties"]:
+        node_data["properties"] = get_common_node_properties(node, options["includeResourcePaths"])
+
+    if options["includeResourcePaths"]:
+        node_data["resources"] = collect_node_resources(node, summary)
+
+    if depth >= max_depth:
+        if node.get_child_count() > 0:
+            limits["depthTruncated"] = true
+        return node_data
+
+    for child in node.get_children():
+        node_data["children"].append(build_scene_tree_node(child, root, depth + 1, max_depth, options, summary, limits))
+
+    return node_data
+
+func read_scene_tree(params):
+    if not params.has("scene_path"):
+        print_json_error("MISSING_SCENE_PATH", "scene_path is required.")
+        return
+
+    var scene_path = normalize_resource_scene_path(params.scene_path)
+    var max_depth = params.max_depth if params.has("max_depth") else 20
+    var max_depth_requested = params.max_depth_requested if params.has("max_depth_requested") else null
+    var max_depth_clamped = params.max_depth_clamped if params.has("max_depth_clamped") else false
+
+    var options = {
+        "includeProperties": params.include_properties if params.has("include_properties") else true,
+        "includeScripts": params.include_scripts if params.has("include_scripts") else true,
+        "includeGroups": params.include_groups if params.has("include_groups") else true,
+        "includeResourcePaths": params.include_resource_paths if params.has("include_resource_paths") else true
+    }
+
+    if not FileAccess.file_exists(scene_path):
+        print_json_error("SCENE_PATH_NOT_FOUND", "Scene file does not exist: " + scene_path)
+        return
+
+    var scene_resource = ResourceLoader.load(scene_path)
+    if scene_resource == null or not (scene_resource is PackedScene):
+        print_json_error("SCENE_LOAD_FAILED", "Failed to load scene as PackedScene: " + scene_path)
+        return
+
+    var scene_root = scene_resource.instantiate()
+    if scene_root == null:
+        print_json_error("SCENE_INSTANTIATE_FAILED", "Failed to instantiate scene: " + scene_path)
+        return
+
+    var summary = {
+        "totalNodes": 0,
+        "maxDepthReached": 0,
+        "nodeTypes": {},
+        "scriptCount": 0,
+        "resourceReferenceCount": 0
+    }
+    var limits = {
+        "maxDepthRequested": max_depth_requested,
+        "maxDepthApplied": max_depth,
+        "maxDepthClamped": max_depth_clamped,
+        "depthTruncated": false
+    }
+
+    var root_data = build_scene_tree_node(scene_root, scene_root, 0, max_depth, options, summary, limits)
+    var result = {
+        "success": true,
+        "projectPath": params.project_path if params.has("project_path") else ProjectSettings.globalize_path("res://"),
+        "scenePath": scene_path,
+        "root": root_data,
+        "summary": summary,
+        "limits": limits
+    }
+
+    print(JSON.stringify(result))
+    scene_root.free()
 
 # Create a new scene with a specified root node type
 func create_scene(params):

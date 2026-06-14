@@ -70,6 +70,8 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 - **Project Analysis**: Get detailed information about project structure
 - **Asset Catalog**:
   - Scan project assets into a structured, read-only catalog for AI-safe asset selection
+- **Scene Inspection**:
+  - Read existing scene trees into structured, read-only JSON before making changes
 - **Scene Management**:
   - Create new scenes with specified root node types
   - Add nodes to existing scenes with customizable properties
@@ -126,6 +128,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "list_projects",
         "get_project_info",
         "scan_assets",
+        "read_scene_tree",
         "create_scene",
         "add_node",
         "load_sprite",
@@ -315,6 +318,81 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Then call `scan_assets` from the inspector with a local Godot project path.
+
+## Scene Inspection
+
+### `read_scene_tree`
+
+Loads a Godot scene through Godot in headless mode and returns a structured, read-only description of the instantiated scene tree. This tool does not save, edit, create, import, or modify scene files.
+
+Input example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Main.tscn",
+  "maxDepth": 20,
+  "includeProperties": true,
+  "includeScripts": true,
+  "includeGroups": true,
+  "includeResourcePaths": true
+}
+```
+
+`scenePath` can be written as `res://scenes/Main.tscn` or `scenes/Main.tscn`. It must stay inside the Godot project and must point to a `.tscn` or `.scn` file.
+
+`maxDepth` defaults to `20`. Values below `1` return a validation error, and values above `100` are clamped to `100`. The include flags default to `true` and control whether common safe properties, script references, group names, and resource paths are included.
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Main.tscn",
+  "root": {
+    "name": "Main",
+    "type": "Node2D",
+    "path": "Main",
+    "childCount": 1,
+    "script": null,
+    "groups": [],
+    "properties": {
+      "position": [0, 0],
+      "rotation": 0,
+      "scale": [1, 1],
+      "visible": true,
+      "z_index": 0
+    },
+    "resources": [],
+    "children": []
+  },
+  "summary": {
+    "totalNodes": 1,
+    "maxDepthReached": 0,
+    "nodeTypes": {
+      "Node2D": 1
+    },
+    "scriptCount": 0,
+    "resourceReferenceCount": 0
+  },
+  "limits": {
+    "maxDepthRequested": 20,
+    "maxDepthApplied": 20,
+    "maxDepthClamped": false,
+    "depthTruncated": false
+  }
+}
+```
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Then call `read_scene_tree` from the inspector with a local Godot project path and an existing scene file.
 
 ## Troubleshooting
 
