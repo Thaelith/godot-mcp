@@ -68,6 +68,8 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 - **Get Godot Version**: Retrieve the installed Godot version
 - **List Godot Projects**: Find Godot projects in a specified directory
 - **Project Analysis**: Get detailed information about project structure
+- **Asset Catalog**:
+  - Scan project assets into a structured, read-only catalog for AI-safe asset selection
 - **Scene Management**:
   - Create new scenes with specified root node types
   - Add nodes to existing scenes with customizable properties
@@ -123,6 +125,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "get_godot_version",
         "list_projects",
         "get_project_info",
+        "scan_assets",
         "create_scene",
         "add_node",
         "load_sprite",
@@ -224,6 +227,71 @@ The Godot MCP server uses a bundled GDScript approach for complex operations:
 2. **Bundled Operations Script**: Complex operations like creating scenes or adding nodes use a single, comprehensive GDScript file (`godot_operations.gd`) that handles all operations.
 
 The bundled script accepts operation type and parameters as JSON, allowing for flexible and dynamic operation execution without generating temporary files for each operation.
+
+## Asset Catalog
+
+### `scan_assets`
+
+Scans a Godot project for usable assets and returns a structured catalog that an AI assistant can use to choose assets for scenes. This tool is read-only: it does not execute, parse, or modify project files.
+
+Input example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "root": "res://assets",
+  "includeExtensions": [".png", ".tscn", ".gd"],
+  "excludeDirs": [".git", ".import", ".godot", "addons", "node_modules"],
+  "maxResults": 100
+}
+```
+
+If `root` is omitted, the tool scans `res://assets`. If that folder does not exist, it safely falls back to scanning the project root while still skipping ignored folders. `root` must stay inside the Godot project and can be written as either `res://assets` or `assets`.
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scanRoot": "res://assets",
+  "totalFound": 1,
+  "truncated": false,
+  "assets": [
+    {
+      "path": "res://assets/characters/player.png",
+      "fileName": "player.png",
+      "name": "player",
+      "extension": ".png",
+      "assetType": "texture",
+      "category": "character",
+      "suggestedNode": "Sprite2D",
+      "sizeBytes": 12345,
+      "relativeDirectory": "assets/characters"
+    }
+  ],
+  "summary": {
+    "texture": 1,
+    "scene": 0,
+    "model": 0,
+    "audio": 0,
+    "font": 0,
+    "script": 0,
+    "data": 0,
+    "resource": 0,
+    "unknown": 0
+  }
+}
+```
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Then call `scan_assets` from the inspector with a local Godot project path.
 
 ## Troubleshooting
 

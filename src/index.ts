@@ -8,8 +8,8 @@
  */
 
 import { fileURLToPath } from 'url';
-import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
+import { join, dirname, basename, normalize, resolve, relative, isAbsolute, extname, parse } from 'path';
+import { existsSync, readdirSync, mkdirSync, statSync, lstatSync, realpathSync } from 'fs';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -58,6 +58,59 @@ interface OperationParams {
   [key: string]: any;
 }
 
+type AssetType = 'texture' | 'scene' | 'model' | 'audio' | 'font' | 'script' | 'data' | 'resource' | 'unknown';
+type AssetCategory = 'character' | 'prop' | 'environment' | 'ui' | 'tilemap' | 'audio' | 'font' | 'scene' | 'script' | 'data' | 'material' | 'unknown';
+
+interface AssetCatalogItem {
+  path: string;
+  fileName: string;
+  name: string;
+  extension: string;
+  assetType: AssetType;
+  category: AssetCategory;
+  suggestedNode: string;
+  sizeBytes: number;
+  relativeDirectory: string;
+}
+
+const DEFAULT_ASSET_EXTENSIONS = [
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.webp',
+  '.svg',
+  '.tga',
+  '.bmp',
+  '.tscn',
+  '.scn',
+  '.glb',
+  '.gltf',
+  '.obj',
+  '.fbx',
+  '.wav',
+  '.ogg',
+  '.mp3',
+  '.ttf',
+  '.otf',
+  '.json',
+  '.cfg',
+  '.tres',
+  '.res',
+  '.gd',
+];
+
+const DEFAULT_EXCLUDED_ASSET_DIRS = [
+  '.git',
+  '.import',
+  '.godot',
+  'addons',
+  'node_modules',
+  'build',
+  'dist',
+  '.tmp',
+  '.cache',
+];
+
 /**
  * Main server class for the Godot MCP server
  */
@@ -89,6 +142,9 @@ class GodotServer {
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
+    'include_extensions': 'includeExtensions',
+    'exclude_dirs': 'excludeDirs',
+    'max_results': 'maxResults',
   };
 
   /**
@@ -222,6 +278,203 @@ class GodotServer {
   private validateClassName(name: string): boolean {
     if (!name) return false;
     return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
+  }
+
+  /**
+   * Ensure a resolved child path remains within the project root.
+   */
+  private isPathInside(parentPath: string, childPath: string): boolean {
+    const relativePath = relative(parentPath, childPath);
+    return relativePath === '' || (!relativePath.startsWith('..') && !isAbsolute(relativePath));
+  }
+
+  /**
+   * Convert a Godot root path such as res://assets or assets into a safe project-relative path.
+   */
+  private normalizeScanRoot(root: string): { relativeRoot: string; scanRoot: string; error?: string } {
+    const rawRoot = root.trim();
+    if (!rawRoot) {
+      return { relativeRoot: 'assets', scanRoot: 'res://assets' };
+    }
+
+    if (rawRoot.includes('\0')) {
+      return { relativeRoot: '', scanRoot: '', error: 'Unsafe root path: null bytes are not allowed' };
+    }
+
+    const slashNormalizedRoot = rawRoot.replace(/\\/g, '/');
+    let relativeRoot = slashNormalizedRoot;
+
+    if (slashNormalizedRoot.startsWith('res://')) {
+      relativeRoot = slashNormalizedRoot.slice('res://'.length);
+    } else if (slashNormalizedRoot.includes('://')) {
+      return { relativeRoot: '', scanRoot: '', error: 'Unsafe root path: only res:// project paths are allowed' };
+    }
+
+    if (
+      isAbsolute(relativeRoot) ||
+      relativeRoot.startsWith('/') ||
+      /^[A-Za-z]:[\\/]/.test(relativeRoot) ||
+      relativeRoot.includes(':')
+    ) {
+      return { relativeRoot: '', scanRoot: '', error: 'Unsafe root path: root must be relative to the Godot project' };
+    }
+
+    const rootParts = relativeRoot.split('/').filter(Boolean);
+    if (rootParts.includes('..')) {
+      return { relativeRoot: '', scanRoot: '', error: 'Unsafe root path: traversal outside the project is not allowed' };
+    }
+
+    const normalizedRelativeRoot = normalize(relativeRoot).replace(/\\/g, '/');
+    const finalRelativeRoot = normalizedRelativeRoot === '.' ? '' : normalizedRelativeRoot;
+
+    if (finalRelativeRoot === '..' || finalRelativeRoot.startsWith('../')) {
+      return { relativeRoot: '', scanRoot: '', error: 'Unsafe root path: traversal outside the project is not allowed' };
+    }
+
+    return {
+      relativeRoot: finalRelativeRoot,
+      scanRoot: finalRelativeRoot ? `res://${finalRelativeRoot}` : 'res://',
+    };
+  }
+
+  private normalizeExtensions(includeExtensions: unknown): { extensions: Set<string>; error?: string } {
+    const sourceExtensions = includeExtensions === undefined ? DEFAULT_ASSET_EXTENSIONS : includeExtensions;
+    if (!Array.isArray(sourceExtensions)) {
+      return { extensions: new Set(), error: 'includeExtensions must be an array of file extensions' };
+    }
+
+    const extensions = new Set<string>();
+    for (const extension of sourceExtensions) {
+      if (typeof extension !== 'string' || !extension.trim()) {
+        return { extensions: new Set(), error: 'includeExtensions must contain non-empty strings' };
+      }
+      const normalizedExtension = extension.trim().toLowerCase();
+      extensions.add(normalizedExtension.startsWith('.') ? normalizedExtension : `.${normalizedExtension}`);
+    }
+
+    return { extensions };
+  }
+
+  private normalizeExcludedDirs(excludeDirs: unknown): { directories: Set<string>; error?: string } {
+    const sourceDirs = excludeDirs === undefined ? DEFAULT_EXCLUDED_ASSET_DIRS : excludeDirs;
+    if (!Array.isArray(sourceDirs)) {
+      return { directories: new Set(), error: 'excludeDirs must be an array of directory names' };
+    }
+
+    const directories = new Set<string>();
+    for (const directory of sourceDirs) {
+      if (typeof directory !== 'string' || !directory.trim()) {
+        return { directories: new Set(), error: 'excludeDirs must contain non-empty strings' };
+      }
+      directories.add(directory.trim().toLowerCase());
+    }
+
+    return { directories };
+  }
+
+  private getAssetType(extension: string): AssetType {
+    if (['.png', '.jpg', '.jpeg', '.webp', '.svg', '.tga', '.bmp'].includes(extension)) {
+      return 'texture';
+    }
+    if (['.tscn', '.scn'].includes(extension)) {
+      return 'scene';
+    }
+    if (['.glb', '.gltf', '.obj', '.fbx'].includes(extension)) {
+      return 'model';
+    }
+    if (['.wav', '.ogg', '.mp3'].includes(extension)) {
+      return 'audio';
+    }
+    if (['.ttf', '.otf'].includes(extension)) {
+      return 'font';
+    }
+    if (extension === '.gd') {
+      return 'script';
+    }
+    if (['.json', '.cfg'].includes(extension)) {
+      return 'data';
+    }
+    if (['.tres', '.res'].includes(extension)) {
+      return 'resource';
+    }
+    return 'unknown';
+  }
+
+  private getSuggestedNode(assetType: AssetType): string {
+    switch (assetType) {
+      case 'texture':
+        return 'Sprite2D';
+      case 'scene':
+        return 'PackedScene instance';
+      case 'model':
+        return 'MeshInstance3D';
+      case 'audio':
+        return 'AudioStreamPlayer';
+      case 'font':
+        return 'Label';
+      case 'script':
+        return 'Node';
+      default:
+        return 'unknown';
+    }
+  }
+
+  private hasAnyKeyword(value: string, keywords: string[]): boolean {
+    return keywords.some((keyword) => value.includes(keyword));
+  }
+
+  private inferAssetCategory(assetType: AssetType, extension: string, relativeDirectory: string, name: string): AssetCategory {
+    const searchablePath = `${relativeDirectory}/${name}`.toLowerCase();
+
+    if (assetType === 'audio' || this.hasAnyKeyword(searchablePath, ['audio', 'sfx', 'music', 'sound'])) {
+      return 'audio';
+    }
+    if (assetType === 'font' || this.hasAnyKeyword(searchablePath, ['font'])) {
+      return 'font';
+    }
+    if (assetType === 'scene') {
+      return 'scene';
+    }
+    if (extension === '.gd') {
+      return 'script';
+    }
+    if (['.json', '.cfg'].includes(extension)) {
+      return 'data';
+    }
+    if (this.hasAnyKeyword(searchablePath, ['character', 'player', 'npc', 'enemy'])) {
+      return 'character';
+    }
+    if (this.hasAnyKeyword(searchablePath, ['prop', 'object', 'item', 'furniture'])) {
+      return 'prop';
+    }
+    if (this.hasAnyKeyword(searchablePath, ['environment', 'bg', 'background', 'terrain', 'wall', 'floor', 'room'])) {
+      return 'environment';
+    }
+    if (this.hasAnyKeyword(searchablePath, ['ui', 'button', 'panel', 'icon', 'hud', 'menu'])) {
+      return 'ui';
+    }
+    if (this.hasAnyKeyword(searchablePath, ['tile', 'tileset', 'tilemap'])) {
+      return 'tilemap';
+    }
+    if (this.hasAnyKeyword(searchablePath, ['material', 'shader'])) {
+      return 'material';
+    }
+
+    return 'unknown';
+  }
+
+  private createEmptyAssetSummary(): Record<AssetType, number> {
+    return {
+      texture: 0,
+      scene: 0,
+      model: 0,
+      audio: 0,
+      font: 0,
+      script: 0,
+      data: 0,
+      resource: 0,
+      unknown: 0,
+    };
   }
 
   /**
@@ -759,6 +1012,42 @@ class GodotServer {
           },
         },
         {
+          name: 'scan_assets',
+          description: 'Scan a Godot project for usable assets and return a structured read-only catalog',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Absolute path to the Godot project directory',
+              },
+              root: {
+                type: 'string',
+                description: 'Optional Godot-relative folder to scan, such as res://assets or assets (default: res://assets)',
+              },
+              includeExtensions: {
+                type: 'array',
+                items: {
+                  type: 'string',
+                },
+                description: 'Optional file extensions to include (default: common Godot asset extensions)',
+              },
+              excludeDirs: {
+                type: 'array',
+                items: {
+                  type: 'string',
+                },
+                description: 'Optional directory names to skip',
+              },
+              maxResults: {
+                type: 'number',
+                description: 'Maximum number of asset entries to return (default: 500)',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
           name: 'create_scene',
           description: 'Create a new Godot scene file',
           inputSchema: {
@@ -944,6 +1233,8 @@ class GodotServer {
           return await this.handleListProjects(request.params.arguments);
         case 'get_project_info':
           return await this.handleGetProjectInfo(request.params.arguments);
+        case 'scan_assets':
+          return await this.handleScanAssets(request.params.arguments);
         case 'create_scene':
           return await this.handleCreateScene(request.params.arguments);
         case 'add_node':
@@ -1471,6 +1762,268 @@ class GodotServer {
           'Ensure Godot is installed correctly',
           'Check if the GODOT_PATH environment variable is set correctly',
           'Verify the project path is accessible',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the scan_assets tool
+   */
+  private async handleScanAssets(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || typeof args.projectPath !== 'string') {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide projectPath as an absolute path to a Godot project directory']
+      );
+    }
+
+    if (args.projectPath.includes('\0')) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a projectPath without null bytes']
+      );
+    }
+
+    if (!isAbsolute(args.projectPath)) {
+      return this.createErrorResponse(
+        'Project path must be absolute',
+        ['Provide projectPath as an absolute path to a Godot project directory']
+      );
+    }
+
+    if (args.root !== undefined && typeof args.root !== 'string') {
+      return this.createErrorResponse(
+        'Invalid root path',
+        ['Provide root as a string such as res://assets or assets']
+      );
+    }
+
+    const includeExtensionsResult = this.normalizeExtensions(args.includeExtensions);
+    if (includeExtensionsResult.error) {
+      return this.createErrorResponse(includeExtensionsResult.error);
+    }
+
+    const excludeDirsResult = this.normalizeExcludedDirs(args.excludeDirs);
+    if (excludeDirsResult.error) {
+      return this.createErrorResponse(excludeDirsResult.error);
+    }
+
+    let maxResults = 500;
+    if (args.maxResults !== undefined) {
+      if (typeof args.maxResults !== 'number' || !Number.isFinite(args.maxResults) || args.maxResults < 0) {
+        return this.createErrorResponse(
+          'Invalid maxResults',
+          ['Provide maxResults as a non-negative number']
+        );
+      }
+      maxResults = Math.floor(args.maxResults);
+    }
+
+    try {
+      const normalizedProjectPath = resolve(args.projectPath);
+      if (!existsSync(normalizedProjectPath)) {
+        return this.createErrorResponse(
+          `Project path does not exist: ${args.projectPath}`,
+          ['Provide an existing Godot project directory']
+        );
+      }
+
+      const projectStats = statSync(normalizedProjectPath);
+      if (!projectStats.isDirectory()) {
+        return this.createErrorResponse(
+          `Project path is not a directory: ${args.projectPath}`,
+          ['Provide a directory containing a project.godot file']
+        );
+      }
+
+      const projectRoot = realpathSync(normalizedProjectPath);
+      const projectFile = join(projectRoot, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      const root = args.root || 'res://assets';
+      const scanRootResult = this.normalizeScanRoot(root);
+      if (scanRootResult.error) {
+        return this.createErrorResponse(
+          scanRootResult.error,
+          ['Use a Godot-relative root such as res://assets or assets']
+        );
+      }
+
+      let scanRootPath = resolve(projectRoot, scanRootResult.relativeRoot);
+      let scanRoot = scanRootResult.scanRoot;
+
+      if (!this.isPathInside(projectRoot, scanRootPath)) {
+        return this.createErrorResponse(
+          'Unsafe root path',
+          ['The scan root must stay inside the Godot project directory']
+        );
+      }
+
+      if (!existsSync(scanRootPath)) {
+        const fallbackRootPath = projectRoot;
+        if (!existsSync(fallbackRootPath) || !statSync(fallbackRootPath).isDirectory()) {
+          return this.createErrorResponse(
+            `Scan root does not exist (${scanRoot}) and fallback also failed`,
+            ['Create the requested scan root or provide a valid Godot project directory']
+          );
+        }
+
+        scanRootPath = fallbackRootPath;
+        scanRoot = 'res://';
+      }
+
+      const scanRootStats = lstatSync(scanRootPath);
+      if (scanRootStats.isSymbolicLink()) {
+        return this.createErrorResponse(
+          'Unsafe root path',
+          ['The scan root must not be a symbolic link']
+        );
+      }
+
+      if (!scanRootStats.isDirectory()) {
+        return this.createErrorResponse(
+          `Scan root is not a directory: ${scanRoot}`,
+          ['Provide a Godot-relative directory to scan']
+        );
+      }
+
+      const realScanRoot = realpathSync(scanRootPath);
+      if (!this.isPathInside(projectRoot, realScanRoot)) {
+        return this.createErrorResponse(
+          'Unsafe root path',
+          ['The scan root must stay inside the Godot project directory']
+        );
+      }
+
+      const assets: AssetCatalogItem[] = [];
+      const summary = this.createEmptyAssetSummary();
+      let totalFound = 0;
+
+      const scanDirectory = (currentPath: string) => {
+        let entries;
+        try {
+          entries = readdirSync(currentPath, { withFileTypes: true })
+            .sort((a, b) => a.name.localeCompare(b.name));
+        } catch (error) {
+          this.logDebug(`Skipping unreadable directory ${currentPath}: ${error}`);
+          return;
+        }
+
+        for (const entry of entries) {
+          const entryPath = join(currentPath, entry.name);
+
+          if (entry.isSymbolicLink()) {
+            continue;
+          }
+
+          if (entry.isDirectory()) {
+            if (excludeDirsResult.directories.has(entry.name.toLowerCase())) {
+              continue;
+            }
+
+            try {
+              const realDirectoryPath = realpathSync(entryPath);
+              if (!this.isPathInside(projectRoot, realDirectoryPath)) {
+                continue;
+              }
+            } catch (error) {
+              this.logDebug(`Skipping unreadable directory ${entryPath}: ${error}`);
+              continue;
+            }
+
+            scanDirectory(entryPath);
+            continue;
+          }
+
+          if (!entry.isFile()) {
+            continue;
+          }
+
+          const extension = extname(entry.name).toLowerCase();
+          if (!includeExtensionsResult.extensions.has(extension)) {
+            continue;
+          }
+
+          let fileStats;
+          try {
+            fileStats = statSync(entryPath);
+          } catch (error) {
+            this.logDebug(`Skipping unreadable file ${entryPath}: ${error}`);
+            continue;
+          }
+
+          const projectRelativeFile = relative(projectRoot, entryPath).replace(/\\/g, '/');
+          if (projectRelativeFile.startsWith('../') || projectRelativeFile === '..') {
+            continue;
+          }
+
+          const relativeDirectory = relative(projectRoot, dirname(entryPath)).replace(/\\/g, '/');
+          const fileName = entry.name;
+          const name = parse(fileName).name;
+          const assetType = this.getAssetType(extension);
+          const category = this.inferAssetCategory(assetType, extension, relativeDirectory, name);
+
+          const asset: AssetCatalogItem = {
+            path: `res://${projectRelativeFile}`,
+            fileName,
+            name,
+            extension,
+            assetType,
+            category,
+            suggestedNode: this.getSuggestedNode(assetType),
+            sizeBytes: fileStats.size,
+            relativeDirectory,
+          };
+
+          totalFound++;
+          summary[assetType]++;
+
+          if (assets.length < maxResults) {
+            assets.push(asset);
+          }
+        }
+      };
+
+      scanDirectory(realScanRoot);
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: true,
+                projectPath: projectRoot.replace(/\\/g, '/'),
+                scanRoot,
+                totalFound,
+                truncated: totalFound > assets.length,
+                assets,
+                summary,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to scan assets: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure the project path exists and is readable',
+          'Check that the scan root is inside the project directory',
         ]
       );
     }
