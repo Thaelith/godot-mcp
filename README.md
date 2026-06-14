@@ -76,6 +76,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
   - Validate scenes read-only and return structured issues before AI-assisted edits
   - Dry-run proposed scene blueprints and return validation issues plus a creation plan without writing files
 - **Scene Management**:
+  - Create scenes from validated blueprints with controlled writes and post-save validation
   - Create new scenes with specified root node types
   - Add nodes to existing scenes with customizable properties
   - Load sprites and textures into Sprite2D nodes
@@ -135,6 +136,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "read_scene_tree",
         "validate_scene",
         "dry_run_scene_blueprint",
+        "create_scene_from_blueprint",
         "create_scene",
         "add_node",
         "load_sprite",
@@ -629,7 +631,7 @@ Input example:
 Supported blueprint fields:
 
 - `root.type` is required; `root.name` defaults to the target scene filename when omitted.
-- `root.properties` and node `properties` support common safe fields such as `position`, `scale`, `rotation`, `rotation_degrees`, `z_index`, `visible`, `size`, `text`, `disabled`, `enabled`, `centered`, `flip_h`, and `flip_v`.
+- `root.properties` and node `properties` support common safe fields such as `position`, `scale`, `rotation`, `rotation_degrees`, `z_index`, `visible`, `size`, `text`, `disabled`, `enabled`, `centered`, `flip_h`, `flip_v`, `offset`, `zoom`, `volume_db`, and `autoplay`.
 - `nodes` is an optional flat array. Each node needs `type`, `name`, and either `parentPath` or `path`.
 - If `path` is omitted, it is derived from `parentPath/name`. If `parentPath` is omitted, it is inferred from `path`.
 - `asset` is optional. If `assetProperty` is omitted, the dry run infers common assignments such as `texture`, `stream`, `instance`, or `mesh`.
@@ -706,6 +708,151 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Then call `dry_run_scene_blueprint` from the inspector with a local Godot project path, a target scene path, and a simple blueprint. Confirm the target scene file is not created.
+
+### `create_scene_from_blueprint`
+
+Creates a `.tscn` or `.scn` scene from a validated flat blueprint. This is the first controlled writing tool in the scene blueprint flow: it reuses `dry_run_scene_blueprint` validation, refuses to write when validation has errors, writes only the requested target scene file, and can validate the saved scene afterward.
+
+Input example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "allowOverwrite": false,
+  "validateBeforeWrite": true,
+  "validateAfterWrite": true,
+  "includePlan": true,
+  "maxNodes": 250,
+  "blueprint": {
+    "root": {
+      "type": "Node2D",
+      "name": "Room",
+      "properties": {
+        "position": [0, 0]
+      }
+    },
+    "nodes": [
+      {
+        "path": "Room/Floor",
+        "parentPath": "Room",
+        "type": "Sprite2D",
+        "name": "Floor",
+        "asset": "res://assets/rooms/floor.png",
+        "assetProperty": "texture",
+        "properties": {
+          "position": [0, 0],
+          "scale": [1, 1],
+          "z_index": 0
+        }
+      }
+    ]
+  }
+}
+```
+
+Safety model:
+
+- The tool validates the blueprint with the dry-run logic before writing and aborts on error issues.
+- The only intended write is the requested scene file plus any missing parent directories inside the Godot project.
+- `scenePath` must stay inside the project and must end in `.tscn` or `.scn`.
+- `allowOverwrite: false` aborts when the target scene exists. `allowOverwrite: true` overwrites only that exact target scene.
+- `validateAfterWrite: true` loads and instantiates the saved scene and returns `postValidation`.
+- Scripts are not attached, script source is not parsed, and custom script node types are not supported in this first version.
+
+Supported blueprint fields match `dry_run_scene_blueprint`: required `root.type`, optional `root.name`, optional `properties`, and a flat `nodes` array where each node has `type`, `name`, and either `parentPath` or `path`. Nested `children` are rejected before writing.
+
+Supported property allowlist:
+
+```text
+position, scale, rotation, rotation_degrees, z_index, visible,
+size, text, disabled, enabled, centered, flip_h, flip_v,
+offset, zoom, volume_db, autoplay
+```
+
+Unknown properties are skipped and reported with `UNKNOWN_PROPERTY_SKIPPED`; they are not blindly written.
+
+Supported asset assignments:
+
+- Texture assets to `Sprite2D.texture` or `TextureRect.texture`
+- Audio assets to `AudioStreamPlayer*.stream`
+- Model mesh assets to `MeshInstance3D.mesh`
+- Scene assets with `assetProperty: "instance"` as instantiated child scenes
+- Font assets to `Label` font overrides when safely loadable
+- Generic `.tres`/`.res` resources only when `assetProperty` is provided and the node exposes that property
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "created": true,
+  "overwritten": false,
+  "valid": true,
+  "severity": "ok",
+  "summary": {
+    "totalNodes": 2,
+    "rootType": "Node2D",
+    "nodeTypes": {
+      "Node2D": 1,
+      "Sprite2D": 1
+    },
+    "assetReferenceCount": 1,
+    "errorCount": 0,
+    "warningCount": 0,
+    "infoCount": 0
+  },
+  "issues": [],
+  "plan": [
+    {
+      "action": "create_root",
+      "path": "Room",
+      "type": "Node2D",
+      "name": "Room"
+    },
+    {
+      "action": "add_node",
+      "path": "Room/Floor",
+      "parentPath": "Room",
+      "type": "Sprite2D",
+      "name": "Floor"
+    },
+    {
+      "action": "assign_asset",
+      "path": "Room/Floor",
+      "asset": "res://assets/rooms/floor.png",
+      "assetProperty": "texture"
+    }
+  ],
+  "write": {
+    "saved": true,
+    "resourceSaverCode": 0,
+    "bytesWritten": 1234,
+    "createdDirectories": []
+  },
+  "postValidation": {
+    "loadable": true,
+    "instantiable": true,
+    "totalNodes": 2
+  },
+  "limits": {
+    "maxNodesRequested": 250,
+    "maxNodesApplied": 250,
+    "maxNodesClamped": false
+  }
+}
+```
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Then call `create_scene_from_blueprint` with a simple Node2D root and Sprite2D child, then call `read_scene_tree` and `validate_scene` on the created scene.
 
 ## Troubleshooting
 

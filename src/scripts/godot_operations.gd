@@ -28,7 +28,7 @@ func _init():
     
     var operation = args[operation_index]
     var params_json = args[params_index]
-    var quiet_output = operation == "read_scene_tree" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint"
+    var quiet_output = operation == "read_scene_tree" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
 
     if quiet_output:
         debug_mode = false
@@ -71,6 +71,8 @@ func _init():
             get_asset_info(params)
         "dry_run_scene_blueprint":
             dry_run_scene_blueprint(params)
+        "create_scene_from_blueprint":
+            create_scene_from_blueprint(params)
         "create_scene":
             create_scene(params)
         "add_node":
@@ -1013,7 +1015,11 @@ func dry_run_validate_properties_for_spec(spec, options, issues):
         "enabled",
         "centered",
         "flip_h",
-        "flip_v"
+        "flip_v",
+        "offset",
+        "zoom",
+        "volume_db",
+        "autoplay"
     ]
 
     for property_name in props.keys():
@@ -1031,13 +1037,16 @@ func dry_run_validate_properties_for_spec(spec, options, issues):
                 valid_vector = dry_run_is_number_array(value, expected_size)
             if not valid_vector:
                 dry_run_add_issue(issues, "error", "INVALID_PROPERTY_VALUE", property_name + " must be a numeric array with the expected vector size.", spec["path"], node_type, property_name, null, "Use [x, y] for Node2D/Control or [x, y, z] for Node3D.")
+        elif property_name == "offset" or property_name == "zoom":
+            if not dry_run_is_number_array(value, 2):
+                dry_run_add_issue(issues, "error", "INVALID_PROPERTY_VALUE", property_name + " must be a numeric [x, y] array.", spec["path"], node_type, property_name, null, "Use a numeric array with two values.")
         elif property_name == "size":
             if not dry_run_is_number_array(value, 2):
                 dry_run_add_issue(issues, "error", "INVALID_PROPERTY_VALUE", "size must be a numeric [width, height] array.", spec["path"], node_type, property_name, null, "Use a numeric array with two values.")
-        elif property_name == "rotation" or property_name == "rotation_degrees" or property_name == "z_index":
+        elif property_name == "rotation" or property_name == "rotation_degrees" or property_name == "z_index" or property_name == "volume_db":
             if not dry_run_is_number_value(value):
                 dry_run_add_issue(issues, "error", "INVALID_PROPERTY_VALUE", property_name + " must be a number.", spec["path"], node_type, property_name, null, "Use a numeric value.")
-        elif property_name == "visible" or property_name == "disabled" or property_name == "enabled" or property_name == "centered" or property_name == "flip_h" or property_name == "flip_v":
+        elif property_name == "visible" or property_name == "disabled" or property_name == "enabled" or property_name == "centered" or property_name == "flip_h" or property_name == "flip_v" or property_name == "autoplay":
             if typeof(value) != TYPE_BOOL:
                 dry_run_add_issue(issues, "error", "INVALID_PROPERTY_VALUE", property_name + " must be a boolean.", spec["path"], node_type, property_name, null, "Use true or false.")
         elif property_name == "text":
@@ -1227,18 +1236,24 @@ func dry_run_finish_result(project_path, scene_path, root_spec, node_specs, issu
     if include_plan:
         result["plan"] = plan
 
+    result["_rootSpec"] = root_spec
+    result["_nodeSpecs"] = node_specs
+
     return result
 
-func dry_run_scene_blueprint(params):
+func dry_run_public_result(result):
+    var output = result.duplicate(true)
+    output.erase("_rootSpec")
+    output.erase("_nodeSpecs")
+    return output
+
+func dry_run_scene_blueprint_result(params):
     if not params.has("scene_path"):
-        print_json_error("MISSING_SCENE_PATH", "scene_path is required.")
-        return
+        return {"success": false, "error": "MISSING_SCENE_PATH", "message": "scene_path is required."}
     if not params.has("blueprint"):
-        print_json_error("MISSING_BLUEPRINT", "blueprint is required.")
-        return
+        return {"success": false, "error": "MISSING_BLUEPRINT", "message": "blueprint is required."}
     if typeof(params.blueprint) != TYPE_DICTIONARY:
-        print_json_error("INVALID_BLUEPRINT", "blueprint must be an object.")
-        return
+        return {"success": false, "error": "INVALID_BLUEPRINT", "message": "blueprint must be an object."}
 
     var scene_path = normalize_resource_scene_path(params.scene_path)
     var project_path = params.project_path if params.has("project_path") else ProjectSettings.globalize_path("res://")
@@ -1260,8 +1275,7 @@ func dry_run_scene_blueprint(params):
 
     var issues = []
     if not blueprint.has("root") or typeof(blueprint.root) != TYPE_DICTIONARY:
-        print_json_error("INVALID_ROOT", "blueprint.root is required and must be an object.")
-        return
+        return {"success": false, "error": "INVALID_ROOT", "message": "blueprint.root is required and must be an object."}
 
     var root = blueprint.root
     var root_type = dry_run_get_value(root, ["type"], null)
@@ -1421,6 +1435,510 @@ func dry_run_scene_blueprint(params):
         dry_run_add_plan_actions(plan, root_spec, node_specs)
 
     var result = dry_run_finish_result(project_path, scene_path, root_spec, node_specs, issues, limits, include_plan, plan, target_exists)
+    return result
+
+func dry_run_scene_blueprint(params):
+    var result = dry_run_scene_blueprint_result(params)
+    print(JSON.stringify(dry_run_public_result(result)))
+
+func create_scene_blueprint_error(error_code, message, issues=[]):
+    return {
+        "success": false,
+        "error": error_code,
+        "message": message,
+        "issues": issues
+    }
+
+func create_scene_blueprint_has_error_issues(issues):
+    for issue in issues:
+        if issue.has("severity") and issue["severity"] == "error":
+            return true
+    return false
+
+func create_scene_blueprint_error_code_from_issues(issues):
+    for issue in issues:
+        if issue.has("code") and issue["code"] == "TARGET_SCENE_EXISTS":
+            return "TARGET_SCENE_EXISTS"
+    for issue in issues:
+        if issue.has("code") and issue["code"] == "BLUEPRINT_TOO_LARGE":
+            return "BLUEPRINT_TOO_LARGE"
+    return "DRY_RUN_VALIDATION_FAILED"
+
+func create_scene_blueprint_issue_counts(issues):
+    var counts = {
+        "errorCount": 0,
+        "warningCount": 0,
+        "infoCount": 0
+    }
+    for issue in issues:
+        if issue.has("severity") and issue["severity"] == "error":
+            counts["errorCount"] += 1
+        elif issue.has("severity") and issue["severity"] == "warning":
+            counts["warningCount"] += 1
+        elif issue.has("severity") and issue["severity"] == "info":
+            counts["infoCount"] += 1
+    return counts
+
+func create_scene_blueprint_severity_from_counts(counts):
+    if counts["errorCount"] > 0:
+        return "error"
+    if counts["warningCount"] > 0:
+        return "warning"
+    if counts["infoCount"] > 0:
+        return "info"
+    return "ok"
+
+func create_scene_blueprint_sorted_specs(node_specs):
+    var remaining = node_specs.duplicate(true)
+    var sorted = []
+    while remaining.size() > 0:
+        var best_index = 0
+        var best_depth = str(remaining[0]["path"]).count("/")
+        for index in range(1, remaining.size()):
+            var depth = str(remaining[index]["path"]).count("/")
+            if depth < best_depth:
+                best_depth = depth
+                best_index = index
+        sorted.append(remaining[best_index])
+        remaining.remove_at(best_index)
+    return sorted
+
+func create_scene_blueprint_node_has_property(node, property_name):
+    var property_list = node.get_property_list()
+    for property_info in property_list:
+        if property_info.has("name") and property_info["name"] == property_name:
+            return true
+    return false
+
+func create_scene_blueprint_safe_properties():
+    return [
+        "position",
+        "scale",
+        "rotation",
+        "rotation_degrees",
+        "z_index",
+        "visible",
+        "size",
+        "text",
+        "disabled",
+        "enabled",
+        "centered",
+        "flip_h",
+        "flip_v",
+        "offset",
+        "zoom",
+        "volume_db",
+        "autoplay"
+    ]
+
+func create_scene_blueprint_convert_property_value(node, property_name, value):
+    if property_name == "position" or property_name == "scale":
+        if dry_run_class_is_or_inherits(node.get_class(), "Node3D") and dry_run_is_number_array(value, 3):
+            return Vector3(value[0], value[1], value[2])
+        if dry_run_is_number_array(value, 2):
+            return Vector2(value[0], value[1])
+        if dry_run_is_number_array(value, 3):
+            return Vector3(value[0], value[1], value[2])
+    elif property_name == "size" or property_name == "offset" or property_name == "zoom":
+        if dry_run_is_number_array(value, 2):
+            return Vector2(value[0], value[1])
+    return value
+
+func create_scene_blueprint_apply_properties(node, spec, issues):
+    var properties = spec["properties"] if spec.has("properties") else {}
+    if typeof(properties) != TYPE_DICTIONARY:
+        return false
+
+    var allowlist = create_scene_blueprint_safe_properties()
+    for property_name in properties.keys():
+        if not allowlist.has(property_name):
+            dry_run_add_issue(
+                issues,
+                "warning",
+                "UNKNOWN_PROPERTY_SKIPPED",
+                "Unknown property was skipped during scene creation.",
+                spec["path"],
+                spec["type"],
+                property_name,
+                null,
+                "Only the safe property allowlist is written by create_scene_from_blueprint."
+            )
+            continue
+
+        if not create_scene_blueprint_node_has_property(node, property_name):
+            dry_run_add_issue(
+                issues,
+                "warning",
+                "UNKNOWN_PROPERTY_SKIPPED",
+                "Property is not available on this node and was skipped.",
+                spec["path"],
+                spec["type"],
+                property_name,
+                null,
+                "Use properties supported by the selected node type."
+            )
+            continue
+
+        var converted_value = create_scene_blueprint_convert_property_value(node, property_name, properties[property_name])
+        node.set(property_name, converted_value)
+
+    return true
+
+func create_scene_blueprint_load_texture(asset_path):
+    var resource = ResourceLoader.load(asset_path)
+    if resource != null:
+        return resource
+
+    var image = Image.new()
+    if image.load(asset_path) != OK:
+        return null
+    return ImageTexture.create_from_image(image)
+
+func create_scene_blueprint_set_owner_recursive(node, owner):
+    if node != owner:
+        node.owner = owner
+    for child in node.get_children():
+        create_scene_blueprint_set_owner_recursive(child, owner)
+
+func create_scene_blueprint_create_node_from_spec(spec, issues):
+    if spec["asset"] != null and spec["assetProperty"] == "instance" and (spec["assetType"] == "scene" or spec["assetType"] == "model"):
+        var packed_resource = ResourceLoader.load(spec["asset"])
+        if packed_resource != null and packed_resource is PackedScene:
+            var instance = packed_resource.instantiate()
+            if instance != null and instance is Node:
+                instance.name = spec["name"]
+                spec["_assetInstanced"] = true
+                return instance
+        if spec["assetType"] == "scene":
+            dry_run_add_issue(
+                issues,
+                "error",
+                "ASSIGN_ASSET_FAILED",
+                "Scene asset could not be loaded and instantiated.",
+                spec["path"],
+                spec["type"],
+                "asset",
+                spec["asset"],
+                "Use a loadable PackedScene asset or remove the scene asset reference."
+            )
+            return null
+
+    if not ClassDB.class_exists(spec["type"]) or not ClassDB.can_instantiate(spec["type"]):
+        dry_run_add_issue(
+            issues,
+            "error",
+            "CREATE_NODE_FAILED",
+            "Node type cannot be instantiated.",
+            spec["path"],
+            spec["type"],
+            "type",
+            null,
+            "Use a concrete built-in Godot node type."
+        )
+        return null
+
+    var node = ClassDB.instantiate(spec["type"])
+    if node == null or not (node is Node):
+        dry_run_add_issue(
+            issues,
+            "error",
+            "CREATE_NODE_FAILED",
+            "Failed to instantiate node.",
+            spec["path"],
+            spec["type"],
+            "type",
+            null,
+            "Use a concrete Godot node class."
+        )
+        return null
+
+    node.name = spec["name"]
+    return node
+
+func create_scene_blueprint_assign_asset(node, spec, issues):
+    if spec["asset"] == null or spec.has("_assetInstanced"):
+        return true
+
+    var asset_path = spec["asset"]
+    var asset_property = spec["assetProperty"]
+    var asset_type = spec["assetType"]
+    var resource = null
+
+    if asset_type == "texture":
+        resource = create_scene_blueprint_load_texture(asset_path)
+        if resource == null:
+            dry_run_add_issue(issues, "error", "ASSIGN_ASSET_FAILED", "Texture asset could not be loaded.", spec["path"], spec["type"], asset_property, asset_path, "Use a loadable texture asset.")
+            return false
+
+        if (node is Sprite2D or node is TextureRect) and asset_property == "texture":
+            node.texture = resource
+            return true
+
+        dry_run_add_issue(issues, "error", "ASSIGN_ASSET_FAILED", "Texture asset can only be assigned to Sprite2D.texture or TextureRect.texture in this version.", spec["path"], spec["type"], asset_property, asset_path, "Use Sprite2D or TextureRect for texture assets.")
+        return false
+
+    resource = ResourceLoader.load(asset_path)
+    if resource == null:
+        dry_run_add_issue(issues, "error", "ASSIGN_ASSET_FAILED", "Asset could not be loaded for assignment.", spec["path"], spec["type"], asset_property, asset_path, "Use a loadable Godot resource.")
+        return false
+
+    if asset_type == "audio" and asset_property == "stream":
+        if node is AudioStreamPlayer or node is AudioStreamPlayer2D or node is AudioStreamPlayer3D:
+            node.stream = resource
+            return true
+        dry_run_add_issue(issues, "error", "ASSIGN_ASSET_FAILED", "Audio asset can only be assigned to AudioStreamPlayer stream properties.", spec["path"], spec["type"], asset_property, asset_path, "Use AudioStreamPlayer, AudioStreamPlayer2D, or AudioStreamPlayer3D.")
+        return false
+
+    if asset_type == "model":
+        if asset_property == "mesh" and node is MeshInstance3D and resource is Mesh:
+            node.mesh = resource
+            return true
+        if asset_property == "instance" and resource is PackedScene:
+            dry_run_add_issue(issues, "warning", "ASSET_INSTANCE_SKIPPED", "Model PackedScene instance assignment was skipped because the node was already created.", spec["path"], spec["type"], asset_property, asset_path, "Use a blueprint node with assetProperty instance so the asset root can be instantiated directly.")
+            return true
+
+    if asset_type == "font":
+        if node is Label and resource is Font:
+            node.add_theme_font_override("font", resource)
+            return true
+        dry_run_add_issue(issues, "warning", "FONT_ASSIGNMENT_SKIPPED", "Font asset assignment was skipped because a safe target was not available.", spec["path"], spec["type"], asset_property, asset_path, "Use a Label node for font assets.")
+        return true
+
+    if asset_type == "script":
+        dry_run_add_issue(issues, "warning", "SCRIPT_ASSET_SKIPPED", "Script assets are not attached by create_scene_from_blueprint.", spec["path"], spec["type"], asset_property, asset_path, "Attach scripts in a later explicit step.")
+        return true
+
+    if asset_type == "resource" and asset_property != null and create_scene_blueprint_node_has_property(node, asset_property):
+        node.set(asset_property, resource)
+        return true
+
+    dry_run_add_issue(issues, "warning", "ASSET_ASSIGNMENT_SKIPPED", "Asset assignment is not supported for this asset/node/property combination.", spec["path"], spec["type"], asset_property, asset_path, "Use one of the supported safe asset assignment combinations.")
+    return true
+
+func create_scene_blueprint_ensure_target_directory(scene_path):
+    var scene_dir_res = scene_path.get_base_dir()
+    var scene_dir_abs = ProjectSettings.globalize_path(scene_dir_res)
+    var project_abs = ProjectSettings.globalize_path("res://")
+    if not scene_dir_abs.begins_with(project_abs):
+        return {"success": false, "error": "UNSAFE_SCENE_PATH", "message": "Target scene directory escapes the project."}
+
+    var created_directories = []
+    if not DirAccess.dir_exists_absolute(scene_dir_abs):
+        var make_error = DirAccess.make_dir_recursive_absolute(scene_dir_abs)
+        if make_error != OK:
+            return {"success": false, "error": "SAVE_SCENE_FAILED", "message": "Failed to create target scene directory.", "code": make_error}
+        created_directories.append(scene_dir_res)
+
+    return {"success": true, "createdDirectories": created_directories}
+
+func create_scene_blueprint_count_nodes(node):
+    var count = 1
+    for child in node.get_children():
+        count += create_scene_blueprint_count_nodes(child)
+    return count
+
+func create_scene_blueprint_post_validate(scene_path):
+    var scene_resource = ResourceLoader.load(scene_path, "", ResourceLoader.CACHE_MODE_IGNORE)
+    if scene_resource == null or not (scene_resource is PackedScene):
+        return {
+            "success": false,
+            "error": "POST_VALIDATE_FAILED",
+            "message": "Saved scene could not be loaded as a PackedScene.",
+            "postValidation": {
+                "loadable": false,
+                "instantiable": false,
+                "totalNodes": 0
+            }
+        }
+
+    var scene_root = scene_resource.instantiate()
+    if scene_root == null:
+        return {
+            "success": false,
+            "error": "POST_VALIDATE_FAILED",
+            "message": "Saved scene could not be instantiated.",
+            "postValidation": {
+                "loadable": true,
+                "instantiable": false,
+                "totalNodes": 0
+            }
+        }
+
+    var total_nodes = create_scene_blueprint_count_nodes(scene_root)
+    scene_root.free()
+    return {
+        "success": true,
+        "postValidation": {
+            "loadable": true,
+            "instantiable": true,
+            "totalNodes": total_nodes
+        }
+    }
+
+func create_scene_from_blueprint(params):
+    if not params.has("scene_path"):
+        print(JSON.stringify(create_scene_blueprint_error("MISSING_SCENE_PATH", "scene_path is required.")))
+        return
+    if not params.has("blueprint"):
+        print(JSON.stringify(create_scene_blueprint_error("MISSING_BLUEPRINT", "blueprint is required.")))
+        return
+
+    var scene_path = normalize_resource_scene_path(params.scene_path)
+    var allow_overwrite = params.allow_overwrite if params.has("allow_overwrite") else false
+    var include_plan = params.include_plan if params.has("include_plan") else true
+    var validate_after_write = params.validate_after_write if params.has("validate_after_write") else true
+    var project_path = params.project_path if params.has("project_path") else ProjectSettings.globalize_path("res://")
+
+    var dry_run_params = params.duplicate(true)
+    dry_run_params["scene_path"] = scene_path
+    dry_run_params["allow_overwrite"] = allow_overwrite
+    dry_run_params["include_plan"] = include_plan
+    dry_run_params["validate_assets"] = true
+    dry_run_params["validate_node_types"] = true
+    dry_run_params["validate_properties"] = true
+    dry_run_params["validate_hierarchy"] = true
+
+    var dry_run_result = dry_run_scene_blueprint_result(dry_run_params)
+    if not dry_run_result.has("success") or not dry_run_result["success"]:
+        print(JSON.stringify(create_scene_blueprint_error(
+            dry_run_result["error"] if dry_run_result.has("error") else "INVALID_BLUEPRINT",
+            dry_run_result["message"] if dry_run_result.has("message") else "Blueprint validation failed."
+        )))
+        return
+
+    var issues = dry_run_result["issues"].duplicate(true)
+    if create_scene_blueprint_has_error_issues(issues):
+        var validation_error_code = create_scene_blueprint_error_code_from_issues(issues)
+        print(JSON.stringify(create_scene_blueprint_error(
+            validation_error_code,
+            "Blueprint dry-run validation failed; scene was not written.",
+            issues
+        )))
+        return
+
+    if FileAccess.file_exists(scene_path) and not allow_overwrite:
+        dry_run_add_issue(issues, "error", "TARGET_SCENE_EXISTS", "Target scene already exists and allowOverwrite is false.", dry_run_result["_rootSpec"]["path"], dry_run_result["_rootSpec"]["type"], null, null, "Set allowOverwrite to true only when replacing the scene is intended.")
+        print(JSON.stringify(create_scene_blueprint_error("TARGET_SCENE_EXISTS", "Target scene already exists; scene was not written.", issues)))
+        return
+
+    var target_existed_before = FileAccess.file_exists(scene_path)
+    var root_spec = dry_run_result["_rootSpec"]
+    var node_specs = create_scene_blueprint_sorted_specs(dry_run_result["_nodeSpecs"])
+    var root_node = create_scene_blueprint_create_node_from_spec(root_spec, issues)
+    if root_node == null:
+        print(JSON.stringify(create_scene_blueprint_error("CREATE_ROOT_FAILED", "Failed to create scene root; scene was not written.", issues)))
+        return
+
+    create_scene_blueprint_apply_properties(root_node, root_spec, issues)
+
+    var node_by_path = {}
+    node_by_path[root_spec["path"]] = root_node
+
+    for spec in node_specs:
+        if not node_by_path.has(spec["parentPath"]):
+            root_node.free()
+            dry_run_add_issue(issues, "error", "MISSING_PARENT", "Parent node was not available during creation.", spec["path"], spec["type"], "parentPath", null, "Ensure parents appear in the blueprint hierarchy.")
+            print(JSON.stringify(create_scene_blueprint_error("CREATE_NODE_FAILED", "Failed to create node hierarchy; scene was not written.", issues)))
+            return
+
+        var node = create_scene_blueprint_create_node_from_spec(spec, issues)
+        if node == null:
+            root_node.free()
+            print(JSON.stringify(create_scene_blueprint_error("CREATE_NODE_FAILED", "Failed to create a blueprint node; scene was not written.", issues)))
+            return
+
+        var parent = node_by_path[spec["parentPath"]]
+        parent.add_child(node)
+        create_scene_blueprint_set_owner_recursive(node, root_node)
+
+        if not create_scene_blueprint_apply_properties(node, spec, issues):
+            root_node.free()
+            print(JSON.stringify(create_scene_blueprint_error("SET_PROPERTY_FAILED", "Failed to set node properties; scene was not written.", issues)))
+            return
+
+        if not create_scene_blueprint_assign_asset(node, spec, issues):
+            root_node.free()
+            print(JSON.stringify(create_scene_blueprint_error("ASSIGN_ASSET_FAILED", "Failed to assign a blueprint asset; scene was not written.", issues)))
+            return
+
+        node_by_path[spec["path"]] = node
+
+    if create_scene_blueprint_has_error_issues(issues):
+        root_node.free()
+        print(JSON.stringify(create_scene_blueprint_error("CREATE_SCENE_FROM_BLUEPRINT_FAILED", "Scene creation produced errors before saving; scene was not written.", issues)))
+        return
+
+    var directory_result = create_scene_blueprint_ensure_target_directory(scene_path)
+    if not directory_result["success"]:
+        root_node.free()
+        print(JSON.stringify(create_scene_blueprint_error(directory_result["error"], directory_result["message"], issues)))
+        return
+
+    var packed_scene = PackedScene.new()
+    var pack_result = packed_scene.pack(root_node)
+    if pack_result != OK:
+        root_node.free()
+        print(JSON.stringify(create_scene_blueprint_error("PACK_SCENE_FAILED", "Failed to pack the generated scene; scene was not written.", issues)))
+        return
+
+    var save_error = ResourceSaver.save(packed_scene, scene_path)
+    if save_error != OK:
+        root_node.free()
+        print(JSON.stringify(create_scene_blueprint_error("SAVE_SCENE_FAILED", "Failed to save the generated scene.", issues)))
+        return
+
+    var bytes_written = 0
+    var file = FileAccess.open(scene_path, FileAccess.READ)
+    if file != null:
+        bytes_written = file.get_length()
+        file.close()
+
+    var post_validation = {
+        "loadable": null,
+        "instantiable": null,
+        "totalNodes": null
+    }
+    if validate_after_write:
+        var post_result = create_scene_blueprint_post_validate(scene_path)
+        post_validation = post_result["postValidation"]
+        if not post_result["success"]:
+            root_node.free()
+            var post_error = create_scene_blueprint_error("POST_VALIDATE_FAILED", post_result["message"], issues)
+            post_error["postValidation"] = post_validation
+            print(JSON.stringify(post_error))
+            return
+
+    root_node.free()
+
+    var issue_counts = create_scene_blueprint_issue_counts(issues)
+    var summary = dry_run_result["summary"].duplicate(true)
+    summary["errorCount"] = issue_counts["errorCount"]
+    summary["warningCount"] = issue_counts["warningCount"]
+    summary["infoCount"] = issue_counts["infoCount"]
+
+    var result = {
+        "success": true,
+        "projectPath": project_path,
+        "scenePath": scene_path,
+        "created": true,
+        "overwritten": target_existed_before,
+        "valid": issue_counts["errorCount"] == 0,
+        "severity": create_scene_blueprint_severity_from_counts(issue_counts),
+        "summary": summary,
+        "issues": issues,
+        "write": {
+            "saved": true,
+            "resourceSaverCode": save_error,
+            "bytesWritten": bytes_written,
+            "createdDirectories": directory_result["createdDirectories"]
+        },
+        "postValidation": post_validation,
+        "limits": dry_run_result["limits"]
+    }
+
+    if include_plan and dry_run_result.has("plan"):
+        result["plan"] = dry_run_result["plan"]
+
     print(JSON.stringify(result))
 
 func get_asset_type_from_extension(extension):
