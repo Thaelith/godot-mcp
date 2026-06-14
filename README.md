@@ -75,6 +75,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
   - Read existing scene trees into structured, read-only JSON before making changes
   - Inspect placement-oriented scene layout, transforms, bounds, and Control rects
   - Dry-run node alignment and layout operations without modifying or saving scenes
+  - Dry-run asset placement plans for existing scenes without modifying or saving scenes
   - Validate scenes read-only and return structured issues before AI-assisted edits
   - Dry-run proposed scene blueprints and return validation issues plus a creation plan without writing files
 - **Scene Management**:
@@ -140,6 +141,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "get_scene_layout",
         "dry_run_align_nodes",
         "align_nodes",
+        "dry_run_place_asset_in_scene",
         "validate_scene",
         "dry_run_scene_blueprint",
         "create_scene_from_blueprint",
@@ -935,6 +937,172 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Then call `align_nodes` on a scene with positioned nodes, inspect the result with `read_scene_tree` or `get_scene_layout`, and confirm only the requested scene file changed.
+
+### `dry_run_place_asset_in_scene`
+
+Plans how an existing asset would be added to an existing scene without modifying, saving, importing, reimporting, or creating files. The tool resolves the target parent, infers node type and asset property when possible, validates safe properties, calculates placement, and returns a plan for a future writing `place_asset_in_scene` tool.
+
+Place a texture at an explicit position:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "assetPath": "res://assets/props/chair.png",
+  "parentPath": "Room",
+  "nodeName": "Chair",
+  "placement": {
+    "mode": "position",
+    "position": [128, 64],
+    "space": "local"
+  }
+}
+```
+
+Place a texture relative to an existing node:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "assetPath": "assets/props/chair.png",
+  "nodeName": "Chair",
+  "boundsSource": "visual",
+  "placement": {
+    "mode": "relative",
+    "referenceNodePath": "Room/Table",
+    "relation": "right_of",
+    "margin": 8
+  }
+}
+```
+
+Place an asset centered in scene bounds:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "assetPath": "res://assets/props/chair.png",
+  "placement": {
+    "mode": "scene_bounds",
+    "alignment": "center",
+    "margin": 0
+  },
+  "includeLayoutBefore": true,
+  "includeAssetInfo": true
+}
+```
+
+Supported placement modes:
+
+- `position`: uses a local or global position and converts to the selected parent when needed.
+- `relative`: places the proposed node `left_of`, `right_of`, `above`, `below`, `centered_on`, or inside a corner of an existing reference node.
+- `scene_bounds`: aligns the proposed node to aggregate scene bounds.
+- `snapToGrid`: optional post-placement snapping with `gridSize`, `origin`, and `position`, `bounds_min`, or `bounds_center` mode.
+
+Supported asset types are textures, scenes, models, audio, fonts, and `.tres`/`.res` resources. Scripts are not attached, and `.json`/`.cfg` files are not placeable in this first version.
+
+Inference rules:
+
+- Texture assets default to `Sprite2D.texture`.
+- Scene assets use an `instance` plan.
+- Model assets use `MeshInstance3D.mesh` when loaded as a mesh, otherwise an instance-style plan.
+- Audio assets default to `AudioStreamPlayer2D` in 2D scenes and `AudioStreamPlayer3D` in 3D scenes.
+- Font assets default to `Label` with a limited future font assignment plan.
+- Resource assets require an explicit `nodeType` and `assetProperty`.
+
+Only safe properties are included in the plan: `position`, `scale`, `rotation`, `rotation_degrees`, `z_index`, `visible`, `size`, `text`, `disabled`, `enabled`, `centered`, `flip_h`, `flip_v`, `offset`, `zoom`, `volume_db`, and `autoplay`. Unknown properties are skipped with `UNKNOWN_PROPERTY_SKIPPED`.
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "assetPath": "res://assets/props/chair.png",
+  "valid": true,
+  "severity": "ok",
+  "summary": {
+    "errorCount": 0,
+    "warningCount": 0,
+    "infoCount": 0,
+    "assetType": "texture",
+    "nodeType": "Sprite2D",
+    "assetProperty": "texture",
+    "parentPath": "Room",
+    "proposedNodePath": "Room/Chair"
+  },
+  "issues": [],
+  "assetInfo": {
+    "assetType": "texture",
+    "resourceType": "Image",
+    "width": 32,
+    "height": 32,
+    "size": [32, 32]
+  },
+  "plan": [
+    {
+      "action": "add_node",
+      "path": "Room/Chair",
+      "parentPath": "Room",
+      "type": "Sprite2D",
+      "name": "Chair"
+    },
+    {
+      "action": "assign_asset",
+      "path": "Room/Chair",
+      "asset": "res://assets/props/chair.png",
+      "assetProperty": "texture"
+    },
+    {
+      "action": "set_properties",
+      "path": "Room/Chair",
+      "properties": {
+        "position": [128, 64]
+      }
+    }
+  ],
+  "proposedNode": {
+    "path": "Room/Chair",
+    "name": "Chair",
+    "type": "Sprite2D",
+    "parentPath": "Room",
+    "asset": "res://assets/props/chair.png",
+    "assetProperty": "texture",
+    "properties": {
+      "position": [128, 64]
+    },
+    "estimatedBounds": {
+      "available": true,
+      "space": "global",
+      "position": [112, 48],
+      "size": [32, 32],
+      "center": [128, 64],
+      "min": [112, 48],
+      "max": [144, 80]
+    }
+  },
+  "layoutBefore": null,
+  "limits": {
+    "maxDepthRequested": null,
+    "maxDepthApplied": 100,
+    "maxDepthClamped": false
+  }
+}
+```
+
+Current limitations: this is read-only and does not add nodes, save scenes, import assets, reimport assets, or attach scripts. Estimated bounds are reliable for simple texture placements and intentionally conservative or unavailable for complex scenes and models.
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Then call `dry_run_place_asset_in_scene` with an existing scene and an existing texture asset. Confirm the returned plan is valid and the scene file hash is unchanged.
 
 ### `validate_scene`
 

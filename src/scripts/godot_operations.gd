@@ -28,7 +28,7 @@ func _init():
     
     var operation = args[operation_index]
     var params_json = args[params_index]
-    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "dry_run_align_nodes" or operation == "align_nodes" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
+    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "dry_run_align_nodes" or operation == "align_nodes" or operation == "dry_run_place_asset_in_scene" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
 
     if quiet_output:
         debug_mode = false
@@ -71,6 +71,8 @@ func _init():
             dry_run_align_nodes(params)
         "align_nodes":
             align_nodes(params)
+        "dry_run_place_asset_in_scene":
+            dry_run_place_asset_in_scene(params)
         "validate_scene":
             validate_scene(params)
         "get_asset_info":
@@ -2116,6 +2118,653 @@ func align_nodes(params):
     scene_root.free()
     var result = align_nodes_result(project_path, scene_path, dry_run_result, issues, plan, applied_changes, save_error, bytes_written, post_validation, layout_after, include_plan, true, true)
     print(JSON.stringify(result))
+
+func place_asset_error(error_code, message):
+    return {
+        "success": false,
+        "error": error_code,
+        "message": message
+    }
+
+func place_asset_add_issue(issues, severity, code, message, node_path=null, asset_path=null, prop_name=null, suggestion=null):
+    var issue = {
+        "severity": severity,
+        "code": code,
+        "message": message
+    }
+    if node_path != null:
+        issue["nodePath"] = node_path
+    if asset_path != null:
+        issue["asset"] = asset_path
+    if prop_name != null:
+        issue["property"] = prop_name
+    if suggestion != null:
+        issue["suggestion"] = suggestion
+    issues.append(issue)
+
+func place_asset_safe_node_name_from_asset(asset_path):
+    var base_name = asset_path.get_file().get_basename()
+    var safe_name = ""
+    var capitalize_next = true
+    var allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+    for index in range(base_name.length()):
+        var character = base_name.substr(index, 1)
+        if allowed.contains(character):
+            if capitalize_next:
+                safe_name += character.to_upper()
+                capitalize_next = false
+            else:
+                safe_name += character
+        else:
+            capitalize_next = true
+
+    if safe_name.is_empty():
+        safe_name = "Asset"
+    var first_character = safe_name.substr(0, 1)
+    if "0123456789".contains(first_character):
+        safe_name = "Asset" + safe_name
+    return safe_name
+
+func place_asset_validate_node_type(node_type, proposed_path, issues):
+    if typeof(node_type) != TYPE_STRING or node_type.strip_edges().is_empty():
+        place_asset_add_issue(issues, "error", "INVALID_NODE_TYPE", "Node type must be a non-empty Godot class name.", proposed_path, null, "nodeType", "Use a built-in node type such as Sprite2D, TextureRect, MeshInstance3D, AudioStreamPlayer2D, or Label.")
+        return false
+
+    var clean_type = node_type.strip_edges()
+    if clean_type.contains("/") or clean_type.contains("\\") or clean_type.contains("://") or clean_type.get_extension().to_lower() == "gd":
+        place_asset_add_issue(issues, "error", "INVALID_NODE_TYPE", "Node type must be a Godot class name, not a script or filesystem path.", proposed_path, null, "nodeType", "Use built-in node types; script classes are not supported by this dry-run.")
+        return false
+
+    if not ClassDB.class_exists(clean_type):
+        place_asset_add_issue(issues, "error", "INVALID_NODE_TYPE", "Node type does not exist or custom script classes are not supported.", proposed_path, null, "nodeType", "Use a concrete built-in Godot node type.")
+        return false
+
+    if not ClassDB.can_instantiate(clean_type):
+        place_asset_add_issue(issues, "error", "INVALID_NODE_TYPE", "Node type exists but cannot be instantiated.", proposed_path, null, "nodeType", "Use a concrete Godot node type.")
+        return false
+
+    return true
+
+func place_asset_scene_dimension(root, parent):
+    if parent is Node3D:
+        return 3
+    if parent is CanvasItem:
+        return 2
+    if root is Node3D:
+        return 3
+    return 2
+
+func place_asset_infer_node_type(asset_type, asset_info, root, parent):
+    var dimension = place_asset_scene_dimension(root, parent)
+    if asset_type == "texture":
+        return "Sprite2D"
+    if asset_type == "scene":
+        return "Node"
+    if asset_type == "model":
+        if asset_info.has("resourceType") and (asset_info["resourceType"] == "Mesh" or asset_info["resourceType"] == "ArrayMesh"):
+            return "MeshInstance3D"
+        return "Node3D"
+    if asset_type == "audio":
+        if dimension == 3:
+            return "AudioStreamPlayer3D"
+        if dimension == 2:
+            return "AudioStreamPlayer2D"
+        return "AudioStreamPlayer"
+    if asset_type == "font":
+        return "Label"
+    return null
+
+func place_asset_infer_asset_property(asset_type, node_type, asset_info, explicit_property, issues, proposed_path, asset_path):
+    if explicit_property != null:
+        if typeof(explicit_property) != TYPE_STRING or explicit_property.strip_edges().is_empty():
+            place_asset_add_issue(issues, "error", "UNSUPPORTED_ASSET_NODE_COMBINATION", "assetProperty must be a non-empty string when provided.", proposed_path, asset_path, "assetProperty", "Use texture, stream, mesh, instance, font, or a supported explicit resource property.")
+            return null
+        return explicit_property.strip_edges()
+
+    if asset_type == "texture" and (dry_run_class_is_or_inherits(node_type, "Sprite2D") or dry_run_class_is_or_inherits(node_type, "TextureRect")):
+        return "texture"
+    if asset_type == "audio" and (node_type == "AudioStreamPlayer" or node_type == "AudioStreamPlayer2D" or node_type == "AudioStreamPlayer3D"):
+        return "stream"
+    if asset_type == "scene":
+        return "instance"
+    if asset_type == "model":
+        if dry_run_class_is_or_inherits(node_type, "MeshInstance3D") and asset_info.has("resourceType") and asset_info["resourceType"] != "PackedScene":
+            return "mesh"
+        return "instance"
+    if asset_type == "font" and dry_run_class_is_or_inherits(node_type, "Label"):
+        place_asset_add_issue(issues, "warning", "FONT_ASSIGNMENT_LIMITED", "Font assignment is represented as a future safe theme override plan.", proposed_path, asset_path, "assetProperty", "Review font assignment before applying a future write operation.")
+        return "font"
+    return null
+
+func place_asset_validate_asset_combination(asset_type, node_type, asset_property, proposed_path, asset_path, issues):
+    if asset_type == "script":
+        place_asset_add_issue(issues, "error", "UNSUPPORTED_ASSET_TYPE", "Script assets are not supported for placement and will not be attached.", proposed_path, asset_path, "assetPath", "Use a non-script asset; attach scripts in a later explicit tool.")
+        return false
+    if asset_type == "data":
+        place_asset_add_issue(issues, "error", "UNSUPPORTED_ASSET_TYPE", "JSON and CFG data files are not supported for scene placement in this version.", proposed_path, asset_path, "assetPath", "Use a texture, scene, model, audio, font, or resource asset.")
+        return false
+    if asset_type == "unknown":
+        place_asset_add_issue(issues, "error", "UNSUPPORTED_ASSET_TYPE", "Asset type is not supported for placement.", proposed_path, asset_path, "assetPath", "Use a supported Godot asset type.")
+        return false
+
+    var compatible = false
+    if asset_type == "texture":
+        compatible = asset_property == "texture" and (dry_run_class_is_or_inherits(node_type, "Sprite2D") or dry_run_class_is_or_inherits(node_type, "TextureRect"))
+    elif asset_type == "scene":
+        compatible = asset_property == "instance"
+    elif asset_type == "model":
+        compatible = (asset_property == "mesh" and dry_run_class_is_or_inherits(node_type, "MeshInstance3D")) or asset_property == "instance"
+    elif asset_type == "audio":
+        compatible = asset_property == "stream" and (node_type == "AudioStreamPlayer" or node_type == "AudioStreamPlayer2D" or node_type == "AudioStreamPlayer3D")
+    elif asset_type == "font":
+        compatible = asset_property == "font" and dry_run_class_is_or_inherits(node_type, "Label")
+    elif asset_type == "resource":
+        compatible = asset_property != null and not str(asset_property).strip_edges().is_empty()
+
+    if not compatible:
+        place_asset_add_issue(issues, "error", "UNSUPPORTED_ASSET_NODE_COMBINATION", "Asset type, node type, and assetProperty are not a supported placement combination.", proposed_path, asset_path, "assetProperty", "Use a compatible node type or set assetProperty explicitly.")
+        return false
+    return true
+
+func place_asset_sanitize_properties(raw_properties, node_type, proposed_path, issues):
+    var sanitized = {}
+    if raw_properties == null:
+        return sanitized
+
+    var allowlist = create_scene_blueprint_safe_properties()
+    for property_name in raw_properties.keys():
+        var value = raw_properties[property_name]
+        if not allowlist.has(property_name):
+            place_asset_add_issue(issues, "warning", "UNKNOWN_PROPERTY_SKIPPED", "Unknown property was skipped by the placement planner.", proposed_path, null, property_name, "Only common safe properties are included in the dry-run plan.")
+            continue
+
+        if property_name == "position" or property_name == "scale":
+            var expected_size = dry_run_expected_vector_size(node_type, property_name)
+            var valid_vector = false
+            if expected_size == 0:
+                valid_vector = dry_run_is_number_array(value, 2) or dry_run_is_number_array(value, 3)
+            else:
+                valid_vector = dry_run_is_number_array(value, expected_size)
+            if not valid_vector:
+                place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", property_name + " must be a numeric array with the expected vector size.", proposed_path, null, property_name, "Use [x, y] for 2D nodes or [x, y, z] for 3D nodes.")
+                continue
+        elif property_name == "offset" or property_name == "zoom" or property_name == "size":
+            if not dry_run_is_number_array(value, 2):
+                place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", property_name + " must be a numeric [x, y] array.", proposed_path, null, property_name, "Use a numeric array with two values.")
+                continue
+        elif property_name == "rotation" or property_name == "rotation_degrees" or property_name == "z_index" or property_name == "volume_db":
+            if not dry_run_is_number_value(value):
+                place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", property_name + " must be a number.", proposed_path, null, property_name, "Use a numeric value.")
+                continue
+        elif property_name == "visible" or property_name == "disabled" or property_name == "enabled" or property_name == "centered" or property_name == "flip_h" or property_name == "flip_v" or property_name == "autoplay":
+            if typeof(value) != TYPE_BOOL:
+                place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", property_name + " must be a boolean.", proposed_path, null, property_name, "Use true or false.")
+                continue
+        elif property_name == "text":
+            if typeof(value) != TYPE_STRING:
+                place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", "text must be a string.", proposed_path, null, property_name, "Use a string value.")
+                continue
+
+        sanitized[property_name] = value
+    return sanitized
+
+func place_asset_texture_size(asset_info):
+    if asset_info.has("metadata") and typeof(asset_info["metadata"]) == TYPE_DICTIONARY:
+        var metadata = asset_info["metadata"]
+        if metadata.has("width") and metadata.has("height"):
+            return [metadata["width"], metadata["height"]]
+        if metadata.has("size") and dry_align_is_number_array_any_size(metadata["size"], [2]):
+            return metadata["size"]
+    return null
+
+func place_asset_estimated_bounds(asset_info, node_type, properties, global_position, issues, proposed_path):
+    if global_position == null or not dry_align_is_number_array_any_size(global_position, [2]):
+        place_asset_add_issue(issues, "warning", "ESTIMATED_BOUNDS_UNAVAILABLE", "Estimated bounds are unavailable for non-2D placement.", proposed_path)
+        return layout_empty_bounds("global")
+
+    var asset_type = asset_info["assetType"] if asset_info.has("assetType") else "unknown"
+    if asset_type != "texture":
+        var code = "SCENE_INSTANCE_BOUNDS_UNKNOWN" if asset_type == "scene" else "ESTIMATED_BOUNDS_UNAVAILABLE"
+        place_asset_add_issue(issues, "warning", code, "Estimated bounds are unavailable for this asset type.", proposed_path, asset_info["path"] if asset_info.has("path") else null)
+        return layout_empty_bounds("global")
+
+    var texture_size = place_asset_texture_size(asset_info)
+    if texture_size == null:
+        place_asset_add_issue(issues, "warning", "ESTIMATED_BOUNDS_UNAVAILABLE", "Texture dimensions are unavailable, so estimated bounds are unavailable.", proposed_path, asset_info["path"] if asset_info.has("path") else null)
+        return layout_empty_bounds("global")
+
+    var scale = [1, 1]
+    if properties.has("scale") and dry_align_is_number_array_any_size(properties["scale"], [2]):
+        scale = properties["scale"]
+
+    var texture_width = texture_size.get(0)
+    var texture_height = texture_size.get(1)
+    var size = [abs(texture_width * scale[0]), abs(texture_height * scale[1])]
+    if dry_run_class_is_or_inherits(node_type, "TextureRect"):
+        if properties.has("size") and dry_align_is_number_array_any_size(properties["size"], [2]):
+            size = [abs(properties["size"][0] * scale[0]), abs(properties["size"][1] * scale[1])]
+        return layout_bounds_from_arrays(global_position, [global_position[0] + size[0], global_position[1] + size[1]], "global")
+
+    var centered = true
+    if properties.has("centered") and typeof(properties["centered"]) == TYPE_BOOL:
+        centered = properties["centered"]
+    var offset = [0, 0]
+    if properties.has("offset") and dry_align_is_number_array_any_size(properties["offset"], [2]):
+        offset = properties["offset"]
+
+    var min_values = [global_position[0] + offset[0], global_position[1] + offset[1]]
+    if centered:
+        min_values = [global_position[0] - size[0] / 2.0 + offset[0], global_position[1] - size[1] / 2.0 + offset[1]]
+    var max_values = [min_values[0] + size[0], min_values[1] + size[1]]
+    return layout_bounds_from_arrays(min_values, max_values, "global")
+
+func place_asset_global_to_local(parent, global_position):
+    if not dry_align_is_number_array_any_size(global_position, [2, 3]):
+        return null
+    if parent is CanvasItem:
+        if global_position.size() != 2:
+            return null
+        return vector2_to_array(parent.get_global_transform().affine_inverse() * Vector2(global_position[0], global_position[1]))
+    if parent is Node3D:
+        if global_position.size() != 3:
+            return null
+        return vector3_to_array(parent.global_transform.affine_inverse() * Vector3(global_position[0], global_position[1], global_position[2]))
+    return dry_align_duplicate_array(global_position)
+
+func place_asset_local_to_global(parent, local_position):
+    if not dry_align_is_number_array_any_size(local_position, [2, 3]):
+        return null
+    if parent is CanvasItem:
+        if local_position.size() != 2:
+            return null
+        return vector2_to_array(parent.get_global_transform() * Vector2(local_position[0], local_position[1]))
+    if parent is Node3D:
+        if local_position.size() != 3:
+            return null
+        return vector3_to_array(parent.global_transform * Vector3(local_position[0], local_position[1], local_position[2]))
+    return dry_align_duplicate_array(local_position)
+
+func place_asset_snap_global_position(global_position, bounds, snap_to_grid, issues, proposed_path):
+    if typeof(snap_to_grid) != TYPE_DICTIONARY:
+        place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", "snapToGrid must be an object.", proposed_path, null, "snapToGrid")
+        return global_position
+
+    var grid_size = dry_run_get_value(snap_to_grid, ["gridSize", "grid_size"], null)
+    if not dry_align_is_number_array_any_size(grid_size, [2]):
+        place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", "snapToGrid.gridSize must be a numeric [x, y] array.", proposed_path, null, "snapToGrid")
+        return global_position
+    if grid_size[0] <= 0 or grid_size[1] <= 0:
+        place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", "snapToGrid.gridSize values must be greater than zero.", proposed_path, null, "snapToGrid")
+        return global_position
+
+    var origin = dry_run_get_value(snap_to_grid, ["origin"], [0, 0])
+    if not dry_align_is_number_array_any_size(origin, [2]):
+        place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", "snapToGrid.origin must be a numeric [x, y] array.", proposed_path, null, "snapToGrid")
+        return global_position
+
+    var mode = dry_run_get_value(snap_to_grid, ["mode"], "position")
+    if not ["position", "bounds_min", "bounds_center"].has(mode):
+        place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", "snapToGrid.mode must be position, bounds_min, or bounds_center.", proposed_path, null, "snapToGrid")
+        return global_position
+
+    var point = global_position
+    if mode == "bounds_min" or mode == "bounds_center":
+        if not dry_align_bounds_available(bounds):
+            place_asset_add_issue(issues, "error", "BOUNDS_UNAVAILABLE", "Estimated bounds are required for this snapToGrid mode.", proposed_path, null, "snapToGrid")
+            return global_position
+        point = bounds["min"] if mode == "bounds_min" else bounds["center"]
+
+    var snapped = dry_align_duplicate_array(point)
+    snapped[0] = dry_align_snap_value(point[0], grid_size[0], origin[0])
+    snapped[1] = dry_align_snap_value(point[1], grid_size[1], origin[1])
+    return [
+        global_position[0] + snapped[0] - point[0],
+        global_position[1] + snapped[1] - point[1]
+    ]
+
+func place_asset_calculate_position(placement, parent, layout_by_path, node_by_path, layout_nodes, scene_bounds, bounds_source, asset_info, node_type, properties, proposed_path, issues):
+    if placement == null:
+        place_asset_add_issue(issues, "info", "DEFAULT_PLACEMENT_USED", "No placement was provided; defaulting to parent origin.", proposed_path)
+        var default_dimension = 3 if parent is Node3D else 2
+        var default_local = dry_align_zero_array(default_dimension)
+        return {
+            "success": true,
+            "local": default_local,
+            "global": place_asset_local_to_global(parent, default_local)
+        }
+
+    var mode = dry_run_get_value(placement, ["mode"], null)
+    if typeof(mode) != TYPE_STRING:
+        place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", "placement.mode is required.", proposed_path, null, "placement")
+        return {"success": false}
+
+    var margin_result = dry_align_parse_margin(dry_run_get_value(placement, ["margin"], null))
+    if not margin_result["success"]:
+        place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", margin_result["message"], proposed_path, null, "placement.margin")
+        return {"success": false}
+    var margin = margin_result["value"]
+    var proposed_global = null
+
+    if mode == "position":
+        var position = dry_run_get_value(placement, ["position"], null)
+        if not dry_align_is_number_array_any_size(position, [2, 3]):
+            place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", "placement.position must be a numeric [x, y] or [x, y, z] array.", proposed_path, null, "placement.position")
+            return {"success": false}
+        var space = dry_run_get_value(placement, ["space"], "local")
+        if not (space == "local" or space == "global"):
+            place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", "placement.space must be local or global.", proposed_path, null, "placement.space")
+            return {"success": false}
+        if space == "local":
+            proposed_global = place_asset_local_to_global(parent, position)
+            if proposed_global == null:
+                place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", "Could not convert local placement position to global coordinates.", proposed_path, null, "placement.position")
+                return {"success": false}
+        else:
+            proposed_global = position
+
+    elif mode == "relative":
+        var reference_path_value = dry_run_get_value(placement, ["referenceNodePath", "reference_node_path"], null)
+        var reference_path_result = dry_run_normalize_scene_node_path(reference_path_value)
+        if reference_path_result.has("error"):
+            place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", reference_path_result["error"], proposed_path, null, "placement.referenceNodePath")
+            return {"success": false}
+        var reference_path = reference_path_result["path"]
+        if not node_by_path.has(reference_path):
+            place_asset_add_issue(issues, "error", "PARENT_NODE_NOT_FOUND", "Reference node was not found in the scene.", reference_path, null, "placement.referenceNodePath", "Use get_scene_layout to inspect valid node paths.")
+            return {"success": false}
+
+        var relation = dry_run_get_value(placement, ["relation"], null)
+        var allowed_relations = ["left_of", "right_of", "above", "below", "centered_on", "inside_top_left", "inside_top_right", "inside_bottom_left", "inside_bottom_right"]
+        if typeof(relation) != TYPE_STRING or not allowed_relations.has(relation):
+            place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", "placement.relation is not supported.", proposed_path, null, "placement.relation")
+            return {"success": false}
+
+        var selected_reference = dry_align_select_bounds(layout_by_path[reference_path], bounds_source, issues, -1, "dry_run_place_asset_in_scene", reference_path)
+        if not selected_reference["success"]:
+            place_asset_add_issue(issues, "error", selected_reference["error"], selected_reference["message"], reference_path, null, "boundsSource")
+            return {"success": false}
+
+        var reference_bounds = selected_reference["bounds"]
+        if not dry_align_bounds_available(reference_bounds) or reference_bounds["center"].size() != 2:
+            place_asset_add_issue(issues, "error", "BOUNDS_UNAVAILABLE", "Relative placement requires 2D reference bounds.", reference_path, null, "boundsSource")
+            return {"success": false}
+
+        var base_bounds = place_asset_estimated_bounds(asset_info, node_type, properties, [0, 0], issues, proposed_path)
+        if not dry_align_bounds_available(base_bounds):
+            place_asset_add_issue(issues, "error", "BOUNDS_UNAVAILABLE", "Relative placement requires estimated bounds for the new asset.", proposed_path, asset_info["path"] if asset_info.has("path") else null)
+            return {"success": false}
+
+        proposed_global = [0, 0]
+        if relation == "left_of":
+            proposed_global[0] += (reference_bounds["min"][0] - margin[0]) - base_bounds["max"][0]
+        elif relation == "right_of":
+            proposed_global[0] += (reference_bounds["max"][0] + margin[0]) - base_bounds["min"][0]
+        elif relation == "above":
+            proposed_global[1] += (reference_bounds["min"][1] - margin[1]) - base_bounds["max"][1]
+        elif relation == "below":
+            proposed_global[1] += (reference_bounds["max"][1] + margin[1]) - base_bounds["min"][1]
+        elif relation == "centered_on":
+            proposed_global[0] += (reference_bounds["center"][0] + margin[0]) - base_bounds["center"][0]
+            proposed_global[1] += (reference_bounds["center"][1] + margin[1]) - base_bounds["center"][1]
+        elif relation == "inside_top_left":
+            proposed_global[0] += (reference_bounds["min"][0] + margin[0]) - base_bounds["min"][0]
+            proposed_global[1] += (reference_bounds["min"][1] + margin[1]) - base_bounds["min"][1]
+        elif relation == "inside_top_right":
+            proposed_global[0] += (reference_bounds["max"][0] - margin[0]) - base_bounds["max"][0]
+            proposed_global[1] += (reference_bounds["min"][1] + margin[1]) - base_bounds["min"][1]
+        elif relation == "inside_bottom_left":
+            proposed_global[0] += (reference_bounds["min"][0] + margin[0]) - base_bounds["min"][0]
+            proposed_global[1] += (reference_bounds["max"][1] - margin[1]) - base_bounds["max"][1]
+        elif relation == "inside_bottom_right":
+            proposed_global[0] += (reference_bounds["max"][0] - margin[0]) - base_bounds["max"][0]
+            proposed_global[1] += (reference_bounds["max"][1] - margin[1]) - base_bounds["max"][1]
+
+    elif mode == "scene_bounds":
+        var alignment = dry_run_get_value(placement, ["alignment"], null)
+        var allowed_alignments = ["left", "right", "top", "bottom", "center_x", "center_y", "center"]
+        if typeof(alignment) != TYPE_STRING or not allowed_alignments.has(alignment):
+            place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", "placement.alignment is not supported.", proposed_path, null, "placement.alignment")
+            return {"success": false}
+
+        var selected_scene = dry_align_select_scene_bounds(scene_bounds, layout_nodes, bounds_source, issues, -1, "dry_run_place_asset_in_scene")
+        if not selected_scene["success"]:
+            place_asset_add_issue(issues, "error", selected_scene["error"], selected_scene["message"], proposed_path, null, "boundsSource")
+            return {"success": false}
+
+        var scene_bounds_value = selected_scene["bounds"]
+        var scene_base_bounds = place_asset_estimated_bounds(asset_info, node_type, properties, [0, 0], issues, proposed_path)
+        if not dry_align_bounds_available(scene_base_bounds):
+            place_asset_add_issue(issues, "error", "BOUNDS_UNAVAILABLE", "Scene bounds placement requires estimated bounds for the new asset.", proposed_path, asset_info["path"] if asset_info.has("path") else null)
+            return {"success": false}
+
+        proposed_global = [0, 0]
+        if alignment == "left":
+            proposed_global[0] += (scene_bounds_value["min"][0] + margin[0]) - scene_base_bounds["min"][0]
+        elif alignment == "right":
+            proposed_global[0] += (scene_bounds_value["max"][0] - margin[0]) - scene_base_bounds["max"][0]
+        elif alignment == "top":
+            proposed_global[1] += (scene_bounds_value["min"][1] + margin[1]) - scene_base_bounds["min"][1]
+        elif alignment == "bottom":
+            proposed_global[1] += (scene_bounds_value["max"][1] - margin[1]) - scene_base_bounds["max"][1]
+        elif alignment == "center_x":
+            proposed_global[0] += (scene_bounds_value["center"][0] + margin[0]) - scene_base_bounds["center"][0]
+        elif alignment == "center_y":
+            proposed_global[1] += (scene_bounds_value["center"][1] + margin[1]) - scene_base_bounds["center"][1]
+        elif alignment == "center":
+            proposed_global[0] += (scene_bounds_value["center"][0] + margin[0]) - scene_base_bounds["center"][0]
+            proposed_global[1] += (scene_bounds_value["center"][1] + margin[1]) - scene_base_bounds["center"][1]
+    else:
+        place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", "placement.mode must be position, relative, or scene_bounds.", proposed_path, null, "placement.mode")
+        return {"success": false}
+
+    if proposed_global == null:
+        place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", "Could not calculate a proposed placement position.", proposed_path, null, "placement")
+        return {"success": false}
+
+    var estimated_bounds = place_asset_estimated_bounds(asset_info, node_type, properties, proposed_global, issues, proposed_path)
+    var snap_to_grid = dry_run_get_value(placement, ["snapToGrid", "snap_to_grid"], null)
+    if snap_to_grid != null:
+        proposed_global = place_asset_snap_global_position(proposed_global, estimated_bounds, snap_to_grid, issues, proposed_path)
+        estimated_bounds = place_asset_estimated_bounds(asset_info, node_type, properties, proposed_global, issues, proposed_path)
+
+    var proposed_local = place_asset_global_to_local(parent, proposed_global)
+    if proposed_local == null:
+        place_asset_add_issue(issues, "error", "INVALID_PLACEMENT", "Could not convert proposed global position to local parent coordinates.", proposed_path, null, "placement")
+        return {"success": false}
+
+    return {
+        "success": true,
+        "local": proposed_local,
+        "global": proposed_global,
+        "bounds": estimated_bounds
+    }
+
+func place_asset_compact_asset_info(asset_info):
+    if asset_info == null or typeof(asset_info) != TYPE_DICTIONARY:
+        return null
+    var compact = {
+        "assetType": asset_info["assetType"] if asset_info.has("assetType") else "unknown",
+        "resourceType": asset_info["resourceType"] if asset_info.has("resourceType") else null
+    }
+    if asset_info.has("metadata") and typeof(asset_info["metadata"]) == TYPE_DICTIONARY:
+        var metadata = asset_info["metadata"]
+        if metadata.has("width"):
+            compact["width"] = metadata["width"]
+        if metadata.has("height"):
+            compact["height"] = metadata["height"]
+        if metadata.has("size"):
+            compact["size"] = metadata["size"]
+    return compact
+
+func place_asset_finish_result(project_path, scene_path, asset_path, asset_info, include_asset_info, include_plan, include_layout_before, layout_data, bounds_source, issues, plan, proposed_node, summary, limits):
+    var counts = dry_align_issue_counts(issues)
+    var severity = dry_align_severity_from_counts(counts)
+    summary["errorCount"] = counts["errorCount"]
+    summary["warningCount"] = counts["warningCount"]
+    summary["infoCount"] = counts["infoCount"]
+
+    return {
+        "success": true,
+        "projectPath": project_path,
+        "scenePath": scene_path,
+        "assetPath": asset_path,
+        "valid": counts["errorCount"] == 0,
+        "severity": severity,
+        "summary": summary,
+        "issues": issues,
+        "assetInfo": place_asset_compact_asset_info(asset_info) if include_asset_info else null,
+        "plan": plan if include_plan else [],
+        "proposedNode": proposed_node,
+        "layoutBefore": dry_align_compact_layout_before(layout_data["nodes"], layout_data["sceneBounds"], bounds_source) if include_layout_before else null,
+        "limits": limits
+    }
+
+func dry_run_place_asset_in_scene(params):
+    if not params.has("scene_path"):
+        print(JSON.stringify(place_asset_error("MISSING_SCENE_PATH", "scene_path is required.")))
+        return
+    if not params.has("asset_path"):
+        print(JSON.stringify(place_asset_error("MISSING_ASSET_PATH", "asset_path is required.")))
+        return
+
+    var scene_path = normalize_resource_scene_path(params.scene_path)
+    var asset_path = normalize_resource_scene_path(params.asset_path)
+    var project_path = params.project_path if params.has("project_path") else ProjectSettings.globalize_path("res://")
+    var bounds_source = params.bounds_source if params.has("bounds_source") else "visual"
+    var include_plan = params.include_plan if params.has("include_plan") else true
+    var include_layout_before = params.include_layout_before if params.has("include_layout_before") else false
+    var include_asset_info = params.include_asset_info if params.has("include_asset_info") else true
+    var max_depth = int(params.max_depth) if params.has("max_depth") else 100
+    var limits = {
+        "maxDepthRequested": params.max_depth_requested if params.has("max_depth_requested") else null,
+        "maxDepthApplied": max_depth,
+        "maxDepthClamped": params.max_depth_clamped if params.has("max_depth_clamped") else false
+    }
+
+    if not FileAccess.file_exists(scene_path):
+        print(JSON.stringify(place_asset_error("SCENE_PATH_NOT_FOUND", "Scene file does not exist: " + scene_path)))
+        return
+    if not FileAccess.file_exists(asset_path):
+        print(JSON.stringify(place_asset_error("ASSET_PATH_NOT_FOUND", "Asset file does not exist: " + asset_path)))
+        return
+
+    var scene_resource = ResourceLoader.load(scene_path)
+    if scene_resource == null or not (scene_resource is PackedScene):
+        print(JSON.stringify(place_asset_error("SCENE_LOAD_FAILED", "Failed to load scene as PackedScene: " + scene_path)))
+        return
+
+    var scene_root = scene_resource.instantiate()
+    if scene_root == null:
+        print(JSON.stringify(place_asset_error("SCENE_INSTANTIATE_FAILED", "Failed to instantiate scene: " + scene_path)))
+        return
+
+    var issues = []
+    var plan = []
+    var layout_data = dry_align_build_layout(scene_root, max_depth)
+    var layout_by_path = layout_data["layoutByPath"]
+    var node_by_path = layout_data["nodeByPath"]
+    var layout_nodes = layout_data["nodes"]
+    var scene_bounds = layout_data["sceneBounds"]
+    var root_path = get_scene_node_path(scene_root, scene_root)
+
+    var parent_path = root_path
+    if params.has("parent_path") and params.parent_path != null:
+        var normalized_parent = dry_run_normalize_scene_node_path(params.parent_path)
+        if normalized_parent.has("error"):
+            place_asset_add_issue(issues, "error", "PARENT_NODE_NOT_FOUND", normalized_parent["error"], str(params.parent_path), null, "parentPath", "Use get_scene_layout to inspect valid parent paths.")
+        else:
+            parent_path = normalized_parent["path"]
+    if not node_by_path.has(parent_path):
+        place_asset_add_issue(issues, "error", "PARENT_NODE_NOT_FOUND", "Parent node was not found in the scene.", parent_path, null, "parentPath", "Use get_scene_layout to inspect valid parent paths.")
+
+    var parent_node = node_by_path[parent_path] if node_by_path.has(parent_path) else scene_root
+    var asset_info = inspect_asset(asset_path, {
+        "includeDependencies": false,
+        "includeScenePreview": false,
+        "includePlacementHints": false
+    })
+    if not asset_info.has("success") or not asset_info["success"]:
+        scene_root.free()
+        print(JSON.stringify(place_asset_error(asset_info["error"] if asset_info.has("error") else "ASSET_LOAD_FAILED", asset_info["message"] if asset_info.has("message") else "Asset could not be inspected.")))
+        return
+
+    var asset_type = asset_info["assetType"]
+    var node_name = params.node_name if params.has("node_name") and params.node_name != null else place_asset_safe_node_name_from_asset(asset_path)
+    var name_error = dry_run_validate_node_name(node_name)
+    if name_error != null:
+        place_asset_add_issue(issues, "error", "INVALID_NODE_NAME", name_error, str(node_name), asset_path, "nodeName", "Use a simple node name without slashes, traversal, or null bytes.")
+        node_name = str(node_name).strip_edges()
+
+    var node_type = params.node_type.strip_edges() if params.has("node_type") and typeof(params.node_type) == TYPE_STRING else null
+    if node_type == null:
+        node_type = place_asset_infer_node_type(asset_type, asset_info, scene_root, parent_node)
+
+    var proposed_path = parent_path + "/" + str(node_name)
+    if node_type != null:
+        place_asset_validate_node_type(node_type, proposed_path, issues)
+    elif not ["script", "data", "unknown"].has(asset_type):
+        place_asset_add_issue(issues, "error", "UNSUPPORTED_ASSET_TYPE", "Could not infer a node type for this asset; provide nodeType if this asset is placeable.", proposed_path, asset_path, "nodeType", "Use a supported asset type or provide a compatible nodeType.")
+
+    if node_by_path.has(proposed_path):
+        place_asset_add_issue(issues, "error", "NODE_PATH_CONFLICT", "A node with the proposed name already exists under the selected parent.", proposed_path, asset_path, "nodeName", "Use a different nodeName such as " + str(node_name) + "2.")
+
+    var asset_property = place_asset_infer_asset_property(asset_type, node_type, asset_info, params.asset_property if params.has("asset_property") else null, issues, proposed_path, asset_path)
+    place_asset_validate_asset_combination(asset_type, node_type, asset_property, proposed_path, asset_path, issues)
+
+    var properties = place_asset_sanitize_properties(params.properties if params.has("properties") else null, node_type if node_type != null else "Node", proposed_path, issues)
+    var placement_result = {"success": false}
+    if not dry_align_has_error_issues(issues):
+        placement_result = place_asset_calculate_position(params.placement if params.has("placement") else null, parent_node, layout_by_path, node_by_path, layout_nodes, scene_bounds, bounds_source, asset_info, node_type, properties, proposed_path, issues)
+        if placement_result.has("success") and placement_result["success"]:
+            properties["position"] = placement_result["local"]
+
+    var estimated_bounds = placement_result["bounds"] if placement_result.has("bounds") else layout_empty_bounds("global")
+    var proposed_node = {
+        "path": proposed_path,
+        "name": str(node_name),
+        "type": node_type,
+        "parentPath": parent_path,
+        "asset": asset_path,
+        "assetProperty": asset_property,
+        "properties": properties,
+        "estimatedBounds": estimated_bounds
+    }
+
+    if not dry_align_has_error_issues(issues):
+        plan.append({
+            "action": "add_node",
+            "path": proposed_path,
+            "parentPath": parent_path,
+            "type": node_type,
+            "name": str(node_name)
+        })
+        plan.append({
+            "action": "assign_asset",
+            "path": proposed_path,
+            "asset": asset_path,
+            "assetProperty": asset_property
+        })
+        if properties.size() > 0:
+            plan.append({
+                "action": "set_properties",
+                "path": proposed_path,
+                "properties": properties
+            })
+
+    var summary = {
+        "errorCount": 0,
+        "warningCount": 0,
+        "infoCount": 0,
+        "assetType": asset_type,
+        "nodeType": node_type,
+        "assetProperty": asset_property,
+        "parentPath": parent_path,
+        "proposedNodePath": proposed_path
+    }
+    var result = place_asset_finish_result(project_path, scene_path, asset_path, asset_info, include_asset_info, include_plan, include_layout_before, layout_data, bounds_source, issues, plan, proposed_node, summary, limits)
+    print(JSON.stringify(result))
+    scene_root.free()
 
 func is_nearly_zero(value):
     return abs(value) <= 0.0001
