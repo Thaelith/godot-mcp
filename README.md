@@ -142,6 +142,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "dry_run_align_nodes",
         "align_nodes",
         "dry_run_place_asset_in_scene",
+        "place_asset_in_scene",
         "validate_scene",
         "dry_run_scene_blueprint",
         "create_scene_from_blueprint",
@@ -1103,6 +1104,110 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Then call `dry_run_place_asset_in_scene` with an existing scene and an existing texture asset. Confirm the returned plan is valid and the scene file hash is unchanged.
+
+### `place_asset_in_scene`
+
+Safely adds an existing asset as a **new** node into an **existing** scene and saves the scene. This is the writing counterpart to `dry_run_place_asset_in_scene`: it reuses the exact same planning logic and refuses to write whenever the dry-run plan contains any error issue (when `validateBeforeWrite` is true). Only the requested scene file is modified — assets are never edited, imported, or reimported, and no other files are written.
+
+Place a texture at an explicit position:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "assetPath": "res://assets/props/chair.png",
+  "parentPath": "Room",
+  "nodeName": "Chair",
+  "placement": { "mode": "position", "position": [128, 64], "space": "local" }
+}
+```
+
+Place a texture to the right of an existing node:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "assetPath": "assets/props/chair.png",
+  "nodeName": "Chair",
+  "boundsSource": "visual",
+  "placement": { "mode": "relative", "referenceNodePath": "Room/Table", "relation": "right_of", "margin": 8 }
+}
+```
+
+> Reference and parent node paths are rooted at the scene root, e.g. `Room/Table` (use `get_scene_layout` to inspect valid paths).
+
+Place an asset centered in scene bounds:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "assetPath": "res://assets/props/chair.png",
+  "placement": { "mode": "scene_bounds", "alignment": "center", "margin": 0 },
+  "validateBeforeWrite": true,
+  "validateAfterWrite": true
+}
+```
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "assetPath": "res://assets/props/chair.png",
+  "placed": true,
+  "saved": true,
+  "valid": true,
+  "severity": "ok",
+  "summary": {
+    "errorCount": 0, "warningCount": 0, "infoCount": 0,
+    "assetType": "texture", "nodeType": "Sprite2D", "assetProperty": "texture",
+    "parentPath": "Room", "newNodePath": "Room/Chair"
+  },
+  "issues": [],
+  "plan": [
+    { "action": "add_node", "path": "Room/Chair", "parentPath": "Room", "type": "Sprite2D", "name": "Chair" },
+    { "action": "assign_asset", "path": "Room/Chair", "asset": "res://assets/props/chair.png", "assetProperty": "texture" },
+    { "action": "set_properties", "path": "Room/Chair", "properties": { "position": [128, 64] } }
+  ],
+  "createdNode": {
+    "path": "Room/Chair", "name": "Chair", "type": "Sprite2D", "parentPath": "Room",
+    "asset": "res://assets/props/chair.png", "assetProperty": "texture",
+    "properties": { "position": [128, 64] }
+  },
+  "write": { "saved": true, "resourceSaverCode": 0, "bytesWritten": 1234 },
+  "postValidation": { "loadable": true, "instantiable": true, "nodeExists": true, "assetAssigned": true, "positionMatches": true },
+  "layoutBefore": null,
+  "layoutAfter": null,
+  "limits": { "maxDepthRequested": null, "maxDepthApplied": 100, "maxDepthClamped": false }
+}
+```
+
+**Difference from `dry_run_place_asset_in_scene`:** the dry-run is read-only and only returns a plan; `place_asset_in_scene` applies that plan, creates the node, assigns the asset, saves the scene, and post-validates the saved result. It always runs the dry-run planner first and never writes when planning has errors.
+
+**Supported placement modes:** `position`, `relative`, `scene_bounds`, plus optional post-placement `snapToGrid` — identical to the dry-run. No new modes are added.
+
+**Supported asset types (writer):** textures (`.png`, `.jpg`, `.jpeg`, `.webp`, `.svg`, `.tga`, `.bmp`), scenes (`.tscn`, `.scn`), models (`.glb`, `.gltf`, `.obj`, `.fbx`), audio (`.wav`, `.ogg`, `.mp3`), fonts (`.ttf`, `.otf`), and resources (`.tres`, `.res`). Supported assignments: texture → `Sprite2D.texture`/`TextureRect.texture`, audio → `AudioStreamPlayer(2D/3D).stream`, mesh → `MeshInstance3D.mesh`, scene/model → instantiated as an `instance`, font → `Label` theme font override (skipped with a warning if unsupported by the engine version), and `.tres`/`.res` → assigned only with an explicit `assetProperty`.
+
+**Write scope:** exactly one new node (or one instanced scene/model) is added under the resolved parent. Existing nodes are never deleted, renamed, reparented, or modified; only the new node (and its new descendants for instances) get an owner set so `PackedScene` saves them. No backup files are created in this version.
+
+**Safe property allowlist:** `position`, `scale`, `rotation`, `rotation_degrees`, `z_index`, `visible`, `size`, `text`, `disabled`, `enabled`, `centered`, `flip_h`, `flip_v`, `offset`, `zoom`, `volume_db`, `autoplay`. Unknown or unsupported properties are skipped with `UNKNOWN_PROPERTY_SKIPPED` (placement is not failed). `script`, `owner`, groups, signals, and metadata are never written.
+
+**`validateBeforeWrite`** (default `true`): runs the planner and aborts with `DRY_RUN_VALIDATION_FAILED` before saving if the plan has any error issue. **`validateAfterWrite`** (default `true`): reloads the saved scene and verifies it loads as a `PackedScene`, instantiates, the new node exists, the asset assignment is present (matching `assetPath` when standalone provenance exists), and the planned position matches within an epsilon of `0.001`; failure returns `POST_VALIDATE_FAILED`.
+
+**Current limitations:** no live editor plugin, no arbitrary script attachment, no arbitrary property editing, no signal/group/metadata support, `.gd`/`.json`/`.cfg` are not placeable, custom script node classes are not supported, and only one node is added per call. Instanced scenes/models verify provenance by node existence only.
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Then call `dry_run_place_asset_in_scene` to confirm the plan is valid, call `place_asset_in_scene` with the same inputs, and verify with `read_scene_tree`/`get_scene_layout`/`validate_scene` that the new node was added and the scene still loads.
 
 ### `validate_scene`
 

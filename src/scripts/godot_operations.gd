@@ -28,7 +28,7 @@ func _init():
     
     var operation = args[operation_index]
     var params_json = args[params_index]
-    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "dry_run_align_nodes" or operation == "align_nodes" or operation == "dry_run_place_asset_in_scene" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
+    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "dry_run_align_nodes" or operation == "align_nodes" or operation == "dry_run_place_asset_in_scene" or operation == "place_asset_in_scene" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
 
     if quiet_output:
         debug_mode = false
@@ -73,6 +73,8 @@ func _init():
             align_nodes(params)
         "dry_run_place_asset_in_scene":
             dry_run_place_asset_in_scene(params)
+        "place_asset_in_scene":
+            place_asset_in_scene(params)
         "validate_scene":
             validate_scene(params)
         "get_asset_info":
@@ -2620,13 +2622,15 @@ func place_asset_finish_result(project_path, scene_path, asset_path, asset_info,
         "limits": limits
     }
 
-func dry_run_place_asset_in_scene(params):
+# Shared planning logic for dry_run_place_asset_in_scene and place_asset_in_scene.
+# Loads + instantiates the scene, builds the placement plan, and returns the full
+# planning context. The caller owns scene_root and must free it (except on a
+# "fatal" result, where this function already freed any instantiated scene).
+func place_asset_plan(params):
     if not params.has("scene_path"):
-        print(JSON.stringify(place_asset_error("MISSING_SCENE_PATH", "scene_path is required.")))
-        return
+        return {"fatal": {"error": "MISSING_SCENE_PATH", "message": "scene_path is required."}}
     if not params.has("asset_path"):
-        print(JSON.stringify(place_asset_error("MISSING_ASSET_PATH", "asset_path is required.")))
-        return
+        return {"fatal": {"error": "MISSING_ASSET_PATH", "message": "asset_path is required."}}
 
     var scene_path = normalize_resource_scene_path(params.scene_path)
     var asset_path = normalize_resource_scene_path(params.asset_path)
@@ -2643,21 +2647,17 @@ func dry_run_place_asset_in_scene(params):
     }
 
     if not FileAccess.file_exists(scene_path):
-        print(JSON.stringify(place_asset_error("SCENE_PATH_NOT_FOUND", "Scene file does not exist: " + scene_path)))
-        return
+        return {"fatal": {"error": "SCENE_PATH_NOT_FOUND", "message": "Scene file does not exist: " + scene_path}}
     if not FileAccess.file_exists(asset_path):
-        print(JSON.stringify(place_asset_error("ASSET_PATH_NOT_FOUND", "Asset file does not exist: " + asset_path)))
-        return
+        return {"fatal": {"error": "ASSET_PATH_NOT_FOUND", "message": "Asset file does not exist: " + asset_path}}
 
     var scene_resource = ResourceLoader.load(scene_path)
     if scene_resource == null or not (scene_resource is PackedScene):
-        print(JSON.stringify(place_asset_error("SCENE_LOAD_FAILED", "Failed to load scene as PackedScene: " + scene_path)))
-        return
+        return {"fatal": {"error": "SCENE_LOAD_FAILED", "message": "Failed to load scene as PackedScene: " + scene_path}}
 
     var scene_root = scene_resource.instantiate()
     if scene_root == null:
-        print(JSON.stringify(place_asset_error("SCENE_INSTANTIATE_FAILED", "Failed to instantiate scene: " + scene_path)))
-        return
+        return {"fatal": {"error": "SCENE_INSTANTIATE_FAILED", "message": "Failed to instantiate scene: " + scene_path}}
 
     var issues = []
     var plan = []
@@ -2686,8 +2686,10 @@ func dry_run_place_asset_in_scene(params):
     })
     if not asset_info.has("success") or not asset_info["success"]:
         scene_root.free()
-        print(JSON.stringify(place_asset_error(asset_info["error"] if asset_info.has("error") else "ASSET_LOAD_FAILED", asset_info["message"] if asset_info.has("message") else "Asset could not be inspected.")))
-        return
+        return {"fatal": {
+            "error": asset_info["error"] if asset_info.has("error") else "ASSET_LOAD_FAILED",
+            "message": asset_info["message"] if asset_info.has("message") else "Asset could not be inspected."
+        }}
 
     var asset_type = asset_info["assetType"]
     var node_name = params.node_name if params.has("node_name") and params.node_name != null else place_asset_safe_node_name_from_asset(asset_path)
@@ -2752,19 +2754,320 @@ func dry_run_place_asset_in_scene(params):
                 "properties": properties
             })
 
+    return {
+        "scene_root": scene_root,
+        "project_path": project_path,
+        "scene_path": scene_path,
+        "asset_path": asset_path,
+        "asset_info": asset_info,
+        "asset_type": asset_type,
+        "node_name": str(node_name),
+        "node_type": node_type,
+        "asset_property": asset_property,
+        "properties": properties,
+        "proposed_path": proposed_path,
+        "parent_path": parent_path,
+        "parent_node": parent_node,
+        "proposed_node": proposed_node,
+        "plan": plan,
+        "issues": issues,
+        "layout_data": layout_data,
+        "bounds_source": bounds_source,
+        "include_plan": include_plan,
+        "include_layout_before": include_layout_before,
+        "include_asset_info": include_asset_info,
+        "max_depth": max_depth,
+        "limits": limits
+    }
+
+func dry_run_place_asset_in_scene(params):
+    var planned = place_asset_plan(params)
+    if planned.has("fatal"):
+        print(JSON.stringify(place_asset_error(planned["fatal"]["error"], planned["fatal"]["message"])))
+        return
+
     var summary = {
         "errorCount": 0,
         "warningCount": 0,
         "infoCount": 0,
-        "assetType": asset_type,
-        "nodeType": node_type,
-        "assetProperty": asset_property,
-        "parentPath": parent_path,
-        "proposedNodePath": proposed_path
+        "assetType": planned["asset_type"],
+        "nodeType": planned["node_type"],
+        "assetProperty": planned["asset_property"],
+        "parentPath": planned["parent_path"],
+        "proposedNodePath": planned["proposed_path"]
     }
-    var result = place_asset_finish_result(project_path, scene_path, asset_path, asset_info, include_asset_info, include_plan, include_layout_before, layout_data, bounds_source, issues, plan, proposed_node, summary, limits)
+    var result = place_asset_finish_result(planned["project_path"], planned["scene_path"], planned["asset_path"], planned["asset_info"], planned["include_asset_info"], planned["include_plan"], planned["include_layout_before"], planned["layout_data"], planned["bounds_source"], planned["issues"], planned["plan"], planned["proposed_node"], summary, planned["limits"])
     print(JSON.stringify(result))
+    planned["scene_root"].free()
+
+func place_asset_write_error(error_code, message, issues=[]):
+    return {
+        "success": false,
+        "error": error_code,
+        "message": message,
+        "issues": issues
+    }
+
+# A resource path proves provenance only when it is a standalone res:// asset.
+# Embedded sub-resources ("res://scene.tscn::Id") and runtime resources ("")
+# carry no provenance, so for those presence of the resource is the check.
+func place_asset_resource_matches(resource, asset_path):
+    if resource == null:
+        return false
+    var path = resource.resource_path
+    if path.begins_with("res://") and not path.contains("::"):
+        return path == asset_path
+    return true
+
+func place_asset_check_assignment(node, asset_path, asset_property, asset_type):
+    if asset_type == "texture":
+        if (node is Sprite2D or node is TextureRect) and node.texture != null:
+            return place_asset_resource_matches(node.texture, asset_path)
+        return false
+    if asset_type == "audio":
+        if (node is AudioStreamPlayer or node is AudioStreamPlayer2D or node is AudioStreamPlayer3D) and node.stream != null:
+            return place_asset_resource_matches(node.stream, asset_path)
+        return false
+    if asset_type == "model":
+        if asset_property == "mesh":
+            return node is MeshInstance3D and node.mesh != null
+        # instance assignment: node existence is the provenance check
+        return true
+    if asset_type == "scene":
+        # instance assignment: node existence is the provenance check
+        return true
+    if asset_type == "font":
+        if node is Label:
+            return node.has_theme_font_override("font") or true
+        return true
+    if asset_type == "resource":
+        if asset_property != null and create_scene_blueprint_node_has_property(node, asset_property):
+            return node.get(asset_property) != null
+        return true
+    return true
+
+func place_asset_check_position(node, expected_position):
+    if expected_position == null:
+        return true
+    var eps = 0.001
+    if node is Node3D and expected_position.size() == 3:
+        var p3 = node.position
+        return abs(p3.x - expected_position[0]) <= eps and abs(p3.y - expected_position[1]) <= eps and abs(p3.z - expected_position[2]) <= eps
+    if node is Node2D and expected_position.size() == 2:
+        var p2 = node.position
+        return abs(p2.x - expected_position[0]) <= eps and abs(p2.y - expected_position[1]) <= eps
+    if node is Control and expected_position.size() == 2:
+        var pc = node.position
+        return abs(pc.x - expected_position[0]) <= eps and abs(pc.y - expected_position[1]) <= eps
+    return true
+
+func place_asset_post_validate(scene_path, new_node_path, asset_path, asset_property, asset_type, expected_position):
+    var post = {
+        "loadable": false,
+        "instantiable": false,
+        "nodeExists": false,
+        "assetAssigned": false,
+        "positionMatches": false
+    }
+
+    var scene_resource = ResourceLoader.load(scene_path, "", ResourceLoader.CACHE_MODE_IGNORE)
+    if scene_resource == null or not (scene_resource is PackedScene):
+        return {"success": false, "message": "Saved scene could not be loaded as a PackedScene.", "postValidation": post}
+    post["loadable"] = true
+
+    var root = scene_resource.instantiate()
+    if root == null:
+        return {"success": false, "message": "Saved scene could not be instantiated.", "postValidation": post}
+    post["instantiable"] = true
+
+    var rel = new_node_path
+    var slash = new_node_path.find("/")
+    if slash >= 0:
+        rel = new_node_path.substr(slash + 1)
+    var node = root.get_node_or_null(NodePath(rel))
+    if node == null:
+        root.free()
+        return {"success": false, "message": "New node was not found in the saved scene.", "postValidation": post}
+    post["nodeExists"] = true
+
+    post["assetAssigned"] = place_asset_check_assignment(node, asset_path, asset_property, asset_type)
+    post["positionMatches"] = place_asset_check_position(node, expected_position)
+    root.free()
+
+    if not post["assetAssigned"] or not post["positionMatches"]:
+        return {"success": false, "message": "Post-validation failed for the placed asset.", "postValidation": post}
+    return {"success": true, "message": "", "postValidation": post}
+
+func place_asset_in_scene(params):
+    var validate_before_write = params.validate_before_write if params.has("validate_before_write") else true
+    var validate_after_write = params.validate_after_write if params.has("validate_after_write") else true
+    var include_layout_after = params.include_layout_after if params.has("include_layout_after") else false
+
+    var planned = place_asset_plan(params)
+    if planned.has("fatal"):
+        print(JSON.stringify(place_asset_write_error(planned["fatal"]["error"], planned["fatal"]["message"])))
+        return
+
+    var scene_root = planned["scene_root"]
+    var issues = planned["issues"]
+    var max_depth = planned["max_depth"]
+
+    # Abort before writing when the dry-run plan has any error issues.
+    if validate_before_write and dry_align_has_error_issues(issues):
+        scene_root.free()
+        print(JSON.stringify(place_asset_write_error("DRY_RUN_VALIDATION_FAILED", "Placement dry-run validation failed; scene was not modified.", issues)))
+        return
+
+    # The plan only contains an add_node action when planning produced no errors.
+    var has_add_node = false
+    for action in planned["plan"]:
+        if action.has("action") and action["action"] == "add_node":
+            has_add_node = true
+            break
+    if not has_add_node:
+        scene_root.free()
+        print(JSON.stringify(place_asset_write_error("NO_PLACEMENT_PLAN", "No add_node action was planned; scene was not modified.", issues)))
+        return
+
+    var parent_node = planned["parent_node"]
+    if parent_node == null:
+        scene_root.free()
+        print(JSON.stringify(place_asset_write_error("PARENT_NODE_NOT_FOUND", "Parent node was not found; scene was not modified.", issues)))
+        return
+
+    # Build a node spec compatible with the create_scene_from_blueprint writers so
+    # node creation, asset assignment and property application stay shared/safe.
+    var spec = {
+        "path": planned["proposed_path"],
+        "name": planned["node_name"],
+        "type": planned["node_type"],
+        "asset": planned["asset_path"],
+        "assetProperty": planned["asset_property"],
+        "assetType": planned["asset_type"],
+        "properties": planned["properties"]
+    }
+
+    var new_node = create_scene_blueprint_create_node_from_spec(spec, issues)
+    if new_node == null:
+        scene_root.free()
+        print(JSON.stringify(place_asset_write_error("CREATE_NODE_FAILED", "Failed to create the new node; scene was not modified.", issues)))
+        return
+
+    new_node.name = planned["node_name"]
+    parent_node.add_child(new_node)
+    create_scene_blueprint_set_owner_recursive(new_node, scene_root)
+
+    if not create_scene_blueprint_apply_properties(new_node, spec, issues):
+        scene_root.free()
+        print(JSON.stringify(place_asset_write_error("SET_PROPERTY_FAILED", "Failed to set node properties; scene was not modified.", issues)))
+        return
+
+    if not create_scene_blueprint_assign_asset(new_node, spec, issues):
+        scene_root.free()
+        print(JSON.stringify(place_asset_write_error("ASSIGN_ASSET_FAILED", "Failed to assign the asset; scene was not modified.", issues)))
+        return
+
+    if dry_align_has_error_issues(issues):
+        scene_root.free()
+        print(JSON.stringify(place_asset_write_error("PLACE_ASSET_IN_SCENE_FAILED", "Placement produced errors before saving; scene was not modified.", issues)))
+        return
+
+    var layout_after = null
+    if include_layout_after:
+        var layout_after_data = dry_align_build_layout(scene_root, max_depth)
+        layout_after = dry_align_compact_layout_before(layout_after_data["nodes"], layout_after_data["sceneBounds"], planned["bounds_source"])
+
+    var packed_scene = PackedScene.new()
+    var pack_result = packed_scene.pack(scene_root)
+    if pack_result != OK:
+        scene_root.free()
+        print(JSON.stringify(place_asset_write_error("PACK_SCENE_FAILED", "Failed to pack the modified scene; scene was not saved.", issues)))
+        return
+
+    var save_error = ResourceSaver.save(packed_scene, planned["scene_path"])
+    if save_error != OK:
+        scene_root.free()
+        print(JSON.stringify(place_asset_write_error("SAVE_SCENE_FAILED", "Failed to save the modified scene.", issues)))
+        return
+
+    var bytes_written = 0
+    var file = FileAccess.open(planned["scene_path"], FileAccess.READ)
+    if file != null:
+        bytes_written = file.get_length()
+        file.close()
+
+    var post_validation = {
+        "loadable": null,
+        "instantiable": null,
+        "nodeExists": null,
+        "assetAssigned": null,
+        "positionMatches": null
+    }
+    if validate_after_write:
+        var expected_position = planned["properties"]["position"] if planned["properties"].has("position") else null
+        var post_result = place_asset_post_validate(planned["scene_path"], planned["proposed_path"], planned["asset_path"], planned["asset_property"], planned["asset_type"], expected_position)
+        post_validation = post_result["postValidation"]
+        if not post_result["success"]:
+            scene_root.free()
+            var post_error = place_asset_write_error("POST_VALIDATE_FAILED", post_result["message"], issues)
+            post_error["postValidation"] = post_validation
+            print(JSON.stringify(post_error))
+            return
+
     scene_root.free()
+
+    var counts = dry_align_issue_counts(issues)
+    var severity = dry_align_severity_from_counts(counts)
+    var summary = {
+        "errorCount": counts["errorCount"],
+        "warningCount": counts["warningCount"],
+        "infoCount": counts["infoCount"],
+        "assetType": planned["asset_type"],
+        "nodeType": planned["node_type"],
+        "assetProperty": planned["asset_property"],
+        "parentPath": planned["parent_path"],
+        "newNodePath": planned["proposed_path"]
+    }
+
+    var created_node = {
+        "path": planned["proposed_path"],
+        "name": planned["node_name"],
+        "type": planned["node_type"],
+        "parentPath": planned["parent_path"],
+        "asset": planned["asset_path"],
+        "assetProperty": planned["asset_property"],
+        "properties": planned["properties"]
+    }
+
+    var layout_before = null
+    if planned["include_layout_before"]:
+        layout_before = dry_align_compact_layout_before(planned["layout_data"]["nodes"], planned["layout_data"]["sceneBounds"], planned["bounds_source"])
+
+    var result = {
+        "success": true,
+        "projectPath": planned["project_path"],
+        "scenePath": planned["scene_path"],
+        "assetPath": planned["asset_path"],
+        "placed": true,
+        "saved": true,
+        "valid": counts["errorCount"] == 0,
+        "severity": severity,
+        "summary": summary,
+        "issues": issues,
+        "assetInfo": place_asset_compact_asset_info(planned["asset_info"]) if planned["include_asset_info"] else null,
+        "plan": planned["plan"] if planned["include_plan"] else [],
+        "createdNode": created_node,
+        "write": {
+            "saved": true,
+            "resourceSaverCode": save_error,
+            "bytesWritten": bytes_written
+        },
+        "postValidation": post_validation,
+        "layoutBefore": layout_before,
+        "layoutAfter": layout_after,
+        "limits": planned["limits"]
+    }
+    print(JSON.stringify(result))
 
 func is_nearly_zero(value):
     return abs(value) <= 0.0001

@@ -166,6 +166,7 @@ class GodotServer {
     'max_operations': 'maxOperations',
     'asset_path': 'assetPath',
     'asset_paths': 'assetPaths',
+    'asset_property': 'assetProperty',
     'include_dependencies': 'includeDependencies',
     'include_scene_preview': 'includeScenePreview',
     'include_placement_hints': 'includePlacementHints',
@@ -428,6 +429,31 @@ class GodotServer {
    */
   private createDryRunPlaceAssetInSceneErrorResponse(error: string, message: string): any {
     console.error(`[SERVER] dry_run_place_asset_in_scene error response: ${error}: ${message}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error,
+              message,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  /**
+   * Create a place_asset_in_scene-specific JSON error response while preserving MCP text content style.
+   */
+  private createPlaceAssetInSceneErrorResponse(error: string, message: string): any {
+    console.error(`[SERVER] place_asset_in_scene error response: ${error}: ${message}`);
 
     return {
       content: [
@@ -1761,6 +1787,85 @@ class GodotServer {
           },
         },
         {
+          name: 'place_asset_in_scene',
+          description: 'Safely add an existing asset as a new node into an existing scene, reusing dry_run_place_asset_in_scene planning and refusing to write when the plan has errors',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Absolute path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Existing Godot scene path such as res://scenes/Room.tscn or scenes/Room.tscn',
+              },
+              assetPath: {
+                type: 'string',
+                description: 'Godot asset path such as res://assets/props/chair.png or assets/props/chair.png',
+              },
+              parentPath: {
+                type: 'string',
+                description: 'Optional parent node path inside the scene; defaults to scene root',
+              },
+              nodeName: {
+                type: 'string',
+                description: 'Optional name for the new node; defaults to asset filename',
+              },
+              nodeType: {
+                type: 'string',
+                description: 'Optional Godot node type; inferred from asset type when omitted',
+              },
+              assetProperty: {
+                type: 'string',
+                description: 'Optional property used to assign the asset; inferred when omitted',
+              },
+              placement: {
+                type: 'object',
+                description: 'Optional placement instructions: position, relative, scene_bounds, plus optional snapToGrid',
+              },
+              properties: {
+                type: 'object',
+                description: 'Optional safe properties to set on the new node',
+              },
+              boundsSource: {
+                type: 'string',
+                enum: ['visual', 'collision', 'control', 'transform'],
+                description: 'Bounds source to use for placement references (default: visual)',
+              },
+              validateBeforeWrite: {
+                type: 'boolean',
+                description: 'Whether to abort before saving when the dry-run plan has errors (default: true)',
+              },
+              validateAfterWrite: {
+                type: 'boolean',
+                description: 'Whether to reload and verify the saved scene after writing (default: true)',
+              },
+              includePlan: {
+                type: 'boolean',
+                description: 'Whether to return the applied add_node/assign_asset/set_properties actions (default: true)',
+              },
+              includeLayoutBefore: {
+                type: 'boolean',
+                description: 'Whether to include compact layout data before the placement (default: false)',
+              },
+              includeLayoutAfter: {
+                type: 'boolean',
+                description: 'Whether to include compact layout data after the placement (default: false)',
+              },
+              includeAssetInfo: {
+                type: 'boolean',
+                description: 'Whether to include compact asset metadata in the response (default: true)',
+              },
+              maxDepth: {
+                type: 'number',
+                description: 'Maximum scene tree depth to inspect (default: 100, max: 200)',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'assetPath'],
+          },
+        },
+        {
           name: 'dry_run_scene_blueprint',
           description: 'Validate and simulate a scene blueprint read-only without creating or modifying files',
           inputSchema: {
@@ -2110,6 +2215,8 @@ class GodotServer {
           return await this.handleAlignNodes(request.params.arguments);
         case 'dry_run_place_asset_in_scene':
           return await this.handleDryRunPlaceAssetInScene(request.params.arguments);
+        case 'place_asset_in_scene':
+          return await this.handlePlaceAssetInScene(request.params.arguments);
         case 'dry_run_scene_blueprint':
           return await this.handleDryRunSceneBlueprint(request.params.arguments);
         case 'create_scene_from_blueprint':
@@ -4752,6 +4859,286 @@ class GodotServer {
       return this.createDryRunPlaceAssetInSceneErrorResponse(
         'DRY_RUN_PLACE_ASSET_IN_SCENE_FAILED',
         `Failed to dry-run asset placement: ${error?.message || 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * Handle the place_asset_in_scene tool
+   */
+  private async handlePlaceAssetInScene(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || typeof args.projectPath !== 'string') {
+      return this.createPlaceAssetInSceneErrorResponse(
+        'MISSING_PROJECT_PATH',
+        'projectPath is required and must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    if (!args.scenePath || typeof args.scenePath !== 'string') {
+      return this.createPlaceAssetInSceneErrorResponse(
+        'MISSING_SCENE_PATH',
+        'scenePath is required and must be a Godot scene path such as res://scenes/Room.tscn or scenes/Room.tscn.'
+      );
+    }
+
+    if (!args.assetPath || typeof args.assetPath !== 'string') {
+      return this.createPlaceAssetInSceneErrorResponse(
+        'MISSING_ASSET_PATH',
+        'assetPath is required and must be a Godot asset path such as res://assets/props/chair.png or assets/props/chair.png.'
+      );
+    }
+
+    if (args.projectPath.includes('\0')) {
+      return this.createPlaceAssetInSceneErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must not contain null bytes.'
+      );
+    }
+
+    if (!isAbsolute(args.projectPath)) {
+      return this.createPlaceAssetInSceneErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    const scenePathResult = this.normalizeScenePath(args.scenePath);
+    if (scenePathResult.error) {
+      return this.createPlaceAssetInSceneErrorResponse('UNSAFE_SCENE_PATH', scenePathResult.error);
+    }
+
+    const sceneExtension = extname(scenePathResult.relativePath).toLowerCase();
+    if (!['.tscn', '.scn'].includes(sceneExtension)) {
+      return this.createPlaceAssetInSceneErrorResponse(
+        'SCENE_PATH_NOT_SCENE_FILE',
+        'scenePath must point to a .tscn or .scn scene file.'
+      );
+    }
+
+    const assetPathResult = this.normalizeAssetPath(args.assetPath);
+    if (assetPathResult.error) {
+      return this.createPlaceAssetInSceneErrorResponse('UNSAFE_ASSET_PATH', assetPathResult.error);
+    }
+
+    if (args.placement !== undefined && (typeof args.placement !== 'object' || args.placement === null || Array.isArray(args.placement))) {
+      return this.createPlaceAssetInSceneErrorResponse(
+        'INVALID_PLACEMENT',
+        'placement must be an object when provided.'
+      );
+    }
+
+    if (args.properties !== undefined && (typeof args.properties !== 'object' || args.properties === null || Array.isArray(args.properties))) {
+      return this.createPlaceAssetInSceneErrorResponse(
+        'INVALID_PROPERTIES',
+        'properties must be an object when provided.'
+      );
+    }
+
+    const allowedBoundsSources = new Set(['visual', 'collision', 'control', 'transform']);
+    const boundsSource = args.boundsSource !== undefined ? args.boundsSource : 'visual';
+    if (typeof boundsSource !== 'string' || !allowedBoundsSources.has(boundsSource)) {
+      return this.createPlaceAssetInSceneErrorResponse(
+        'INVALID_BOUNDS_SOURCE',
+        'boundsSource must be one of: visual, collision, control, transform.'
+      );
+    }
+
+    const maxDepthRequested = args.maxDepth !== undefined ? args.maxDepth : null;
+    let maxDepthApplied = 100;
+    let maxDepthClamped = false;
+    if (args.maxDepth !== undefined) {
+      if (typeof args.maxDepth !== 'number' || !Number.isFinite(args.maxDepth) || args.maxDepth < 1) {
+        return this.createPlaceAssetInSceneErrorResponse(
+          'INVALID_MAX_DEPTH',
+          'maxDepth must be a number between 1 and 200.'
+        );
+      }
+
+      if (args.maxDepth > 200) {
+        maxDepthApplied = 200;
+        maxDepthClamped = true;
+      } else {
+        maxDepthApplied = Math.floor(args.maxDepth);
+      }
+    }
+
+    const booleanOptions = [
+      'includePlan',
+      'includeLayoutBefore',
+      'includeLayoutAfter',
+      'includeAssetInfo',
+      'validateBeforeWrite',
+      'validateAfterWrite',
+    ];
+    for (const option of booleanOptions) {
+      if (args[option] !== undefined && typeof args[option] !== 'boolean') {
+        return this.createPlaceAssetInSceneErrorResponse(
+          'PLACE_ASSET_IN_SCENE_FAILED',
+          `${option} must be a boolean.`
+        );
+      }
+    }
+
+    const includePlan = args.includePlan !== undefined ? args.includePlan : true;
+    const includeLayoutBefore = args.includeLayoutBefore !== undefined ? args.includeLayoutBefore : false;
+    const includeLayoutAfter = args.includeLayoutAfter !== undefined ? args.includeLayoutAfter : false;
+    const includeAssetInfo = args.includeAssetInfo !== undefined ? args.includeAssetInfo : true;
+    const validateBeforeWrite = args.validateBeforeWrite !== undefined ? args.validateBeforeWrite : true;
+    const validateAfterWrite = args.validateAfterWrite !== undefined ? args.validateAfterWrite : true;
+
+    try {
+      const normalizedProjectPath = resolve(args.projectPath);
+      if (!existsSync(normalizedProjectPath)) {
+        return this.createPlaceAssetInSceneErrorResponse(
+          'PROJECT_PATH_NOT_FOUND',
+          `Project path does not exist: ${args.projectPath}`
+        );
+      }
+
+      const projectStats = statSync(normalizedProjectPath);
+      if (!projectStats.isDirectory()) {
+        return this.createPlaceAssetInSceneErrorResponse(
+          'PROJECT_PATH_NOT_DIRECTORY',
+          `Project path is not a directory: ${args.projectPath}`
+        );
+      }
+
+      const projectRoot = realpathSync(normalizedProjectPath);
+      const projectFile = join(projectRoot, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createPlaceAssetInSceneErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          `Not a valid Godot project: ${args.projectPath}. The directory must contain a project.godot file.`
+        );
+      }
+
+      const sceneFilePath = resolve(projectRoot, scenePathResult.relativePath);
+      if (!this.isPathInside(projectRoot, sceneFilePath)) {
+        return this.createPlaceAssetInSceneErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must stay inside the Godot project directory.'
+        );
+      }
+
+      if (!existsSync(sceneFilePath)) {
+        return this.createPlaceAssetInSceneErrorResponse(
+          'SCENE_PATH_NOT_FOUND',
+          `Scene file does not exist: ${scenePathResult.resourcePath}`
+        );
+      }
+
+      const sceneFileStats = lstatSync(sceneFilePath);
+      if (sceneFileStats.isSymbolicLink()) {
+        return this.createPlaceAssetInSceneErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must not be a symbolic link.'
+        );
+      }
+
+      if (!sceneFileStats.isFile()) {
+        return this.createPlaceAssetInSceneErrorResponse(
+          'SCENE_PATH_NOT_FOUND',
+          `Scene path is not a file: ${scenePathResult.resourcePath}`
+        );
+      }
+
+      const realSceneFilePath = realpathSync(sceneFilePath);
+      if (!this.isPathInside(projectRoot, realSceneFilePath)) {
+        return this.createPlaceAssetInSceneErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must stay inside the Godot project directory.'
+        );
+      }
+
+      const assetFilePath = resolve(projectRoot, assetPathResult.relativePath);
+      if (!this.isPathInside(projectRoot, assetFilePath)) {
+        return this.createPlaceAssetInSceneErrorResponse(
+          'UNSAFE_ASSET_PATH',
+          'assetPath must stay inside the Godot project directory.'
+        );
+      }
+
+      if (!existsSync(assetFilePath)) {
+        return this.createPlaceAssetInSceneErrorResponse(
+          'ASSET_PATH_NOT_FOUND',
+          `Asset file does not exist: ${assetPathResult.resourcePath}`
+        );
+      }
+
+      const assetFileStats = lstatSync(assetFilePath);
+      if (assetFileStats.isSymbolicLink()) {
+        return this.createPlaceAssetInSceneErrorResponse(
+          'UNSAFE_ASSET_PATH',
+          'assetPath must not be a symbolic link.'
+        );
+      }
+
+      if (!assetFileStats.isFile()) {
+        return this.createPlaceAssetInSceneErrorResponse(
+          'ASSET_PATH_NOT_FILE',
+          `Asset path is not a file: ${assetPathResult.resourcePath}`
+        );
+      }
+
+      const realAssetFilePath = realpathSync(assetFilePath);
+      if (!this.isPathInside(projectRoot, realAssetFilePath)) {
+        return this.createPlaceAssetInSceneErrorResponse(
+          'UNSAFE_ASSET_PATH',
+          'assetPath must stay inside the Godot project directory.'
+        );
+      }
+
+      const params = {
+        projectPath: projectRoot.replace(/\\/g, '/'),
+        scenePath: scenePathResult.resourcePath,
+        assetPath: assetPathResult.resourcePath,
+        parentPath: args.parentPath,
+        nodeName: args.nodeName,
+        nodeType: args.nodeType,
+        assetProperty: args.assetProperty,
+        placement: args.placement,
+        properties: args.properties,
+        boundsSource,
+        validateBeforeWrite,
+        validateAfterWrite,
+        includePlan,
+        includeLayoutBefore,
+        includeLayoutAfter,
+        includeAssetInfo,
+        maxDepth: maxDepthApplied,
+        maxDepthRequested,
+        maxDepthClamped,
+      };
+
+      const { stdout, stderr } = await this.executeOperation('place_asset_in_scene', params, projectRoot);
+      const parsedResult = this.extractLastJsonObject(stdout);
+
+      if (!parsedResult) {
+        const stderrText = stderr?.trim();
+        return this.createPlaceAssetInSceneErrorResponse(
+          'PLACE_ASSET_IN_SCENE_FAILED',
+          stderrText
+            ? `Godot did not return valid JSON for place_asset_in_scene. Stderr: ${stderrText}`
+            : 'Godot did not return valid JSON for place_asset_in_scene.'
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(parsedResult, null, 2),
+          },
+        ],
+        ...(parsedResult.success === false ? { isError: true } : {}),
+      };
+    } catch (error: any) {
+      return this.createPlaceAssetInSceneErrorResponse(
+        'PLACE_ASSET_IN_SCENE_FAILED',
+        `Failed to place asset in scene: ${error?.message || 'Unknown error'}`
       );
     }
   }
