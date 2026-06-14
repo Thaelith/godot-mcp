@@ -158,6 +158,9 @@ class GodotServer {
     'include_resources': 'includeResources',
     'include_children': 'includeChildren',
     'include_warnings': 'includeWarnings',
+    'bounds_source': 'boundsSource',
+    'include_layout_before': 'includeLayoutBefore',
+    'max_operations': 'maxOperations',
     'asset_path': 'assetPath',
     'asset_paths': 'assetPaths',
     'include_dependencies': 'includeDependencies',
@@ -347,6 +350,31 @@ class GodotServer {
    */
   private createGetSceneLayoutErrorResponse(error: string, message: string): any {
     console.error(`[SERVER] get_scene_layout error response: ${error}: ${message}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error,
+              message,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  /**
+   * Create a dry_run_align_nodes-specific JSON error response while preserving MCP text content style.
+   */
+  private createDryRunAlignNodesErrorResponse(error: string, message: string): any {
+    console.error(`[SERVER] dry_run_align_nodes error response: ${error}: ${message}`);
 
     return {
       content: [
@@ -1515,6 +1543,49 @@ class GodotServer {
           },
         },
         {
+          name: 'dry_run_align_nodes',
+          description: 'Plan node alignment and layout changes read-only without modifying or saving the scene',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Absolute path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Godot scene path such as res://scenes/Room.tscn or scenes/Room.tscn',
+              },
+              operations: {
+                type: 'array',
+                description: 'Non-empty array of alignment/layout operations to plan',
+              },
+              boundsSource: {
+                type: 'string',
+                enum: ['visual', 'collision', 'control', 'transform'],
+                description: 'Bounds source to use for operations by default (default: visual)',
+              },
+              includePlan: {
+                type: 'boolean',
+                description: 'Whether to return proposed position changes (default: true)',
+              },
+              includeLayoutBefore: {
+                type: 'boolean',
+                description: 'Whether to include compact layout data before planned changes (default: false)',
+              },
+              maxOperations: {
+                type: 'number',
+                description: 'Maximum operations to evaluate (default: 50, max: 500)',
+              },
+              maxDepth: {
+                type: 'number',
+                description: 'Maximum scene tree depth to inspect (default: 100, max: 200)',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'operations'],
+          },
+        },
+        {
           name: 'dry_run_scene_blueprint',
           description: 'Validate and simulate a scene blueprint read-only without creating or modifying files',
           inputSchema: {
@@ -1858,6 +1929,8 @@ class GodotServer {
           return await this.handleReadSceneTree(request.params.arguments);
         case 'get_scene_layout':
           return await this.handleGetSceneLayout(request.params.arguments);
+        case 'dry_run_align_nodes':
+          return await this.handleDryRunAlignNodes(request.params.arguments);
         case 'dry_run_scene_blueprint':
           return await this.handleDryRunSceneBlueprint(request.params.arguments);
         case 'create_scene_from_blueprint':
@@ -3733,6 +3806,247 @@ class GodotServer {
       return this.createGetSceneLayoutErrorResponse(
         'GET_SCENE_LAYOUT_FAILED',
         `Failed to get scene layout: ${error?.message || 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * Handle the dry_run_align_nodes tool
+   */
+  private async handleDryRunAlignNodes(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || typeof args.projectPath !== 'string') {
+      return this.createDryRunAlignNodesErrorResponse(
+        'MISSING_PROJECT_PATH',
+        'projectPath is required and must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    if (!args.scenePath || typeof args.scenePath !== 'string') {
+      return this.createDryRunAlignNodesErrorResponse(
+        'MISSING_SCENE_PATH',
+        'scenePath is required and must be a Godot scene path such as res://scenes/Room.tscn or scenes/Room.tscn.'
+      );
+    }
+
+    if (args.projectPath.includes('\0')) {
+      return this.createDryRunAlignNodesErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must not contain null bytes.'
+      );
+    }
+
+    if (!isAbsolute(args.projectPath)) {
+      return this.createDryRunAlignNodesErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    const scenePathResult = this.normalizeScenePath(args.scenePath);
+    if (scenePathResult.error) {
+      return this.createDryRunAlignNodesErrorResponse(
+        'UNSAFE_SCENE_PATH',
+        scenePathResult.error
+      );
+    }
+
+    const sceneExtension = extname(scenePathResult.relativePath).toLowerCase();
+    if (!['.tscn', '.scn'].includes(sceneExtension)) {
+      return this.createDryRunAlignNodesErrorResponse(
+        'SCENE_PATH_NOT_SCENE_FILE',
+        'scenePath must point to a .tscn or .scn scene file.'
+      );
+    }
+
+    if (args.operations === undefined) {
+      return this.createDryRunAlignNodesErrorResponse(
+        'MISSING_OPERATIONS',
+        'operations is required and must be a non-empty array of alignment operations.'
+      );
+    }
+
+    if (!Array.isArray(args.operations)) {
+      return this.createDryRunAlignNodesErrorResponse(
+        'INVALID_OPERATIONS',
+        'operations must be a non-empty array of alignment operations.'
+      );
+    }
+
+    if (args.operations.length === 0) {
+      return this.createDryRunAlignNodesErrorResponse(
+        'INVALID_OPERATIONS',
+        'operations must contain at least one alignment operation.'
+      );
+    }
+
+    const allowedBoundsSources = new Set(['visual', 'collision', 'control', 'transform']);
+    const boundsSource = args.boundsSource !== undefined ? args.boundsSource : 'visual';
+    if (typeof boundsSource !== 'string' || !allowedBoundsSources.has(boundsSource)) {
+      return this.createDryRunAlignNodesErrorResponse(
+        'INVALID_BOUNDS_SOURCE',
+        'boundsSource must be one of: visual, collision, control, transform.'
+      );
+    }
+
+    const maxOperationsRequested = args.maxOperations !== undefined ? args.maxOperations : null;
+    let maxOperationsApplied = 50;
+    let maxOperationsClamped = false;
+    if (args.maxOperations !== undefined) {
+      if (typeof args.maxOperations !== 'number' || !Number.isFinite(args.maxOperations) || args.maxOperations < 1) {
+        return this.createDryRunAlignNodesErrorResponse(
+          'INVALID_MAX_OPERATIONS',
+          'maxOperations must be a number between 1 and 500.'
+        );
+      }
+
+      if (args.maxOperations > 500) {
+        maxOperationsApplied = 500;
+        maxOperationsClamped = true;
+      } else {
+        maxOperationsApplied = Math.floor(args.maxOperations);
+      }
+    }
+
+    const maxDepthRequested = args.maxDepth !== undefined ? args.maxDepth : null;
+    let maxDepthApplied = 100;
+    let maxDepthClamped = false;
+    if (args.maxDepth !== undefined) {
+      if (typeof args.maxDepth !== 'number' || !Number.isFinite(args.maxDepth) || args.maxDepth < 1) {
+        return this.createDryRunAlignNodesErrorResponse(
+          'INVALID_MAX_DEPTH',
+          'maxDepth must be a number between 1 and 200.'
+        );
+      }
+
+      if (args.maxDepth > 200) {
+        maxDepthApplied = 200;
+        maxDepthClamped = true;
+      } else {
+        maxDepthApplied = Math.floor(args.maxDepth);
+      }
+    }
+
+    const booleanOptions = ['includePlan', 'includeLayoutBefore'];
+    for (const option of booleanOptions) {
+      if (args[option] !== undefined && typeof args[option] !== 'boolean') {
+        return this.createDryRunAlignNodesErrorResponse(
+          'DRY_RUN_ALIGN_NODES_FAILED',
+          `${option} must be a boolean.`
+        );
+      }
+    }
+
+    const includePlan = args.includePlan !== undefined ? args.includePlan : true;
+    const includeLayoutBefore = args.includeLayoutBefore !== undefined ? args.includeLayoutBefore : false;
+
+    try {
+      const normalizedProjectPath = resolve(args.projectPath);
+      if (!existsSync(normalizedProjectPath)) {
+        return this.createDryRunAlignNodesErrorResponse(
+          'PROJECT_PATH_NOT_FOUND',
+          `Project path does not exist: ${args.projectPath}`
+        );
+      }
+
+      const projectStats = statSync(normalizedProjectPath);
+      if (!projectStats.isDirectory()) {
+        return this.createDryRunAlignNodesErrorResponse(
+          'PROJECT_PATH_NOT_DIRECTORY',
+          `Project path is not a directory: ${args.projectPath}`
+        );
+      }
+
+      const projectRoot = realpathSync(normalizedProjectPath);
+      const projectFile = join(projectRoot, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createDryRunAlignNodesErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          `Not a valid Godot project: ${args.projectPath}. The directory must contain a project.godot file.`
+        );
+      }
+
+      const sceneFilePath = resolve(projectRoot, scenePathResult.relativePath);
+      if (!this.isPathInside(projectRoot, sceneFilePath)) {
+        return this.createDryRunAlignNodesErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must stay inside the Godot project directory.'
+        );
+      }
+
+      if (!existsSync(sceneFilePath)) {
+        return this.createDryRunAlignNodesErrorResponse(
+          'SCENE_PATH_NOT_FOUND',
+          `Scene file does not exist: ${scenePathResult.resourcePath}`
+        );
+      }
+
+      const sceneFileStats = lstatSync(sceneFilePath);
+      if (sceneFileStats.isSymbolicLink()) {
+        return this.createDryRunAlignNodesErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must not be a symbolic link.'
+        );
+      }
+
+      if (!sceneFileStats.isFile()) {
+        return this.createDryRunAlignNodesErrorResponse(
+          'SCENE_PATH_NOT_FOUND',
+          `Scene path is not a file: ${scenePathResult.resourcePath}`
+        );
+      }
+
+      const realSceneFilePath = realpathSync(sceneFilePath);
+      if (!this.isPathInside(projectRoot, realSceneFilePath)) {
+        return this.createDryRunAlignNodesErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must stay inside the Godot project directory.'
+        );
+      }
+
+      const params = {
+        projectPath: projectRoot.replace(/\\/g, '/'),
+        scenePath: scenePathResult.resourcePath,
+        operations: args.operations,
+        boundsSource,
+        includePlan,
+        includeLayoutBefore,
+        maxOperations: maxOperationsApplied,
+        maxOperationsRequested,
+        maxOperationsClamped,
+        maxDepth: maxDepthApplied,
+        maxDepthRequested,
+        maxDepthClamped,
+      };
+
+      const { stdout, stderr } = await this.executeOperation('dry_run_align_nodes', params, projectRoot);
+      const parsedResult = this.extractLastJsonObject(stdout);
+
+      if (!parsedResult) {
+        const stderrText = stderr?.trim();
+        return this.createDryRunAlignNodesErrorResponse(
+          'DRY_RUN_ALIGN_NODES_FAILED',
+          stderrText
+            ? `Godot did not return valid JSON for dry_run_align_nodes. Stderr: ${stderrText}`
+            : 'Godot did not return valid JSON for dry_run_align_nodes.'
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(parsedResult, null, 2),
+          },
+        ],
+        ...(parsedResult.success === false ? { isError: true } : {}),
+      };
+    } catch (error: any) {
+      return this.createDryRunAlignNodesErrorResponse(
+        'DRY_RUN_ALIGN_NODES_FAILED',
+        `Failed to dry-run node alignment: ${error?.message || 'Unknown error'}`
       );
     }
   }

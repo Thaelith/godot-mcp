@@ -28,7 +28,7 @@ func _init():
     
     var operation = args[operation_index]
     var params_json = args[params_index]
-    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
+    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "dry_run_align_nodes" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
 
     if quiet_output:
         debug_mode = false
@@ -67,6 +67,8 @@ func _init():
             read_scene_tree(params)
         "get_scene_layout":
             get_scene_layout(params)
+        "dry_run_align_nodes":
+            dry_run_align_nodes(params)
         "validate_scene":
             validate_scene(params)
         "get_asset_info":
@@ -899,6 +901,914 @@ func get_scene_layout(params):
         }
     }
 
+    print(JSON.stringify(result))
+    scene_root.free()
+
+func dry_align_error(error_code, message):
+    return {
+        "success": false,
+        "error": error_code,
+        "message": message
+    }
+
+func dry_align_add_issue(issues, severity, code, message, operation_index=-1, operation_type=null, node_path=null, suggestion=null):
+    var issue = {
+        "severity": severity,
+        "code": code,
+        "message": message
+    }
+
+    if operation_index != -1:
+        issue["operationIndex"] = operation_index
+    if operation_type != null:
+        issue["operationType"] = operation_type
+    if node_path != null:
+        issue["nodePath"] = node_path
+    if suggestion != null:
+        issue["suggestion"] = suggestion
+
+    issues.append(issue)
+
+func dry_align_issue_counts(issues):
+    var counts = {
+        "errorCount": 0,
+        "warningCount": 0,
+        "infoCount": 0
+    }
+    for issue in issues:
+        if issue.has("severity") and issue["severity"] == "error":
+            counts["errorCount"] += 1
+        elif issue.has("severity") and issue["severity"] == "warning":
+            counts["warningCount"] += 1
+        elif issue.has("severity") and issue["severity"] == "info":
+            counts["infoCount"] += 1
+    return counts
+
+func dry_align_severity_from_counts(counts):
+    if counts["errorCount"] > 0:
+        return "error"
+    if counts["warningCount"] > 0:
+        return "warning"
+    if counts["infoCount"] > 0:
+        return "info"
+    return "ok"
+
+func dry_align_allowed_bounds_source(source):
+    return source == "visual" or source == "collision" or source == "control" or source == "transform"
+
+func dry_align_is_number_array_any_size(value, allowed_sizes):
+    if typeof(value) != TYPE_ARRAY:
+        return false
+    if not allowed_sizes.has(value.size()):
+        return false
+    for item in value:
+        if typeof(item) != TYPE_INT and typeof(item) != TYPE_FLOAT:
+            return false
+    return true
+
+func dry_align_zero_array(size):
+    var result = []
+    for _index in range(size):
+        result.append(0)
+    return result
+
+func dry_align_duplicate_array(value):
+    var result = []
+    for item in value:
+        result.append(item)
+    return result
+
+func dry_align_array_delta(proposed, current):
+    var result = []
+    for index in range(proposed.size()):
+        result.append(proposed[index] - current[index])
+    return result
+
+func dry_align_parse_margin(value):
+    if value == null:
+        return {"success": true, "value": [0, 0]}
+    if typeof(value) == TYPE_INT or typeof(value) == TYPE_FLOAT:
+        return {"success": true, "value": [value, value]}
+    if dry_align_is_number_array_any_size(value, [2]):
+        return {"success": true, "value": [value[0], value[1]]}
+    return {"success": false, "message": "margin must be a number or [x, y] array."}
+
+func dry_align_bounds_available(bounds):
+    if bounds == null or typeof(bounds) != TYPE_DICTIONARY:
+        return false
+    if not bounds.has("available") or not bounds["available"]:
+        return false
+    return bounds.has("min") and bounds.has("max") and bounds.has("center") and typeof(bounds["min"]) == TYPE_ARRAY and typeof(bounds["max"]) == TYPE_ARRAY and typeof(bounds["center"]) == TYPE_ARRAY
+
+func dry_align_transform_bounds(layout_data):
+    if layout_data == null or typeof(layout_data) != TYPE_DICTIONARY:
+        return layout_empty_bounds("global")
+    if not layout_data.has("transform") or layout_data["transform"] == null:
+        return layout_empty_bounds("global")
+
+    var transform_data = layout_data["transform"]
+    if typeof(transform_data) != TYPE_DICTIONARY or not transform_data.has("globalPosition"):
+        return layout_empty_bounds("global")
+
+    var global_position = transform_data["globalPosition"]
+    if not dry_align_is_number_array_any_size(global_position, [2, 3]):
+        return layout_empty_bounds("global")
+
+    return layout_bounds_from_arrays(global_position, global_position, "global")
+
+func dry_align_get_bounds_by_name(layout_data, source):
+    if source == "visual":
+        if layout_data.has("visualBounds"):
+            return layout_data["visualBounds"]
+    elif source == "collision":
+        if layout_data.has("collisionBounds"):
+            return layout_data["collisionBounds"]
+    elif source == "control":
+        if layout_data.has("controlRect"):
+            return layout_data["controlRect"]
+    elif source == "transform":
+        return dry_align_transform_bounds(layout_data)
+    return null
+
+func dry_align_candidate_sources(source):
+    if source == "visual":
+        return ["visual", "control", "transform"]
+    if source == "collision":
+        return ["collision", "visual", "transform"]
+    if source == "control":
+        return ["control", "visual", "transform"]
+    return ["transform"]
+
+func dry_align_select_bounds(layout_data, source, issues, operation_index, operation_type, node_path):
+    if not dry_align_allowed_bounds_source(source):
+        return {"success": false, "error": "INVALID_BOUNDS_SOURCE", "message": "Bounds source must be visual, collision, control, or transform."}
+
+    for candidate_source in dry_align_candidate_sources(source):
+        var bounds = dry_align_get_bounds_by_name(layout_data, candidate_source)
+        if dry_align_bounds_available(bounds):
+            if candidate_source != source:
+                dry_align_add_issue(
+                    issues,
+                    "warning",
+                    "BOUNDS_FALLBACK_USED",
+                    "Requested bounds were unavailable; used " + candidate_source + " bounds instead.",
+                    operation_index,
+                    operation_type,
+                    node_path
+                )
+            return {
+                "success": true,
+                "bounds": bounds,
+                "source": candidate_source
+            }
+
+    return {"success": false, "error": "BOUNDS_UNAVAILABLE", "message": "No usable bounds or transform position are available."}
+
+func dry_align_union_bounds_for_source(layout_nodes, source):
+    var aggregate = layout_empty_bounds("global")
+    for layout_data in layout_nodes:
+        var bounds = dry_align_get_bounds_by_name(layout_data, source)
+        if dry_align_bounds_available(bounds):
+            aggregate = layout_union_bounds(aggregate, bounds)
+    return aggregate
+
+func dry_align_select_scene_bounds(scene_bounds, layout_nodes, source, issues, operation_index, operation_type):
+    if not dry_align_allowed_bounds_source(source):
+        return {"success": false, "error": "INVALID_BOUNDS_SOURCE", "message": "Bounds source must be visual, collision, control, or transform."}
+
+    for candidate_source in dry_align_candidate_sources(source):
+        var bounds = null
+        if (candidate_source == "visual" or candidate_source == "collision") and scene_bounds.has(candidate_source):
+            bounds = scene_bounds[candidate_source]
+        else:
+            bounds = dry_align_union_bounds_for_source(layout_nodes, candidate_source)
+
+        if dry_align_bounds_available(bounds):
+            if candidate_source != source:
+                dry_align_add_issue(
+                    issues,
+                    "warning",
+                    "BOUNDS_FALLBACK_USED",
+                    "Requested scene bounds were unavailable; used " + candidate_source + " bounds instead.",
+                    operation_index,
+                    operation_type,
+                    null
+                )
+            return {
+                "success": true,
+                "bounds": bounds,
+                "source": candidate_source
+            }
+
+    return {"success": false, "error": "BOUNDS_UNAVAILABLE", "message": "No usable scene bounds are available."}
+
+func dry_align_get_local_position(node):
+    if node is Control:
+        return vector2_to_array(node.position)
+    if node is Node2D:
+        return vector2_to_array(node.position)
+    if node is Node3D:
+        return vector3_to_array(node.position)
+    return null
+
+func dry_align_get_global_position(node):
+    if node is Control:
+        return vector2_to_array(node.global_position)
+    if node is Node2D:
+        return vector2_to_array(node.global_position)
+    if node is Node3D:
+        return vector3_to_array(node.global_position)
+    return null
+
+func dry_align_array_to_vector2(value):
+    return Vector2(value[0], value[1])
+
+func dry_align_array_to_vector3(value):
+    return Vector3(value[0], value[1], value[2])
+
+func dry_align_global_to_local_position(node, global_position):
+    if not dry_align_is_number_array_any_size(global_position, [2, 3]):
+        return null
+
+    if node is Control or node is Node2D:
+        if global_position.size() != 2:
+            return null
+        var parent = node.get_parent()
+        if parent is CanvasItem:
+            return vector2_to_array(parent.get_global_transform().affine_inverse() * dry_align_array_to_vector2(global_position))
+        return [global_position[0], global_position[1]]
+
+    if node is Node3D:
+        if global_position.size() != 3:
+            return null
+        var parent_3d = node.get_parent()
+        if parent_3d is Node3D:
+            return vector3_to_array(parent_3d.global_transform.affine_inverse() * dry_align_array_to_vector3(global_position))
+        return [global_position[0], global_position[1], global_position[2]]
+
+    return null
+
+func dry_align_local_to_global_position(node, local_position):
+    if not dry_align_is_number_array_any_size(local_position, [2, 3]):
+        return null
+
+    if node is Control or node is Node2D:
+        if local_position.size() != 2:
+            return null
+        var parent = node.get_parent()
+        if parent is CanvasItem:
+            return vector2_to_array(parent.get_global_transform() * dry_align_array_to_vector2(local_position))
+        return [local_position[0], local_position[1]]
+
+    if node is Node3D:
+        if local_position.size() != 3:
+            return null
+        var parent_3d = node.get_parent()
+        if parent_3d is Node3D:
+            return vector3_to_array(parent_3d.global_transform * dry_align_array_to_vector3(local_position))
+        return [local_position[0], local_position[1], local_position[2]]
+
+    return null
+
+func dry_align_append_plan_change(plan, operation_index, operation_type, node_path, current_local, proposed_local, current_global, proposed_global, reason):
+    plan.append({
+        "operationIndex": operation_index,
+        "operationType": operation_type,
+        "nodePath": node_path,
+        "property": "position",
+        "space": "local",
+        "currentValue": current_local,
+        "proposedValue": proposed_local,
+        "delta": dry_align_array_delta(proposed_local, current_local),
+        "currentGlobalPosition": current_global,
+        "proposedGlobalPosition": proposed_global,
+        "reason": reason
+    })
+
+func dry_align_plan_global_position(plan, issues, operation_index, operation_type, node_path, node, proposed_global, reason):
+    var current_local = dry_align_get_local_position(node)
+    var current_global = dry_align_get_global_position(node)
+    if current_local == null or current_global == null:
+        dry_align_add_issue(issues, "error", "UNSUPPORTED_NODE_DIMENSION", "Node does not expose a supported position property.", operation_index, operation_type, node_path)
+        return
+    if proposed_global.size() != current_global.size():
+        dry_align_add_issue(issues, "error", "UNSUPPORTED_NODE_DIMENSION", "Proposed position dimension does not match the target node.", operation_index, operation_type, node_path)
+        return
+
+    var proposed_local = dry_align_global_to_local_position(node, proposed_global)
+    if proposed_local == null:
+        dry_align_add_issue(issues, "error", "UNSUPPORTED_NODE_DIMENSION", "Could not convert proposed global position to local position.", operation_index, operation_type, node_path)
+        return
+
+    dry_align_append_plan_change(plan, operation_index, operation_type, node_path, current_local, proposed_local, current_global, proposed_global, reason)
+
+func dry_align_plan_local_position(plan, issues, operation_index, operation_type, node_path, node, proposed_local, reason):
+    var current_local = dry_align_get_local_position(node)
+    var current_global = dry_align_get_global_position(node)
+    if current_local == null or current_global == null:
+        dry_align_add_issue(issues, "error", "UNSUPPORTED_NODE_DIMENSION", "Node does not expose a supported position property.", operation_index, operation_type, node_path)
+        return
+    if proposed_local.size() != current_local.size():
+        dry_align_add_issue(issues, "error", "UNSUPPORTED_NODE_DIMENSION", "Proposed position dimension does not match the target node.", operation_index, operation_type, node_path)
+        return
+
+    var proposed_global = dry_align_local_to_global_position(node, proposed_local)
+    if proposed_global == null:
+        dry_align_add_issue(issues, "error", "UNSUPPORTED_NODE_DIMENSION", "Could not convert proposed local position to global position.", operation_index, operation_type, node_path)
+        return
+
+    dry_align_append_plan_change(plan, operation_index, operation_type, node_path, current_local, proposed_local, current_global, proposed_global, reason)
+
+func dry_align_collect_node_map(node, root, max_depth, depth, node_by_path):
+    node_by_path[get_scene_node_path(node, root)] = node
+    if depth >= max_depth:
+        return
+    for child in node.get_children():
+        dry_align_collect_node_map(child, root, max_depth, depth + 1, node_by_path)
+
+func dry_align_build_layout(scene_root, max_depth):
+    var options = {
+        "includeHidden": true,
+        "includeVisualBounds": true,
+        "includeCollisionBounds": true,
+        "includeControlRects": true,
+        "includeResources": false,
+        "includeChildren": false,
+        "includeWarnings": true
+    }
+    var summary = {
+        "totalNodes": 0,
+        "visibleNodes": 0,
+        "hiddenNodes": 0,
+        "nodesWithVisualBounds": 0,
+        "nodesWithCollisionBounds": 0,
+        "nodesWithControlRects": 0,
+        "maxDepthReached": 0,
+        "depthTruncated": false,
+        "nodeTypes": {}
+    }
+    var scene_bounds = {
+        "visual": layout_empty_bounds("global"),
+        "collision": layout_empty_bounds("global")
+    }
+    var nodes = []
+    collect_scene_layout_node(scene_root, scene_root, 0, max_depth, options, summary, scene_bounds, nodes)
+
+    var layout_by_path = {}
+    for layout_data in nodes:
+        layout_by_path[layout_data["path"]] = layout_data
+
+    var node_by_path = {}
+    dry_align_collect_node_map(scene_root, scene_root, max_depth, 0, node_by_path)
+
+    return {
+        "nodes": nodes,
+        "layoutByPath": layout_by_path,
+        "nodeByPath": node_by_path,
+        "sceneBounds": scene_bounds,
+        "summary": summary
+    }
+
+func dry_align_normalize_node_path_for_operation(path_value, issues, operation_index, operation_type, code):
+    var normalized = dry_run_normalize_scene_node_path(path_value)
+    if normalized.has("error"):
+        dry_align_add_issue(issues, "error", code, normalized["error"], operation_index, operation_type, str(path_value), "Use read_scene_tree or get_scene_layout to inspect valid node paths.")
+        return null
+    return normalized["path"]
+
+func dry_align_find_node(path_value, node_by_path, issues, operation_index, operation_type, code):
+    var node_path = dry_align_normalize_node_path_for_operation(path_value, issues, operation_index, operation_type, code)
+    if node_path == null:
+        return {"success": false}
+    if not node_by_path.has(node_path):
+        var message = "Target node was not found in the scene."
+        if code == "REFERENCE_NODE_NOT_FOUND":
+            message = "Reference node was not found in the scene."
+        dry_align_add_issue(issues, "error", code, message, operation_index, operation_type, node_path, "Use read_scene_tree or get_scene_layout to inspect valid node paths.")
+        return {"success": false}
+    return {
+        "success": true,
+        "path": node_path,
+        "node": node_by_path[node_path]
+    }
+
+func dry_align_get_node_paths(value, issues, operation_index, operation_type):
+    if typeof(value) != TYPE_ARRAY or value.is_empty():
+        dry_align_add_issue(issues, "error", "INVALID_OPERATION", "nodePaths must be a non-empty array.", operation_index, operation_type)
+        return []
+    return value
+
+func dry_align_reference_data(operation, bounds_source, layout_by_path, node_by_path, layout_nodes, scene_bounds, issues, operation_index, operation_type):
+    var reference = dry_run_get_value(operation, ["reference"], null)
+    if typeof(reference) != TYPE_DICTIONARY:
+        dry_align_add_issue(issues, "error", "INVALID_OPERATION", "reference is required and must be an object.", operation_index, operation_type)
+        return {"success": false}
+
+    var reference_type = dry_run_get_value(reference, ["type"], null)
+    if typeof(reference_type) != TYPE_STRING:
+        dry_align_add_issue(issues, "error", "INVALID_OPERATION", "reference.type must be node, scene_bounds, or point.", operation_index, operation_type)
+        return {"success": false}
+    reference_type = reference_type.strip_edges()
+
+    var reference_bounds_source = dry_run_get_value(reference, ["bounds"], bounds_source)
+    if typeof(reference_bounds_source) != TYPE_STRING or not dry_align_allowed_bounds_source(reference_bounds_source):
+        dry_align_add_issue(issues, "error", "INVALID_BOUNDS_SOURCE", "reference.bounds must be visual, collision, control, or transform.", operation_index, operation_type)
+        return {"success": false}
+
+    if reference_type == "node":
+        var reference_node_path = dry_run_get_value(reference, ["nodePath", "node_path"], null)
+        var found = dry_align_find_node(reference_node_path, node_by_path, issues, operation_index, operation_type, "REFERENCE_NODE_NOT_FOUND")
+        if not found["success"]:
+            return {"success": false}
+        var layout_data = layout_by_path[found["path"]]
+        var selected = dry_align_select_bounds(layout_data, reference_bounds_source, issues, operation_index, operation_type, found["path"])
+        if not selected["success"]:
+            dry_align_add_issue(issues, "error", selected["error"], selected["message"], operation_index, operation_type, found["path"])
+            return {"success": false}
+        return {
+            "success": true,
+            "bounds": selected["bounds"],
+            "position": dry_align_get_global_position(found["node"]),
+            "path": found["path"],
+            "type": reference_type
+        }
+
+    if reference_type == "scene_bounds":
+        var selected_scene = dry_align_select_scene_bounds(scene_bounds, layout_nodes, reference_bounds_source, issues, operation_index, operation_type)
+        if not selected_scene["success"]:
+            dry_align_add_issue(issues, "error", selected_scene["error"], selected_scene["message"], operation_index, operation_type)
+            return {"success": false}
+        return {
+            "success": true,
+            "bounds": selected_scene["bounds"],
+            "position": selected_scene["bounds"]["center"],
+            "path": null,
+            "type": reference_type
+        }
+
+    if reference_type == "point":
+        var point = dry_run_get_value(reference, ["point"], null)
+        if not dry_align_is_number_array_any_size(point, [2, 3]):
+            dry_align_add_issue(issues, "error", "INVALID_OPERATION", "reference.point must be a numeric [x, y] or [x, y, z] array.", operation_index, operation_type)
+            return {"success": false}
+        return {
+            "success": true,
+            "bounds": layout_bounds_from_arrays(point, point, "global"),
+            "position": point,
+            "path": null,
+            "type": reference_type
+        }
+
+    dry_align_add_issue(issues, "error", "INVALID_OPERATION", "reference.type must be node, scene_bounds, or point.", operation_index, operation_type)
+    return {"success": false}
+
+func dry_align_require_2d_bounds(bounds, issues, operation_index, operation_type, node_path):
+    if not dry_align_bounds_available(bounds) or bounds["center"].size() != 2:
+        dry_align_add_issue(issues, "error", "UNSUPPORTED_NODE_DIMENSION", "Bounds-based alignment is supported only for 2D bounds in this version.", operation_index, operation_type, node_path)
+        return false
+    return true
+
+func dry_align_operation_align(operation, bounds_source, layout_by_path, node_by_path, layout_nodes, scene_bounds, issues, plan, operation_index):
+    var operation_type = "align"
+    var node_paths = dry_align_get_node_paths(dry_run_get_value(operation, ["nodePaths", "node_paths"], null), issues, operation_index, operation_type)
+    if node_paths.is_empty():
+        return
+
+    var mode = dry_run_get_value(operation, ["mode"], null)
+    var allowed_modes = ["left", "right", "top", "bottom", "center_x", "center_y", "center", "match_position"]
+    if typeof(mode) != TYPE_STRING or not allowed_modes.has(mode):
+        dry_align_add_issue(issues, "error", "INVALID_OPERATION", "align.mode is not supported.", operation_index, operation_type)
+        return
+
+    var margin_result = dry_align_parse_margin(dry_run_get_value(operation, ["margin"], null))
+    if not margin_result["success"]:
+        dry_align_add_issue(issues, "error", "INVALID_OPERATION", margin_result["message"], operation_index, operation_type)
+        return
+    var margin = margin_result["value"]
+
+    var reference = dry_align_reference_data(operation, bounds_source, layout_by_path, node_by_path, layout_nodes, scene_bounds, issues, operation_index, operation_type)
+    if not reference["success"]:
+        return
+
+    for path_value in node_paths:
+        var found = dry_align_find_node(path_value, node_by_path, issues, operation_index, operation_type, "NODE_NOT_FOUND")
+        if not found["success"]:
+            continue
+
+        var target_node = found["node"]
+        var target_path = found["path"]
+        var current_global = dry_align_get_global_position(target_node)
+        if current_global == null:
+            dry_align_add_issue(issues, "error", "UNSUPPORTED_NODE_DIMENSION", "Target node does not expose a supported global position.", operation_index, operation_type, target_path)
+            continue
+
+        if mode == "match_position":
+            if reference["position"] == null or reference["position"].size() != current_global.size():
+                dry_align_add_issue(issues, "error", "UNSUPPORTED_NODE_DIMENSION", "Reference position dimension does not match target node.", operation_index, operation_type, target_path)
+                continue
+            var proposed_match = dry_align_duplicate_array(reference["position"])
+            if proposed_match.size() == 2:
+                proposed_match[0] += margin[0]
+                proposed_match[1] += margin[1]
+            dry_align_plan_global_position(plan, issues, operation_index, operation_type, target_path, target_node, proposed_match, "Align " + target_path + " match_position to the reference with margin.")
+            continue
+
+        var target_bounds_selected = dry_align_select_bounds(layout_by_path[target_path], bounds_source, issues, operation_index, operation_type, target_path)
+        if not target_bounds_selected["success"]:
+            dry_align_add_issue(issues, "error", target_bounds_selected["error"], target_bounds_selected["message"], operation_index, operation_type, target_path)
+            continue
+
+        var target_bounds = target_bounds_selected["bounds"]
+        var reference_bounds = reference["bounds"]
+        if not dry_align_require_2d_bounds(target_bounds, issues, operation_index, operation_type, target_path):
+            continue
+        if not dry_align_require_2d_bounds(reference_bounds, issues, operation_index, operation_type, reference["path"]):
+            continue
+
+        var proposed_global = dry_align_duplicate_array(current_global)
+        if mode == "left":
+            proposed_global[0] += (reference_bounds["min"][0] + margin[0]) - target_bounds["min"][0]
+        elif mode == "right":
+            proposed_global[0] += (reference_bounds["max"][0] - margin[0]) - target_bounds["max"][0]
+        elif mode == "top":
+            proposed_global[1] += (reference_bounds["min"][1] + margin[1]) - target_bounds["min"][1]
+        elif mode == "bottom":
+            proposed_global[1] += (reference_bounds["max"][1] - margin[1]) - target_bounds["max"][1]
+        elif mode == "center_x":
+            proposed_global[0] += (reference_bounds["center"][0] + margin[0]) - target_bounds["center"][0]
+        elif mode == "center_y":
+            proposed_global[1] += (reference_bounds["center"][1] + margin[1]) - target_bounds["center"][1]
+        elif mode == "center":
+            proposed_global[0] += (reference_bounds["center"][0] + margin[0]) - target_bounds["center"][0]
+            proposed_global[1] += (reference_bounds["center"][1] + margin[1]) - target_bounds["center"][1]
+
+        dry_align_plan_global_position(plan, issues, operation_index, operation_type, target_path, target_node, proposed_global, "Align " + target_path + " using mode " + mode + ".")
+
+func dry_align_operation_place_relative(operation, bounds_source, layout_by_path, node_by_path, issues, plan, operation_index):
+    var operation_type = "place_relative"
+    var found_target = dry_align_find_node(dry_run_get_value(operation, ["nodePath", "node_path"], null), node_by_path, issues, operation_index, operation_type, "NODE_NOT_FOUND")
+    var found_reference = dry_align_find_node(dry_run_get_value(operation, ["referenceNodePath", "reference_node_path"], null), node_by_path, issues, operation_index, operation_type, "REFERENCE_NODE_NOT_FOUND")
+    if not found_target["success"] or not found_reference["success"]:
+        return
+
+    var relation = dry_run_get_value(operation, ["relation"], null)
+    var allowed_relations = ["left_of", "right_of", "above", "below", "centered_on", "inside_top_left", "inside_top_right", "inside_bottom_left", "inside_bottom_right"]
+    if typeof(relation) != TYPE_STRING or not allowed_relations.has(relation):
+        dry_align_add_issue(issues, "error", "INVALID_OPERATION", "place_relative.relation is not supported.", operation_index, operation_type, found_target["path"])
+        return
+
+    var preserve_axis = dry_run_get_value(operation, ["preserveAxis", "preserve_axis"], null)
+    if preserve_axis != null and not (preserve_axis == "x" or preserve_axis == "y"):
+        dry_align_add_issue(issues, "error", "INVALID_OPERATION", "preserveAxis must be x, y, or null.", operation_index, operation_type, found_target["path"])
+        return
+
+    var margin_result = dry_align_parse_margin(dry_run_get_value(operation, ["margin"], null))
+    if not margin_result["success"]:
+        dry_align_add_issue(issues, "error", "INVALID_OPERATION", margin_result["message"], operation_index, operation_type, found_target["path"])
+        return
+    var margin = margin_result["value"]
+
+    var target_bounds_selected = dry_align_select_bounds(layout_by_path[found_target["path"]], bounds_source, issues, operation_index, operation_type, found_target["path"])
+    var reference_bounds_selected = dry_align_select_bounds(layout_by_path[found_reference["path"]], bounds_source, issues, operation_index, operation_type, found_reference["path"])
+    if not target_bounds_selected["success"]:
+        dry_align_add_issue(issues, "error", target_bounds_selected["error"], target_bounds_selected["message"], operation_index, operation_type, found_target["path"])
+        return
+    if not reference_bounds_selected["success"]:
+        dry_align_add_issue(issues, "error", reference_bounds_selected["error"], reference_bounds_selected["message"], operation_index, operation_type, found_reference["path"])
+        return
+
+    var target_bounds = target_bounds_selected["bounds"]
+    var reference_bounds = reference_bounds_selected["bounds"]
+    if not dry_align_require_2d_bounds(target_bounds, issues, operation_index, operation_type, found_target["path"]):
+        return
+    if not dry_align_require_2d_bounds(reference_bounds, issues, operation_index, operation_type, found_reference["path"]):
+        return
+
+    var target_node = found_target["node"]
+    var current_global = dry_align_get_global_position(target_node)
+    if current_global == null or current_global.size() != 2:
+        dry_align_add_issue(issues, "error", "UNSUPPORTED_NODE_DIMENSION", "place_relative supports 2D Node2D/Control targets in this version.", operation_index, operation_type, found_target["path"])
+        return
+
+    var proposed_global = dry_align_duplicate_array(current_global)
+    var shift_x = 0
+    var shift_y = 0
+    if relation == "left_of":
+        shift_x = (reference_bounds["min"][0] - margin[0]) - target_bounds["max"][0]
+    elif relation == "right_of":
+        shift_x = (reference_bounds["max"][0] + margin[0]) - target_bounds["min"][0]
+    elif relation == "above":
+        shift_y = (reference_bounds["min"][1] - margin[1]) - target_bounds["max"][1]
+    elif relation == "below":
+        shift_y = (reference_bounds["max"][1] + margin[1]) - target_bounds["min"][1]
+    elif relation == "centered_on":
+        shift_x = (reference_bounds["center"][0] + margin[0]) - target_bounds["center"][0]
+        shift_y = (reference_bounds["center"][1] + margin[1]) - target_bounds["center"][1]
+    elif relation == "inside_top_left":
+        shift_x = (reference_bounds["min"][0] + margin[0]) - target_bounds["min"][0]
+        shift_y = (reference_bounds["min"][1] + margin[1]) - target_bounds["min"][1]
+    elif relation == "inside_top_right":
+        shift_x = (reference_bounds["max"][0] - margin[0]) - target_bounds["max"][0]
+        shift_y = (reference_bounds["min"][1] + margin[1]) - target_bounds["min"][1]
+    elif relation == "inside_bottom_left":
+        shift_x = (reference_bounds["min"][0] + margin[0]) - target_bounds["min"][0]
+        shift_y = (reference_bounds["max"][1] - margin[1]) - target_bounds["max"][1]
+    elif relation == "inside_bottom_right":
+        shift_x = (reference_bounds["max"][0] - margin[0]) - target_bounds["max"][0]
+        shift_y = (reference_bounds["max"][1] - margin[1]) - target_bounds["max"][1]
+
+    if preserve_axis != "x":
+        proposed_global[0] += shift_x
+    if preserve_axis != "y":
+        proposed_global[1] += shift_y
+
+    dry_align_plan_global_position(plan, issues, operation_index, operation_type, found_target["path"], target_node, proposed_global, "Place " + found_target["path"] + " " + relation + " " + found_reference["path"] + ".")
+
+func dry_align_snap_value(value, grid_size, origin):
+    return origin + round((value - origin) / grid_size) * grid_size
+
+func dry_align_operation_snap_to_grid(operation, bounds_source, layout_by_path, node_by_path, issues, plan, operation_index):
+    var operation_type = "snap_to_grid"
+    var node_paths = dry_align_get_node_paths(dry_run_get_value(operation, ["nodePaths", "node_paths"], null), issues, operation_index, operation_type)
+    if node_paths.is_empty():
+        return
+
+    var grid_size = dry_run_get_value(operation, ["gridSize", "grid_size"], null)
+    if not dry_align_is_number_array_any_size(grid_size, [2, 3]):
+        dry_align_add_issue(issues, "error", "INVALID_OPERATION", "gridSize must be a numeric [x, y] or [x, y, z] array.", operation_index, operation_type)
+        return
+    for component in grid_size:
+        if component <= 0:
+            dry_align_add_issue(issues, "error", "INVALID_OPERATION", "gridSize values must be greater than zero.", operation_index, operation_type)
+            return
+
+    var origin = dry_run_get_value(operation, ["origin"], null)
+    if origin == null:
+        origin = dry_align_zero_array(grid_size.size())
+    if not dry_align_is_number_array_any_size(origin, [grid_size.size()]):
+        dry_align_add_issue(issues, "error", "INVALID_OPERATION", "origin must match the gridSize dimension.", operation_index, operation_type)
+        return
+
+    var mode = dry_run_get_value(operation, ["mode"], "position")
+    var allowed_modes = ["position", "bounds_min", "bounds_center"]
+    if typeof(mode) != TYPE_STRING or not allowed_modes.has(mode):
+        dry_align_add_issue(issues, "error", "INVALID_OPERATION", "snap_to_grid.mode must be position, bounds_min, or bounds_center.", operation_index, operation_type)
+        return
+
+    for path_value in node_paths:
+        var found = dry_align_find_node(path_value, node_by_path, issues, operation_index, operation_type, "NODE_NOT_FOUND")
+        if not found["success"]:
+            continue
+
+        var node = found["node"]
+        var current_global = dry_align_get_global_position(node)
+        if current_global == null:
+            dry_align_add_issue(issues, "error", "UNSUPPORTED_NODE_DIMENSION", "Node does not expose a supported global position.", operation_index, operation_type, found["path"])
+            continue
+
+        var point = current_global
+        if mode == "bounds_min" or mode == "bounds_center":
+            var selected = dry_align_select_bounds(layout_by_path[found["path"]], bounds_source, issues, operation_index, operation_type, found["path"])
+            if not selected["success"]:
+                dry_align_add_issue(issues, "error", selected["error"], selected["message"], operation_index, operation_type, found["path"])
+                continue
+            if selected["bounds"]["center"].size() != 2:
+                dry_align_add_issue(issues, "error", "UNSUPPORTED_NODE_DIMENSION", "Bounds-based snap_to_grid supports 2D bounds only in this version.", operation_index, operation_type, found["path"])
+                continue
+            point = selected["bounds"]["min"] if mode == "bounds_min" else selected["bounds"]["center"]
+
+        if grid_size.size() > point.size():
+            dry_align_add_issue(issues, "error", "UNSUPPORTED_NODE_DIMENSION", "gridSize dimension is larger than the target point dimension.", operation_index, operation_type, found["path"])
+            continue
+
+        var snapped_point = dry_align_duplicate_array(point)
+        for index in range(grid_size.size()):
+            snapped_point[index] = dry_align_snap_value(point[index], grid_size[index], origin[index])
+
+        var proposed_global = dry_align_duplicate_array(current_global)
+        for index in range(grid_size.size()):
+            proposed_global[index] += snapped_point[index] - point[index]
+
+        dry_align_plan_global_position(plan, issues, operation_index, operation_type, found["path"], node, proposed_global, "Snap " + found["path"] + " to grid using " + mode + ".")
+
+func dry_align_operation_distribute(operation, node_by_path, issues, plan, operation_index):
+    var operation_type = "distribute"
+    var node_paths = dry_align_get_node_paths(dry_run_get_value(operation, ["nodePaths", "node_paths"], null), issues, operation_index, operation_type)
+    if node_paths.size() < 3:
+        dry_align_add_issue(issues, "error", "INVALID_OPERATION", "distribute.nodePaths must contain at least three nodes.", operation_index, operation_type)
+        return
+
+    var axis = dry_run_get_value(operation, ["axis"], null)
+    if not (axis == "x" or axis == "y"):
+        dry_align_add_issue(issues, "error", "INVALID_OPERATION", "distribute.axis must be x or y.", operation_index, operation_type)
+        return
+    var axis_index = 0 if axis == "x" else 1
+
+    var spacing = dry_run_get_value(operation, ["spacing"], null)
+    if spacing != null and not (typeof(spacing) == TYPE_INT or typeof(spacing) == TYPE_FLOAT):
+        dry_align_add_issue(issues, "error", "INVALID_OPERATION", "distribute.spacing must be a number or null.", operation_index, operation_type)
+        return
+
+    var found_nodes = []
+    for path_value in node_paths:
+        var found = dry_align_find_node(path_value, node_by_path, issues, operation_index, operation_type, "NODE_NOT_FOUND")
+        if not found["success"]:
+            return
+        var global_position = dry_align_get_global_position(found["node"])
+        if global_position == null or global_position.size() != 2:
+            dry_align_add_issue(issues, "error", "UNSUPPORTED_NODE_DIMENSION", "distribute supports 2D Node2D/Control nodes in this version.", operation_index, operation_type, found["path"])
+            return
+        found["globalPosition"] = global_position
+        found_nodes.append(found)
+
+    var anchor_value = found_nodes[0]["globalPosition"][axis_index]
+    if spacing == null:
+        var last_value = found_nodes[found_nodes.size() - 1]["globalPosition"][axis_index]
+        spacing = (last_value - anchor_value) / float(found_nodes.size() - 1)
+        for index in range(1, found_nodes.size() - 1):
+            var item = found_nodes[index]
+            var proposed_global = dry_align_duplicate_array(item["globalPosition"])
+            proposed_global[axis_index] = anchor_value + spacing * index
+            dry_align_plan_global_position(plan, issues, operation_index, operation_type, item["path"], item["node"], proposed_global, "Distribute " + item["path"] + " along the " + axis + " axis.")
+    else:
+        for index in range(1, found_nodes.size()):
+            var item = found_nodes[index]
+            var proposed_global = dry_align_duplicate_array(item["globalPosition"])
+            proposed_global[axis_index] = anchor_value + spacing * index
+            dry_align_plan_global_position(plan, issues, operation_index, operation_type, item["path"], item["node"], proposed_global, "Distribute " + item["path"] + " along the " + axis + " axis with fixed spacing.")
+
+func dry_align_operation_set_position(operation, node_by_path, issues, plan, operation_index):
+    var operation_type = "set_position"
+    var node_paths = dry_align_get_node_paths(dry_run_get_value(operation, ["nodePaths", "node_paths"], null), issues, operation_index, operation_type)
+    if node_paths.is_empty():
+        return
+
+    var position = dry_run_get_value(operation, ["position"], null)
+    if not dry_align_is_number_array_any_size(position, [2, 3]):
+        dry_align_add_issue(issues, "error", "INVALID_OPERATION", "set_position.position must be a numeric [x, y] or [x, y, z] array.", operation_index, operation_type)
+        return
+
+    var space = dry_run_get_value(operation, ["space"], "local")
+    if not (space == "local" or space == "global"):
+        dry_align_add_issue(issues, "error", "INVALID_OPERATION", "set_position.space must be local or global.", operation_index, operation_type)
+        return
+
+    for path_value in node_paths:
+        var found = dry_align_find_node(path_value, node_by_path, issues, operation_index, operation_type, "NODE_NOT_FOUND")
+        if not found["success"]:
+            continue
+
+        if space == "local":
+            dry_align_plan_local_position(plan, issues, operation_index, operation_type, found["path"], found["node"], position, "Set " + found["path"] + " local position.")
+        else:
+            dry_align_plan_global_position(plan, issues, operation_index, operation_type, found["path"], found["node"], position, "Set " + found["path"] + " global position.")
+
+func dry_align_compact_bounds(bounds):
+    if not dry_align_bounds_available(bounds):
+        return {
+            "available": false,
+            "position": null,
+            "size": null,
+            "center": null
+        }
+    return {
+        "available": true,
+        "position": bounds["position"],
+        "size": bounds["size"],
+        "center": bounds["center"],
+        "min": bounds["min"],
+        "max": bounds["max"]
+    }
+
+func dry_align_best_bounds_without_issues(layout_data, bounds_source):
+    for candidate_source in dry_align_candidate_sources(bounds_source):
+        var bounds = dry_align_get_bounds_by_name(layout_data, candidate_source)
+        if dry_align_bounds_available(bounds):
+            return bounds
+    return layout_empty_bounds("global")
+
+func dry_align_compact_layout_before(layout_nodes, scene_bounds, bounds_source):
+    var compact_nodes = []
+    for layout_data in layout_nodes:
+        var position = null
+        if layout_data.has("transform") and layout_data["transform"] != null and layout_data["transform"].has("globalPosition"):
+            position = layout_data["transform"]["globalPosition"]
+        compact_nodes.append({
+            "path": layout_data["path"],
+            "type": layout_data["type"],
+            "position": position,
+            "bounds": dry_align_compact_bounds(dry_align_best_bounds_without_issues(layout_data, bounds_source))
+        })
+
+    return {
+        "nodes": compact_nodes,
+        "sceneBounds": scene_bounds
+    }
+
+func dry_align_finish_result(project_path, scene_path, operations, processed_count, issues, plan, include_plan, include_layout_before, layout_data, bounds_source, limits):
+    var counts = dry_align_issue_counts(issues)
+    var severity = dry_align_severity_from_counts(counts)
+    var result = {
+        "success": true,
+        "projectPath": project_path,
+        "scenePath": scene_path,
+        "valid": counts["errorCount"] == 0,
+        "severity": severity,
+        "summary": {
+            "operationCount": processed_count,
+            "plannedChangeCount": plan.size(),
+            "errorCount": counts["errorCount"],
+            "warningCount": counts["warningCount"],
+            "infoCount": counts["infoCount"]
+        },
+        "issues": issues,
+        "plan": plan if include_plan else [],
+        "layoutBefore": dry_align_compact_layout_before(layout_data["nodes"], layout_data["sceneBounds"], bounds_source) if include_layout_before else null,
+        "limits": limits
+    }
+    return result
+
+func dry_run_align_nodes(params):
+    if not params.has("scene_path"):
+        print(JSON.stringify(dry_align_error("MISSING_SCENE_PATH", "scene_path is required.")))
+        return
+    if not params.has("operations") or typeof(params.operations) != TYPE_ARRAY or params.operations.is_empty():
+        print(JSON.stringify(dry_align_error("MISSING_OPERATIONS", "operations must be a non-empty array.")))
+        return
+
+    var scene_path = normalize_resource_scene_path(params.scene_path)
+    var project_path = params.project_path if params.has("project_path") else ProjectSettings.globalize_path("res://")
+    var operations = params.operations
+    var bounds_source = params.bounds_source if params.has("bounds_source") else "visual"
+    var include_plan = params.include_plan if params.has("include_plan") else true
+    var include_layout_before = params.include_layout_before if params.has("include_layout_before") else false
+    var max_operations = int(params.max_operations) if params.has("max_operations") else 50
+    var max_depth = int(params.max_depth) if params.has("max_depth") else 100
+    var limits = {
+        "maxOperationsRequested": params.max_operations_requested if params.has("max_operations_requested") else null,
+        "maxOperationsApplied": max_operations,
+        "maxOperationsClamped": params.max_operations_clamped if params.has("max_operations_clamped") else false,
+        "maxDepthRequested": params.max_depth_requested if params.has("max_depth_requested") else null,
+        "maxDepthApplied": max_depth,
+        "maxDepthClamped": params.max_depth_clamped if params.has("max_depth_clamped") else false
+    }
+
+    if not FileAccess.file_exists(scene_path):
+        print(JSON.stringify(dry_align_error("SCENE_PATH_NOT_FOUND", "Scene file does not exist: " + scene_path)))
+        return
+
+    var scene_resource = ResourceLoader.load(scene_path)
+    if scene_resource == null or not (scene_resource is PackedScene):
+        print(JSON.stringify(dry_align_error("SCENE_LOAD_FAILED", "Failed to load scene as PackedScene: " + scene_path)))
+        return
+
+    var scene_root = scene_resource.instantiate()
+    if scene_root == null:
+        print(JSON.stringify(dry_align_error("SCENE_INSTANTIATE_FAILED", "Failed to instantiate scene: " + scene_path)))
+        return
+
+    var issues = []
+    var plan = []
+    var layout_data = dry_align_build_layout(scene_root, max_depth)
+    var layout_summary = layout_data["summary"]
+    if layout_summary.has("depthTruncated") and layout_summary["depthTruncated"]:
+        dry_align_add_issue(issues, "warning", "DEPTH_TRUNCATED", "Scene tree traversal was truncated by maxDepth.", -1, null, str(scene_root.name), "Increase maxDepth if deeper nodes should be available to the alignment planner.")
+
+    var processed_count = min(operations.size(), max_operations)
+    if operations.size() > max_operations:
+        dry_align_add_issue(issues, "warning", "OPERATIONS_TRUNCATED", "Only the first maxOperations operations were evaluated.", -1, null, null, "Increase maxOperations up to 500 if more operations should be planned.")
+
+    var layout_by_path = layout_data["layoutByPath"]
+    var node_by_path = layout_data["nodeByPath"]
+    var layout_nodes = layout_data["nodes"]
+    var scene_bounds = layout_data["sceneBounds"]
+
+    for operation_index in range(processed_count):
+        var operation = operations[operation_index]
+        if typeof(operation) != TYPE_DICTIONARY:
+            dry_align_add_issue(issues, "error", "INVALID_OPERATION", "Each operation must be an object.", operation_index, null)
+            continue
+
+        var operation_type = dry_run_get_value(operation, ["type"], null)
+        if typeof(operation_type) != TYPE_STRING:
+            dry_align_add_issue(issues, "error", "UNKNOWN_OPERATION_TYPE", "Operation type is required.", operation_index, null)
+            continue
+        operation_type = operation_type.strip_edges()
+
+        if operation_type == "align":
+            dry_align_operation_align(operation, bounds_source, layout_by_path, node_by_path, layout_nodes, scene_bounds, issues, plan, operation_index)
+        elif operation_type == "place_relative":
+            dry_align_operation_place_relative(operation, bounds_source, layout_by_path, node_by_path, issues, plan, operation_index)
+        elif operation_type == "snap_to_grid":
+            dry_align_operation_snap_to_grid(operation, bounds_source, layout_by_path, node_by_path, issues, plan, operation_index)
+        elif operation_type == "distribute":
+            dry_align_operation_distribute(operation, node_by_path, issues, plan, operation_index)
+        elif operation_type == "set_position":
+            dry_align_operation_set_position(operation, node_by_path, issues, plan, operation_index)
+        else:
+            dry_align_add_issue(issues, "error", "UNKNOWN_OPERATION_TYPE", "Operation type is not supported: " + operation_type, operation_index, operation_type)
+
+    var result = dry_align_finish_result(project_path, scene_path, operations, processed_count, issues, plan, include_plan, include_layout_before, layout_data, bounds_source, limits)
     print(JSON.stringify(result))
     scene_root.free()
 

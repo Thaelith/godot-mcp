@@ -74,6 +74,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 - **Scene Inspection**:
   - Read existing scene trees into structured, read-only JSON before making changes
   - Inspect placement-oriented scene layout, transforms, bounds, and Control rects
+  - Dry-run node alignment and layout operations without modifying or saving scenes
   - Validate scenes read-only and return structured issues before AI-assisted edits
   - Dry-run proposed scene blueprints and return validation issues plus a creation plan without writing files
 - **Scene Management**:
@@ -136,6 +137,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "get_asset_info",
         "read_scene_tree",
         "get_scene_layout",
+        "dry_run_align_nodes",
         "validate_scene",
         "dry_run_scene_blueprint",
         "create_scene_from_blueprint",
@@ -641,6 +643,140 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Then call `get_scene_layout` from the inspector with a local Godot project path and an existing scene file. Confirm the scene file is unchanged.
+
+### `dry_run_align_nodes`
+
+Plans alignment and layout changes for existing scene nodes without modifying, saving, importing, reimporting, or creating files. This read-only tool loads the scene, calculates proposed local `position` changes, and returns a plan that a future writing `align_nodes` tool could apply.
+
+Input examples:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "boundsSource": "visual",
+  "operations": [
+    {
+      "type": "align",
+      "nodePaths": ["Room/Chair"],
+      "mode": "center_x",
+      "reference": {
+        "type": "node",
+        "nodePath": "Room/Table",
+        "bounds": "visual"
+      },
+      "margin": 0
+    }
+  ]
+}
+```
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "scenes/Room.tscn",
+  "operations": [
+    {
+      "type": "place_relative",
+      "nodePath": "Room/Chair",
+      "referenceNodePath": "Room/Table",
+      "relation": "right_of",
+      "margin": 8,
+      "preserveAxis": null
+    },
+    {
+      "type": "snap_to_grid",
+      "nodePaths": ["Room/Chair", "Room/Table"],
+      "gridSize": [16, 16],
+      "origin": [0, 0],
+      "mode": "position"
+    },
+    {
+      "type": "distribute",
+      "nodePaths": ["Room/A", "Room/B", "Room/C"],
+      "axis": "x",
+      "spacing": null
+    },
+    {
+      "type": "set_position",
+      "nodePaths": ["Room/Chair"],
+      "position": [100, 200],
+      "space": "local"
+    }
+  ],
+  "includePlan": true,
+  "includeLayoutBefore": false,
+  "maxOperations": 50,
+  "maxDepth": 100
+}
+```
+
+Supported operations:
+
+- `align`: aligns target bounds to a node, scene bounds, or point using `left`, `right`, `top`, `bottom`, `center_x`, `center_y`, `center`, or `match_position`.
+- `place_relative`: places one node relative to another with relations such as `left_of`, `right_of`, `above`, `below`, `centered_on`, or inside-corner placement.
+- `snap_to_grid`: snaps node positions or selected bounds points to a grid.
+- `distribute`: distributes at least three 2D nodes along `x` or `y`.
+- `set_position`: plans a direct local or global position change.
+
+`boundsSource` defaults to `visual` and can be `visual`, `collision`, `control`, or `transform`. If the requested bounds are unavailable, the planner falls back according to the same safe priority used by the tool and returns a `BOUNDS_FALLBACK_USED` warning.
+
+`maxOperations` defaults to `50`; values below `1` return a validation error, and values above `500` are clamped to `500`. `maxDepth` defaults to `100`; values below `1` return a validation error, and values above `200` are clamped to `200`.
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "valid": true,
+  "severity": "ok",
+  "summary": {
+    "operationCount": 1,
+    "plannedChangeCount": 1,
+    "errorCount": 0,
+    "warningCount": 0,
+    "infoCount": 0
+  },
+  "issues": [],
+  "plan": [
+    {
+      "operationIndex": 0,
+      "operationType": "place_relative",
+      "nodePath": "Room/Chair",
+      "property": "position",
+      "space": "local",
+      "currentValue": [0, 0],
+      "proposedValue": [128, 0],
+      "delta": [128, 0],
+      "currentGlobalPosition": [0, 0],
+      "proposedGlobalPosition": [128, 0],
+      "reason": "Place Room/Chair right_of Room/Table."
+    }
+  ],
+  "layoutBefore": null,
+  "limits": {
+    "maxOperationsRequested": null,
+    "maxOperationsApplied": 50,
+    "maxOperationsClamped": false,
+    "maxDepthRequested": null,
+    "maxDepthApplied": 100,
+    "maxDepthClamped": false
+  }
+}
+```
+
+The first version fully supports 2D `Node2D` and `Control` placement. `Node3D` support is limited to transform-position planning through `set_position` and `snap_to_grid`; bounds-based 3D alignment returns a structured warning or error instead of guessing. This tool differs from the future `align_nodes` tool because it never writes the calculated changes.
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Then call `dry_run_align_nodes` with an existing scene containing at least two positioned 2D nodes. Confirm the returned plan contains proposed local `position` values and that the scene file is unchanged.
 
 ### `validate_scene`
 
