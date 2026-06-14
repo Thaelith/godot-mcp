@@ -28,7 +28,7 @@ func _init():
     
     var operation = args[operation_index]
     var params_json = args[params_index]
-    var quiet_output = operation == "read_scene_tree" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
+    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
 
     if quiet_output:
         debug_mode = false
@@ -65,6 +65,8 @@ func _init():
     match operation:
         "read_scene_tree":
             read_scene_tree(params)
+        "get_scene_layout":
+            get_scene_layout(params)
         "validate_scene":
             validate_scene(params)
         "get_asset_info":
@@ -420,6 +422,481 @@ func read_scene_tree(params):
         "root": root_data,
         "summary": summary,
         "limits": limits
+    }
+
+    print(JSON.stringify(result))
+    scene_root.free()
+
+func layout_add_warning(warnings, code, message):
+    warnings.append({
+        "code": code,
+        "message": message
+    })
+
+func layout_empty_bounds(space):
+    return {
+        "available": false,
+        "space": space,
+        "position": null,
+        "size": null,
+        "center": null,
+        "min": null,
+        "max": null
+    }
+
+func layout_bounds_from_arrays(min_values, max_values, space):
+    var size_values = []
+    var center_values = []
+    for index in range(min_values.size()):
+        var size_value = max_values[index] - min_values[index]
+        size_values.append(size_value)
+        center_values.append(min_values[index] + size_value / 2.0)
+
+    return {
+        "available": true,
+        "space": space,
+        "position": min_values,
+        "size": size_values,
+        "center": center_values,
+        "min": min_values,
+        "max": max_values
+    }
+
+func layout_rect2_to_bounds(rect, space="global"):
+    return layout_bounds_from_arrays(
+        vector2_to_array(rect.position),
+        vector2_to_array(rect.position + rect.size),
+        space
+    )
+
+func layout_aabb_to_bounds(aabb, space="global"):
+    return layout_bounds_from_arrays(
+        vector3_to_array(aabb.position),
+        vector3_to_array(aabb.position + aabb.size),
+        space
+    )
+
+func layout_transform2d_bounds(transform, local_min, local_max, space="global"):
+    var points = [
+        transform * local_min,
+        transform * Vector2(local_max.x, local_min.y),
+        transform * local_max,
+        transform * Vector2(local_min.x, local_max.y)
+    ]
+    var min_x = points[0].x
+    var min_y = points[0].y
+    var max_x = points[0].x
+    var max_y = points[0].y
+    for point in points:
+        min_x = min(min_x, point.x)
+        min_y = min(min_y, point.y)
+        max_x = max(max_x, point.x)
+        max_y = max(max_y, point.y)
+
+    return layout_bounds_from_arrays([min_x, min_y], [max_x, max_y], space)
+
+func layout_points2d_bounds(transform, points, space="global"):
+    if points.is_empty():
+        return layout_empty_bounds(space)
+
+    var first_point = transform * points[0]
+    var min_x = first_point.x
+    var min_y = first_point.y
+    var max_x = first_point.x
+    var max_y = first_point.y
+    for point in points:
+        var transformed = transform * point
+        min_x = min(min_x, transformed.x)
+        min_y = min(min_y, transformed.y)
+        max_x = max(max_x, transformed.x)
+        max_y = max(max_y, transformed.y)
+
+    return layout_bounds_from_arrays([min_x, min_y], [max_x, max_y], space)
+
+func layout_transform3d_aabb(transform, aabb, space="global"):
+    var min_corner = aabb.position
+    var max_corner = aabb.position + aabb.size
+    var corners = [
+        Vector3(min_corner.x, min_corner.y, min_corner.z),
+        Vector3(max_corner.x, min_corner.y, min_corner.z),
+        Vector3(min_corner.x, max_corner.y, min_corner.z),
+        Vector3(max_corner.x, max_corner.y, min_corner.z),
+        Vector3(min_corner.x, min_corner.y, max_corner.z),
+        Vector3(max_corner.x, min_corner.y, max_corner.z),
+        Vector3(min_corner.x, max_corner.y, max_corner.z),
+        Vector3(max_corner.x, max_corner.y, max_corner.z)
+    ]
+
+    var first_corner = transform * corners[0]
+    var min_x = first_corner.x
+    var min_y = first_corner.y
+    var min_z = first_corner.z
+    var max_x = first_corner.x
+    var max_y = first_corner.y
+    var max_z = first_corner.z
+
+    for corner in corners:
+        var transformed = transform * corner
+        min_x = min(min_x, transformed.x)
+        min_y = min(min_y, transformed.y)
+        min_z = min(min_z, transformed.z)
+        max_x = max(max_x, transformed.x)
+        max_y = max(max_y, transformed.y)
+        max_z = max(max_z, transformed.z)
+
+    return layout_bounds_from_arrays([min_x, min_y, min_z], [max_x, max_y, max_z], space)
+
+func layout_union_bounds(existing, candidate):
+    if candidate == null or not candidate.has("available") or not candidate["available"]:
+        return existing
+    if existing == null or not existing.has("available") or not existing["available"]:
+        return candidate.duplicate(true)
+    if existing["min"].size() != candidate["min"].size():
+        return existing
+
+    var min_values = []
+    var max_values = []
+    for index in range(existing["min"].size()):
+        min_values.append(min(existing["min"][index], candidate["min"][index]))
+        max_values.append(max(existing["max"][index], candidate["max"][index]))
+
+    return layout_bounds_from_arrays(min_values, max_values, existing["space"])
+
+func layout_node_visible(node):
+    if node is CanvasItem:
+        return node.visible
+    if node is Node3D:
+        return node.visible
+    return true
+
+func layout_node_transform(node):
+    if node is Control:
+        return {
+            "localPosition": vector2_to_array(node.position),
+            "globalPosition": vector2_to_array(node.global_position),
+            "localScale": vector2_to_array(node.scale),
+            "size": vector2_to_array(node.size),
+            "rotation": node.rotation
+        }
+
+    if node is Node2D:
+        return {
+            "localPosition": vector2_to_array(node.position),
+            "globalPosition": vector2_to_array(node.global_position),
+            "localScale": vector2_to_array(node.scale),
+            "globalScale": vector2_to_array(node.global_scale),
+            "rotation": node.rotation,
+            "globalRotation": node.global_rotation
+        }
+
+    if node is Node3D:
+        return {
+            "localPosition": vector3_to_array(node.position),
+            "globalPosition": vector3_to_array(node.global_position),
+            "localScale": vector3_to_array(node.scale),
+            "globalScale": vector3_to_array(node.global_transform.basis.get_scale()),
+            "rotation": vector3_to_array(node.rotation),
+            "globalRotation": vector3_to_array(node.global_rotation)
+        }
+
+    return null
+
+func layout_control_rect(node):
+    if not (node is Control):
+        return null
+    var rect = node.get_global_rect()
+    return layout_rect2_to_bounds(rect, "global")
+
+func layout_add_resource(resources, property_name, resource):
+    if resource == null or not (resource is Resource):
+        return
+    if resource.resource_path.is_empty():
+        return
+
+    resources.append({
+        "property": property_name,
+        "path": resource.resource_path,
+        "type": resource.get_class()
+    })
+
+func layout_collect_resources(node):
+    var resources = []
+    if node is Sprite2D:
+        layout_add_resource(resources, "texture", node.texture)
+    if node is TextureRect:
+        layout_add_resource(resources, "texture", node.texture)
+    if node is CollisionShape2D:
+        layout_add_resource(resources, "shape", node.shape)
+    if node is CollisionShape3D:
+        layout_add_resource(resources, "shape", node.shape)
+    if node is MeshInstance3D:
+        layout_add_resource(resources, "mesh", node.mesh)
+    if node is AudioStreamPlayer:
+        layout_add_resource(resources, "stream", node.stream)
+    if node is AudioStreamPlayer2D:
+        layout_add_resource(resources, "stream", node.stream)
+    if node is AudioStreamPlayer3D:
+        layout_add_resource(resources, "stream", node.stream)
+    return resources
+
+func layout_sprite2d_bounds(node, warnings):
+    if node.texture == null:
+        layout_add_warning(warnings, "MISSING_TEXTURE", "Sprite2D has no texture, so visual bounds are unavailable.")
+        return layout_empty_bounds("global")
+
+    var texture_size = node.texture.get_size()
+    if node.hframes > 0:
+        texture_size.x = texture_size.x / node.hframes
+    if node.vframes > 0:
+        texture_size.y = texture_size.y / node.vframes
+
+    var local_min = Vector2.ZERO
+    if node.centered:
+        local_min = -texture_size / 2.0
+    local_min += node.offset
+    var local_max = local_min + texture_size
+
+    if not is_nearly_zero(node.global_rotation):
+        layout_add_warning(warnings, "APPROXIMATE_BOUNDS", "Visual bounds are approximate because rotation is applied.")
+
+    return layout_transform2d_bounds(node.global_transform, local_min, local_max, "global")
+
+func layout_mesh_instance_bounds(node, warnings):
+    if node.mesh == null:
+        layout_add_warning(warnings, "MISSING_MESH", "MeshInstance3D has no mesh, so visual bounds are unavailable.")
+        return layout_empty_bounds("global")
+
+    layout_add_warning(warnings, "APPROXIMATE_3D_BOUNDS", "3D visual bounds are an approximate transformed mesh AABB.")
+    return layout_transform3d_aabb(node.global_transform, node.mesh.get_aabb(), "global")
+
+func layout_visual_bounds(node, warnings):
+    if node is Sprite2D:
+        return layout_sprite2d_bounds(node, warnings)
+    if node is TextureRect:
+        return layout_control_rect(node)
+    if node is MeshInstance3D:
+        return layout_mesh_instance_bounds(node, warnings)
+    return layout_empty_bounds("global")
+
+func layout_collision_shape2d_bounds(node, warnings):
+    if node.shape == null:
+        layout_add_warning(warnings, "UNSUPPORTED_COLLISION_SHAPE", "CollisionShape2D has no shape, so collision bounds are unavailable.")
+        var missing_bounds = layout_empty_bounds("global")
+        missing_bounds["disabled"] = node.disabled
+        missing_bounds["shapeType"] = null
+        return missing_bounds
+
+    var shape = node.shape
+    var bounds = layout_empty_bounds("global")
+    if shape is RectangleShape2D:
+        var half_size = shape.size / 2.0
+        bounds = layout_transform2d_bounds(node.global_transform, -half_size, half_size, "global")
+    elif shape is CircleShape2D:
+        var radius = shape.radius
+        bounds = layout_transform2d_bounds(node.global_transform, Vector2(-radius, -radius), Vector2(radius, radius), "global")
+    elif shape is CapsuleShape2D:
+        var capsule_half = Vector2(shape.radius, shape.height / 2.0)
+        bounds = layout_transform2d_bounds(node.global_transform, -capsule_half, capsule_half, "global")
+        layout_add_warning(warnings, "APPROXIMATE_BOUNDS", "CapsuleShape2D bounds are approximate.")
+    elif shape is SegmentShape2D:
+        bounds = layout_points2d_bounds(node.global_transform, [shape.a, shape.b], "global")
+    else:
+        layout_add_warning(warnings, "UNSUPPORTED_COLLISION_SHAPE", "CollisionShape2D shape type is not supported for bounds.")
+
+    bounds["disabled"] = node.disabled
+    bounds["shapeType"] = shape.get_class()
+    return bounds
+
+func layout_collision_polygon2d_bounds(node, warnings):
+    if node.polygon.is_empty():
+        layout_add_warning(warnings, "UNSUPPORTED_COLLISION_SHAPE", "CollisionPolygon2D has no polygon points.")
+        return layout_empty_bounds("global")
+
+    return layout_points2d_bounds(node.global_transform, node.polygon, "global")
+
+func layout_collision_shape3d_bounds(node, warnings):
+    if node.shape == null:
+        layout_add_warning(warnings, "UNSUPPORTED_COLLISION_SHAPE_3D", "CollisionShape3D has no shape, so collision bounds are unavailable.")
+        var missing_bounds = layout_empty_bounds("global")
+        missing_bounds["disabled"] = node.disabled
+        missing_bounds["shapeType"] = null
+        return missing_bounds
+
+    var shape = node.shape
+    var bounds = layout_empty_bounds("global")
+    if shape is BoxShape3D:
+        bounds = layout_transform3d_aabb(node.global_transform, AABB(-shape.size / 2.0, shape.size), "global")
+    elif shape is SphereShape3D:
+        var sphere_size = Vector3(shape.radius * 2.0, shape.radius * 2.0, shape.radius * 2.0)
+        bounds = layout_transform3d_aabb(node.global_transform, AABB(-sphere_size / 2.0, sphere_size), "global")
+    elif shape is CapsuleShape3D:
+        var capsule_size = Vector3(shape.radius * 2.0, shape.height, shape.radius * 2.0)
+        bounds = layout_transform3d_aabb(node.global_transform, AABB(-capsule_size / 2.0, capsule_size), "global")
+        layout_add_warning(warnings, "APPROXIMATE_3D_BOUNDS", "CapsuleShape3D bounds are approximate.")
+    else:
+        layout_add_warning(warnings, "UNSUPPORTED_COLLISION_SHAPE_3D", "CollisionShape3D shape type is not supported for bounds.")
+
+    bounds["disabled"] = node.disabled
+    bounds["shapeType"] = shape.get_class()
+    return bounds
+
+func layout_collision_bounds(node, warnings):
+    if node is CollisionShape2D:
+        return layout_collision_shape2d_bounds(node, warnings)
+    if node is CollisionPolygon2D:
+        return layout_collision_polygon2d_bounds(node, warnings)
+    if node is CollisionShape3D:
+        return layout_collision_shape3d_bounds(node, warnings)
+    return layout_empty_bounds("global")
+
+func layout_update_summary_for_node(node, visible, depth, summary):
+    var node_type = node.get_class()
+    summary["totalNodes"] += 1
+    if visible:
+        summary["visibleNodes"] += 1
+    else:
+        summary["hiddenNodes"] += 1
+    summary["maxDepthReached"] = max(summary["maxDepthReached"], depth)
+    if not summary["nodeTypes"].has(node_type):
+        summary["nodeTypes"][node_type] = 0
+    summary["nodeTypes"][node_type] += 1
+
+func layout_parent_path(node, root):
+    if node == root or node.get_parent() == null:
+        return null
+    return get_scene_node_path(node.get_parent(), root)
+
+func collect_scene_layout_node(node, root, depth, max_depth, options, summary, scene_bounds, flat_nodes):
+    var visible = layout_node_visible(node)
+    if not options["includeHidden"] and not visible:
+        return null
+
+    layout_update_summary_for_node(node, visible, depth, summary)
+
+    var warnings = []
+    var node_path = get_scene_node_path(node, root)
+    var node_data = {
+        "path": node_path,
+        "name": str(node.name),
+        "type": node.get_class(),
+        "parentPath": layout_parent_path(node, root),
+        "depth": depth,
+        "visible": visible,
+        "transform": layout_node_transform(node)
+    }
+
+    if options["includeVisualBounds"]:
+        var visual_bounds = layout_visual_bounds(node, warnings)
+        node_data["visualBounds"] = visual_bounds
+        if visual_bounds["available"]:
+            summary["nodesWithVisualBounds"] += 1
+            scene_bounds["visual"] = layout_union_bounds(scene_bounds["visual"], visual_bounds)
+
+    if options["includeCollisionBounds"]:
+        var collision_bounds = layout_collision_bounds(node, warnings)
+        node_data["collisionBounds"] = collision_bounds
+        if collision_bounds["available"]:
+            summary["nodesWithCollisionBounds"] += 1
+            scene_bounds["collision"] = layout_union_bounds(scene_bounds["collision"], collision_bounds)
+
+    if options["includeControlRects"]:
+        var control_rect = layout_control_rect(node)
+        node_data["controlRect"] = control_rect
+        if control_rect != null and control_rect["available"]:
+            summary["nodesWithControlRects"] += 1
+
+    if options["includeResources"]:
+        node_data["resources"] = layout_collect_resources(node)
+
+    if options["includeChildren"]:
+        node_data["children"] = []
+
+    if depth >= max_depth:
+        if node.get_child_count() > 0:
+            summary["depthTruncated"] = true
+            layout_add_warning(warnings, "DEPTH_TRUNCATED", "Scene layout traversal was truncated by maxDepth.")
+        if options["includeWarnings"]:
+            node_data["warnings"] = warnings
+        flat_nodes.append(node_data)
+        return node_data
+
+    flat_nodes.append(node_data)
+    for child in node.get_children():
+        var child_data = collect_scene_layout_node(child, root, depth + 1, max_depth, options, summary, scene_bounds, flat_nodes)
+        if options["includeChildren"] and child_data != null:
+            node_data["children"].append(child_data)
+
+    if options["includeWarnings"]:
+        node_data["warnings"] = warnings
+    return node_data
+
+func get_scene_layout(params):
+    if not params.has("scene_path"):
+        print_json_error("MISSING_SCENE_PATH", "scene_path is required.")
+        return
+
+    var scene_path = normalize_resource_scene_path(params.scene_path)
+    var max_depth = params.max_depth if params.has("max_depth") else 100
+    var max_depth_requested = params.max_depth_requested if params.has("max_depth_requested") else null
+    var max_depth_clamped = params.max_depth_clamped if params.has("max_depth_clamped") else false
+    var project_path = params.project_path if params.has("project_path") else ProjectSettings.globalize_path("res://")
+
+    var options = {
+        "includeHidden": params.include_hidden if params.has("include_hidden") else true,
+        "includeVisualBounds": params.include_visual_bounds if params.has("include_visual_bounds") else true,
+        "includeCollisionBounds": params.include_collision_bounds if params.has("include_collision_bounds") else true,
+        "includeControlRects": params.include_control_rects if params.has("include_control_rects") else true,
+        "includeResources": params.include_resources if params.has("include_resources") else true,
+        "includeChildren": params.include_children if params.has("include_children") else false,
+        "includeWarnings": params.include_warnings if params.has("include_warnings") else true
+    }
+
+    if not FileAccess.file_exists(scene_path):
+        print_json_error("SCENE_PATH_NOT_FOUND", "Scene file does not exist: " + scene_path)
+        return
+
+    var scene_resource = ResourceLoader.load(scene_path)
+    if scene_resource == null or not (scene_resource is PackedScene):
+        print_json_error("SCENE_LOAD_FAILED", "Failed to load scene as PackedScene: " + scene_path)
+        return
+
+    var scene_root = scene_resource.instantiate()
+    if scene_root == null:
+        print_json_error("SCENE_INSTANTIATE_FAILED", "Failed to instantiate scene: " + scene_path)
+        return
+
+    var summary = {
+        "totalNodes": 0,
+        "visibleNodes": 0,
+        "hiddenNodes": 0,
+        "nodesWithVisualBounds": 0,
+        "nodesWithCollisionBounds": 0,
+        "nodesWithControlRects": 0,
+        "maxDepthReached": 0,
+        "depthTruncated": false,
+        "nodeTypes": {}
+    }
+    var scene_bounds = {
+        "visual": layout_empty_bounds("global"),
+        "collision": layout_empty_bounds("global")
+    }
+    var nodes = []
+    collect_scene_layout_node(scene_root, scene_root, 0, max_depth, options, summary, scene_bounds, nodes)
+
+    var result = {
+        "success": true,
+        "projectPath": project_path,
+        "scenePath": scene_path,
+        "rootType": scene_root.get_class(),
+        "coordinateSpace": "scene",
+        "nodes": nodes,
+        "summary": summary,
+        "sceneBounds": scene_bounds,
+        "limits": {
+            "maxDepthRequested": max_depth_requested,
+            "maxDepthApplied": max_depth,
+            "maxDepthClamped": max_depth_clamped
+        }
     }
 
     print(JSON.stringify(result))

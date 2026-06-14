@@ -73,6 +73,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
   - Inspect selected assets for metadata, dependencies, scene previews, and placement hints
 - **Scene Inspection**:
   - Read existing scene trees into structured, read-only JSON before making changes
+  - Inspect placement-oriented scene layout, transforms, bounds, and Control rects
   - Validate scenes read-only and return structured issues before AI-assisted edits
   - Dry-run proposed scene blueprints and return validation issues plus a creation plan without writing files
 - **Scene Management**:
@@ -134,6 +135,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "scan_assets",
         "get_asset_info",
         "read_scene_tree",
+        "get_scene_layout",
         "validate_scene",
         "dry_run_scene_blueprint",
         "create_scene_from_blueprint",
@@ -501,6 +503,144 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Then call `read_scene_tree` from the inspector with a local Godot project path and an existing scene file.
+
+### `get_scene_layout`
+
+Inspects a Godot scene read-only and returns placement-oriented metadata: node transforms, approximate visual bounds, collision bounds, Control rects, parent paths, resources, and aggregate scene bounds. This tool loads and instantiates the scene for inspection only; it does not save, create, import, reimport, or modify files.
+
+Input example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "maxDepth": 100,
+  "includeHidden": true,
+  "includeVisualBounds": true,
+  "includeCollisionBounds": true,
+  "includeControlRects": true,
+  "includeResources": true,
+  "includeChildren": false,
+  "includeWarnings": true
+}
+```
+
+`scenePath` can be written as `res://scenes/Room.tscn` or `scenes/Room.tscn`. It must stay inside the Godot project and must point to an existing `.tscn` or `.scn` file.
+
+`maxDepth` defaults to `100`. Values below `1` return a validation error, and values above `200` are clamped to `200`.
+
+Layout fields:
+
+- `visualBounds`: approximate global AABB for visual nodes such as `Sprite2D`, `TextureRect`, and `MeshInstance3D`.
+- `collisionBounds`: approximate global AABB for supported collision shapes and polygons.
+- `controlRect`: global Control rectangle for `Control` subclasses.
+- `sceneBounds`: aggregate union of available visual and collision bounds.
+- `resources`: small resource path references only, never full resource contents.
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "rootType": "Node2D",
+  "coordinateSpace": "scene",
+  "nodes": [
+    {
+      "path": "Room/Floor",
+      "name": "Floor",
+      "type": "Sprite2D",
+      "parentPath": "Room",
+      "depth": 1,
+      "visible": true,
+      "transform": {
+        "localPosition": [0, 0],
+        "globalPosition": [0, 0],
+        "localScale": [1, 1],
+        "globalScale": [1, 1],
+        "rotation": 0,
+        "globalRotation": 0
+      },
+      "visualBounds": {
+        "available": true,
+        "space": "global",
+        "position": [-64, -64],
+        "size": [128, 128],
+        "center": [0, 0],
+        "min": [-64, -64],
+        "max": [64, 64]
+      },
+      "collisionBounds": {
+        "available": false,
+        "space": "global",
+        "position": null,
+        "size": null,
+        "center": null,
+        "min": null,
+        "max": null
+      },
+      "controlRect": null,
+      "resources": [
+        {
+          "property": "texture",
+          "path": "res://assets/floor.png",
+          "type": "ImageTexture"
+        }
+      ],
+      "warnings": []
+    }
+  ],
+  "summary": {
+    "totalNodes": 2,
+    "visibleNodes": 2,
+    "hiddenNodes": 0,
+    "nodesWithVisualBounds": 1,
+    "nodesWithCollisionBounds": 0,
+    "nodesWithControlRects": 0,
+    "maxDepthReached": 1,
+    "depthTruncated": false,
+    "nodeTypes": {
+      "Node2D": 1,
+      "Sprite2D": 1
+    }
+  },
+  "sceneBounds": {
+    "visual": {
+      "available": true,
+      "position": [-64, -64],
+      "size": [128, 128],
+      "center": [0, 0],
+      "min": [-64, -64],
+      "max": [64, 64]
+    },
+    "collision": {
+      "available": false,
+      "position": null,
+      "size": null,
+      "center": null,
+      "min": null,
+      "max": null
+    }
+  },
+  "limits": {
+    "maxDepthRequested": 100,
+    "maxDepthApplied": 100,
+    "maxDepthClamped": false
+  }
+}
+```
+
+Bounds are intentionally approximate where Godot's rendered output or transformed 3D geometry would require more expensive editor/runtime context. Nodes may include warnings such as `APPROXIMATE_BOUNDS`, `APPROXIMATE_3D_BOUNDS`, `MISSING_TEXTURE`, or unsupported collision shape notices.
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Then call `get_scene_layout` from the inspector with a local Godot project path and an existing scene file. Confirm the scene file is unchanged.
 
 ### `validate_scene`
 
