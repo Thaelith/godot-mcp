@@ -28,7 +28,7 @@ func _init():
     
     var operation = args[operation_index]
     var params_json = args[params_index]
-    var quiet_output = operation == "read_scene_tree"
+    var quiet_output = operation == "read_scene_tree" or operation == "validate_scene"
 
     if quiet_output:
         debug_mode = false
@@ -65,6 +65,8 @@ func _init():
     match operation:
         "read_scene_tree":
             read_scene_tree(params)
+        "validate_scene":
+            validate_scene(params)
         "create_scene":
             create_scene(params)
         "add_node":
@@ -414,6 +416,392 @@ func read_scene_tree(params):
         "limits": limits
     }
 
+    print(JSON.stringify(result))
+    scene_root.free()
+
+func is_nearly_zero(value):
+    return abs(value) <= 0.0001
+
+func is_vector2_nearly_zero(value):
+    return is_nearly_zero(value.x) or is_nearly_zero(value.y)
+
+func is_vector3_nearly_zero(value):
+    return is_nearly_zero(value.x) or is_nearly_zero(value.y) or is_nearly_zero(value.z)
+
+func add_validation_issue(issues, severity, code, message, node, root, prop_name=null, resource_path=null, suggestion=null):
+    var issue = {
+        "severity": severity,
+        "code": code,
+        "message": message,
+        "nodePath": get_scene_node_path(node, root),
+        "nodeType": node.get_class()
+    }
+
+    if prop_name != null:
+        issue["property"] = prop_name
+    if resource_path != null:
+        issue["resourcePath"] = resource_path
+    if suggestion != null:
+        issue["suggestion"] = suggestion
+
+    issues.append(issue)
+
+func validate_resource_path_for_property(node, root, issues, prop_name, resource):
+    if resource == null or not (resource is Resource):
+        return
+
+    var resource_path = resource.resource_path
+    if resource_path.is_empty():
+        return
+
+    if not ResourceLoader.exists(resource_path):
+        add_validation_issue(
+            issues,
+            "error",
+            "MISSING_RESOURCE",
+            "Referenced resource does not exist: " + resource_path,
+            node,
+            root,
+            prop_name,
+            resource_path,
+            "Assign an existing resource path or remove the broken reference."
+        )
+
+func has_descendant_of_class(node, class_name_to_find):
+    for child in node.get_children():
+        if child.is_class(class_name_to_find):
+            return true
+        if has_descendant_of_class(child, class_name_to_find):
+            return true
+    return false
+
+func has_visible_child_content(node):
+    for child in node.get_children():
+        if child is CanvasItem and child.visible:
+            return true
+        if child is Node3D and child.visible:
+            return true
+    return false
+
+func validate_script_reference(node, root, issues):
+    var script = node.get_script()
+    if script == null:
+        return
+
+    var script_path = script.resource_path
+    if script_path.is_empty() or not ResourceLoader.exists(script_path):
+        add_validation_issue(
+            issues,
+            "error",
+            "MISSING_SCRIPT",
+            "Node script reference is missing or does not exist.",
+            node,
+            root,
+            "script",
+            script_path if not script_path.is_empty() else null,
+            "Assign an existing script resource or clear the script reference."
+        )
+
+func validate_resource_references(node, root, issues):
+    if node is Sprite2D:
+        validate_resource_path_for_property(node, root, issues, "texture", node.texture)
+    if node is TextureRect:
+        validate_resource_path_for_property(node, root, issues, "texture", node.texture)
+    if node is CollisionShape2D:
+        validate_resource_path_for_property(node, root, issues, "shape", node.shape)
+    if node is CollisionShape3D:
+        validate_resource_path_for_property(node, root, issues, "shape", node.shape)
+    if node is MeshInstance3D:
+        validate_resource_path_for_property(node, root, issues, "mesh", node.mesh)
+    if node is AudioStreamPlayer:
+        validate_resource_path_for_property(node, root, issues, "stream", node.stream)
+    if node is AudioStreamPlayer2D:
+        validate_resource_path_for_property(node, root, issues, "stream", node.stream)
+    if node is AudioStreamPlayer3D:
+        validate_resource_path_for_property(node, root, issues, "stream", node.stream)
+
+func validate_rendering_node(node, root, issues, include_info):
+    if node is Sprite2D and node.texture == null:
+        add_validation_issue(
+            issues,
+            "error",
+            "SPRITE_MISSING_TEXTURE",
+            "Sprite2D node has no texture assigned.",
+            node,
+            root,
+            "texture",
+            null,
+            "Assign a Texture2D resource or remove the unused Sprite2D node."
+        )
+
+    if node is TextureRect and node.texture == null:
+        add_validation_issue(
+            issues,
+            "warning",
+            "TEXTURE_RECT_MISSING_TEXTURE",
+            "TextureRect node has no texture assigned.",
+            node,
+            root,
+            "texture",
+            null,
+            "Assign a Texture2D resource or remove the unused TextureRect node."
+        )
+
+    if node is MeshInstance3D and node.mesh == null:
+        add_validation_issue(
+            issues,
+            "error",
+            "MESH_INSTANCE_MISSING_MESH",
+            "MeshInstance3D node has no mesh assigned.",
+            node,
+            root,
+            "mesh",
+            null,
+            "Assign a Mesh resource or remove the unused MeshInstance3D node."
+        )
+
+    if node is Node2D:
+        if node.visible and is_vector2_nearly_zero(node.scale):
+            add_validation_issue(issues, "warning", "ZERO_SCALE", "Visible Node2D has an approximately zero scale axis.", node, root, "scale", null, "Use a non-zero scale for visible nodes.")
+        elif include_info and not node.visible:
+            add_validation_issue(issues, "info", "NODE_NOT_VISIBLE", "Node2D is not visible.", node, root, "visible")
+    elif node is Control:
+        if node.visible and is_vector2_nearly_zero(node.scale):
+            add_validation_issue(issues, "warning", "ZERO_SCALE", "Visible Control has an approximately zero scale axis.", node, root, "scale", null, "Use a non-zero scale for visible controls.")
+        elif include_info and not node.visible:
+            add_validation_issue(issues, "info", "NODE_NOT_VISIBLE", "Control is not visible.", node, root, "visible")
+    elif node is Node3D:
+        if node.visible and is_vector3_nearly_zero(node.scale):
+            add_validation_issue(issues, "warning", "ZERO_SCALE", "Visible Node3D has an approximately zero scale axis.", node, root, "scale", null, "Use a non-zero scale for visible 3D nodes.")
+
+func validate_collision_node(node, root, issues, include_info):
+    if node is CollisionShape2D:
+        if node.shape == null:
+            add_validation_issue(
+                issues,
+                "error",
+                "COLLISION_SHAPE_MISSING_SHAPE",
+                "CollisionShape2D node has no shape assigned.",
+                node,
+                root,
+                "shape",
+                null,
+                "Assign a Shape2D resource or remove the unused CollisionShape2D node."
+            )
+        elif include_info and node.disabled:
+            add_validation_issue(issues, "info", "COLLISION_SHAPE_DISABLED", "CollisionShape2D is disabled.", node, root, "disabled")
+
+    if node is CollisionShape3D:
+        if node.shape == null:
+            add_validation_issue(
+                issues,
+                "error",
+                "COLLISION_SHAPE_3D_MISSING_SHAPE",
+                "CollisionShape3D node has no shape assigned.",
+                node,
+                root,
+                "shape",
+                null,
+                "Assign a Shape3D resource or remove the unused CollisionShape3D node."
+            )
+
+    if node is Area2D or node is StaticBody2D or node is CharacterBody2D or node is RigidBody2D:
+        if not has_descendant_of_class(node, "CollisionShape2D") and not has_descendant_of_class(node, "CollisionPolygon2D"):
+            add_validation_issue(
+                issues,
+                "warning",
+                "PHYSICS_BODY_WITHOUT_COLLISION",
+                "2D physics node has no CollisionShape2D or CollisionPolygon2D descendants.",
+                node,
+                root,
+                null,
+                null,
+                "Add a collision shape or remove the unused physics body."
+            )
+
+    if node is Area3D or node is StaticBody3D or node is CharacterBody3D or node is RigidBody3D:
+        if not has_descendant_of_class(node, "CollisionShape3D"):
+            add_validation_issue(
+                issues,
+                "warning",
+                "PHYSICS_BODY_3D_WITHOUT_COLLISION",
+                "3D physics node has no CollisionShape3D descendants.",
+                node,
+                root,
+                null,
+                null,
+                "Add a CollisionShape3D or remove the unused physics body."
+            )
+
+func validate_audio_node(node, root, issues):
+    if node is AudioStreamPlayer and node.stream == null:
+        add_validation_issue(issues, "warning", "AUDIO_STREAM_MISSING", "AudioStreamPlayer has no stream assigned.", node, root, "stream", null, "Assign an audio stream or remove the unused audio player.")
+    if node is AudioStreamPlayer2D and node.stream == null:
+        add_validation_issue(issues, "warning", "AUDIO_STREAM_MISSING", "AudioStreamPlayer2D has no stream assigned.", node, root, "stream", null, "Assign an audio stream or remove the unused audio player.")
+    if node is AudioStreamPlayer3D and node.stream == null:
+        add_validation_issue(issues, "warning", "AUDIO_STREAM_MISSING", "AudioStreamPlayer3D has no stream assigned.", node, root, "stream", null, "Assign an audio stream or remove the unused audio player.")
+
+func validate_control_node(node, root, issues, include_info):
+    if not (node is Control):
+        return
+
+    if is_nearly_zero(node.size.x) and is_nearly_zero(node.size.y):
+        add_validation_issue(issues, "warning", "CONTROL_ZERO_SIZE", "Control node has approximately zero size.", node, root, "size", null, "Set a useful size or anchors for the Control node.")
+
+    if include_info and node is Button:
+        if node.text.strip_edges().is_empty() and node.icon == null and not has_visible_child_content(node):
+            add_validation_issue(issues, "info", "BUTTON_EMPTY_TEXT", "Button has empty text and no visible child or icon content.", node, root, "text", null, "Add text, an icon, or visible child content.")
+
+    if include_info and node is Label:
+        if node.text.strip_edges().is_empty():
+            add_validation_issue(issues, "info", "LABEL_EMPTY_TEXT", "Label has empty text.", node, root, "text", null, "Set label text or remove the unused Label node.")
+
+func validate_node_ownership(node, root, issues):
+    if node != root and node.owner == null:
+        add_validation_issue(
+            issues,
+            "warning",
+            "NODE_MISSING_OWNER",
+            "Instantiated node has no owner.",
+            node,
+            root,
+            "owner",
+            null,
+            "Check whether this node is intentionally runtime-only before saving scene edits."
+        )
+
+func traverse_validate_scene(node, root, depth, max_depth, options, summary, issues):
+    var node_type = node.get_class()
+    summary["totalNodes"] += 1
+    summary["maxDepthReached"] = max(summary["maxDepthReached"], depth)
+
+    if not summary["nodeTypes"].has(node_type):
+        summary["nodeTypes"][node_type] = 0
+    summary["nodeTypes"][node_type] += 1
+
+    if options["checkScripts"]:
+        validate_script_reference(node, root, issues)
+    if options["checkResources"]:
+        validate_resource_references(node, root, issues)
+    if options["checkRendering"]:
+        validate_rendering_node(node, root, issues, options["includeInfo"])
+    if options["checkCollisions"]:
+        validate_collision_node(node, root, issues, options["includeInfo"])
+    if options["checkAudio"]:
+        validate_audio_node(node, root, issues)
+    if options["checkControls"]:
+        validate_control_node(node, root, issues, options["includeInfo"])
+    if options["checkOwnership"]:
+        validate_node_ownership(node, root, issues)
+
+    if depth >= max_depth:
+        if node.get_child_count() > 0:
+            summary["depthTruncated"] = true
+        return
+
+    for child in node.get_children():
+        traverse_validate_scene(child, root, depth + 1, max_depth, options, summary, issues)
+
+func finish_validation_result(project_path, scene_path, root, issues, summary, limits, options):
+    if options["checkNodeBasics"] and summary["depthTruncated"]:
+        issues.append({
+            "severity": "warning",
+            "code": "DEPTH_TRUNCATED",
+            "message": "Scene tree traversal was truncated by maxDepth.",
+            "nodePath": get_scene_node_path(root, root),
+            "nodeType": root.get_class(),
+            "suggestion": "Increase maxDepth if deeper nodes should be validated."
+        })
+
+    var error_count = 0
+    var warning_count = 0
+    var info_count = 0
+    for issue in issues:
+        if issue["severity"] == "error":
+            error_count += 1
+        elif issue["severity"] == "warning":
+            warning_count += 1
+        elif issue["severity"] == "info":
+            info_count += 1
+
+    summary["errorCount"] = error_count
+    summary["warningCount"] = warning_count
+    summary["infoCount"] = info_count
+
+    var top_severity = "ok"
+    if error_count > 0:
+        top_severity = "error"
+    elif warning_count > 0:
+        top_severity = "warning"
+    elif info_count > 0:
+        top_severity = "info"
+
+    return {
+        "success": true,
+        "projectPath": project_path,
+        "scenePath": scene_path,
+        "valid": error_count == 0,
+        "severity": top_severity,
+        "summary": summary,
+        "issues": issues,
+        "limits": limits
+    }
+
+func validate_scene(params):
+    if not params.has("scene_path"):
+        print_json_error("MISSING_SCENE_PATH", "scene_path is required.")
+        return
+
+    var scene_path = normalize_resource_scene_path(params.scene_path)
+    var max_depth = params.max_depth if params.has("max_depth") else 100
+    var max_depth_requested = params.max_depth_requested if params.has("max_depth_requested") else null
+    var max_depth_clamped = params.max_depth_clamped if params.has("max_depth_clamped") else false
+    var project_path = params.project_path if params.has("project_path") else ProjectSettings.globalize_path("res://")
+
+    var options = {
+        "includeInfo": params.include_info if params.has("include_info") else true,
+        "checkResources": params.check_resources if params.has("check_resources") else true,
+        "checkScripts": params.check_scripts if params.has("check_scripts") else true,
+        "checkNodeBasics": params.check_node_basics if params.has("check_node_basics") else true,
+        "checkCollisions": params.check_collisions if params.has("check_collisions") else true,
+        "checkRendering": params.check_rendering if params.has("check_rendering") else true,
+        "checkAudio": params.check_audio if params.has("check_audio") else true,
+        "checkControls": params.check_controls if params.has("check_controls") else true,
+        "checkOwnership": params.check_ownership if params.has("check_ownership") else true
+    }
+
+    if not FileAccess.file_exists(scene_path):
+        print_json_error("SCENE_PATH_NOT_FOUND", "Scene file does not exist: " + scene_path)
+        return
+
+    var scene_resource = ResourceLoader.load(scene_path)
+    if scene_resource == null or not (scene_resource is PackedScene):
+        print_json_error("SCENE_LOAD_FAILED", "Failed to load scene as PackedScene: " + scene_path)
+        return
+
+    var scene_root = scene_resource.instantiate()
+    if scene_root == null:
+        print_json_error("SCENE_INSTANTIATE_FAILED", "Failed to instantiate scene: " + scene_path)
+        return
+
+    var issues = []
+    var summary = {
+        "totalNodes": 0,
+        "errorCount": 0,
+        "warningCount": 0,
+        "infoCount": 0,
+        "maxDepthReached": 0,
+        "depthTruncated": false,
+        "nodeTypes": {}
+    }
+    var limits = {
+        "maxDepthRequested": max_depth_requested,
+        "maxDepthApplied": max_depth,
+        "maxDepthClamped": max_depth_clamped
+    }
+
+    traverse_validate_scene(scene_root, scene_root, 0, max_depth, options, summary, issues)
+    var result = finish_validation_result(project_path, scene_path, scene_root, issues, summary, limits, options)
     print(JSON.stringify(result))
     scene_root.free()
 

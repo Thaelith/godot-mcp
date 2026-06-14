@@ -72,6 +72,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
   - Scan project assets into a structured, read-only catalog for AI-safe asset selection
 - **Scene Inspection**:
   - Read existing scene trees into structured, read-only JSON before making changes
+  - Validate scenes read-only and return structured issues before AI-assisted edits
 - **Scene Management**:
   - Create new scenes with specified root node types
   - Add nodes to existing scenes with customizable properties
@@ -129,6 +130,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "get_project_info",
         "scan_assets",
         "read_scene_tree",
+        "validate_scene",
         "create_scene",
         "add_node",
         "load_sprite",
@@ -393,6 +395,88 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Then call `read_scene_tree` from the inspector with a local Godot project path and an existing scene file.
+
+### `validate_scene`
+
+Loads a Godot scene through Godot in headless mode, validates common scene setup problems, and returns structured issues that an AI assistant can use before modifying or generating scene content. This tool is read-only: it does not save, edit, create, import, reimport, or modify project files.
+
+Input example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Main.tscn",
+  "maxDepth": 100,
+  "includeInfo": true,
+  "checkResources": true,
+  "checkScripts": true,
+  "checkNodeBasics": true,
+  "checkCollisions": true,
+  "checkRendering": true,
+  "checkAudio": true,
+  "checkControls": true,
+  "checkOwnership": true
+}
+```
+
+`scenePath` can be written as `res://scenes/Main.tscn` or `scenes/Main.tscn`. It must stay inside the Godot project and must point to a `.tscn` or `.scn` file.
+
+`maxDepth` defaults to `100`. Values below `1` return a validation error, and values above `200` are clamped to `200`.
+
+Validation categories include node basics, resource references, script references, rendering setup, collisions, audio streams, Control/UI setup, and ownership. Issue severities mean:
+
+- `error`: scene is likely broken or unusable
+- `warning`: scene may work but has suspicious or missing setup
+- `info`: useful note, not a problem
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Main.tscn",
+  "valid": false,
+  "severity": "error",
+  "summary": {
+    "totalNodes": 2,
+    "errorCount": 1,
+    "warningCount": 0,
+    "infoCount": 0,
+    "maxDepthReached": 1,
+    "depthTruncated": false,
+    "nodeTypes": {
+      "Node2D": 1,
+      "Sprite2D": 1
+    }
+  },
+  "issues": [
+    {
+      "severity": "error",
+      "code": "SPRITE_MISSING_TEXTURE",
+      "message": "Sprite2D node has no texture assigned.",
+      "nodePath": "Main/Player",
+      "nodeType": "Sprite2D",
+      "property": "texture",
+      "suggestion": "Assign a Texture2D resource or remove the unused Sprite2D node."
+    }
+  ],
+  "limits": {
+    "maxDepthRequested": 100,
+    "maxDepthApplied": 100,
+    "maxDepthClamped": false
+  }
+}
+```
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Then call `validate_scene` from the inspector with a local Godot project path and an existing scene file.
 
 ## Troubleshooting
 

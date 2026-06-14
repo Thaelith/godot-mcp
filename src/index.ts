@@ -150,6 +150,15 @@ class GodotServer {
     'include_scripts': 'includeScripts',
     'include_groups': 'includeGroups',
     'include_resource_paths': 'includeResourcePaths',
+    'include_info': 'includeInfo',
+    'check_resources': 'checkResources',
+    'check_scripts': 'checkScripts',
+    'check_node_basics': 'checkNodeBasics',
+    'check_collisions': 'checkCollisions',
+    'check_rendering': 'checkRendering',
+    'check_audio': 'checkAudio',
+    'check_controls': 'checkControls',
+    'check_ownership': 'checkOwnership',
   };
 
   /**
@@ -292,6 +301,31 @@ class GodotServer {
    */
   private createReadSceneTreeErrorResponse(error: string, message: string): any {
     console.error(`[SERVER] read_scene_tree error response: ${error}: ${message}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error,
+              message,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  /**
+   * Create a validate_scene-specific JSON error response while preserving MCP text content style.
+   */
+  private createValidateSceneErrorResponse(error: string, message: string): any {
+    console.error(`[SERVER] validate_scene error response: ${error}: ${message}`);
 
     return {
       content: [
@@ -1221,6 +1255,64 @@ class GodotServer {
           },
         },
         {
+          name: 'validate_scene',
+          description: 'Validate a Godot scene read-only and return structured issues for AI-safe editing',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Absolute path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Godot scene path such as res://scenes/Main.tscn or scenes/Main.tscn',
+              },
+              maxDepth: {
+                type: 'number',
+                description: 'Maximum scene tree depth to validate (default: 100, max: 200)',
+              },
+              includeInfo: {
+                type: 'boolean',
+                description: 'Whether to include informational issues (default: true)',
+              },
+              checkResources: {
+                type: 'boolean',
+                description: 'Whether to validate common resource references (default: true)',
+              },
+              checkScripts: {
+                type: 'boolean',
+                description: 'Whether to validate script references (default: true)',
+              },
+              checkNodeBasics: {
+                type: 'boolean',
+                description: 'Whether to count nodes and report traversal truncation (default: true)',
+              },
+              checkCollisions: {
+                type: 'boolean',
+                description: 'Whether to validate collision nodes and physics bodies (default: true)',
+              },
+              checkRendering: {
+                type: 'boolean',
+                description: 'Whether to validate renderable nodes such as Sprite2D and MeshInstance3D (default: true)',
+              },
+              checkAudio: {
+                type: 'boolean',
+                description: 'Whether to validate audio player stream assignments (default: true)',
+              },
+              checkControls: {
+                type: 'boolean',
+                description: 'Whether to validate Control/UI nodes (default: true)',
+              },
+              checkOwnership: {
+                type: 'boolean',
+                description: 'Whether to warn about instantiated nodes with no owner (default: true)',
+              },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
           name: 'create_scene',
           description: 'Create a new Godot scene file',
           inputSchema: {
@@ -1410,6 +1502,8 @@ class GodotServer {
           return await this.handleScanAssets(request.params.arguments);
         case 'read_scene_tree':
           return await this.handleReadSceneTree(request.params.arguments);
+        case 'validate_scene':
+          return await this.handleValidateScene(request.params.arguments);
         case 'create_scene':
           return await this.handleCreateScene(request.params.arguments);
         case 'add_node':
@@ -2428,6 +2522,217 @@ class GodotServer {
       return this.createReadSceneTreeErrorResponse(
         'READ_SCENE_TREE_FAILED',
         `Failed to read scene tree: ${error?.message || 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * Handle the validate_scene tool
+   */
+  private async handleValidateScene(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || typeof args.projectPath !== 'string') {
+      return this.createValidateSceneErrorResponse(
+        'MISSING_PROJECT_PATH',
+        'projectPath is required and must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    if (!args.scenePath || typeof args.scenePath !== 'string') {
+      return this.createValidateSceneErrorResponse(
+        'MISSING_SCENE_PATH',
+        'scenePath is required and must be a Godot scene path such as res://scenes/Main.tscn or scenes/Main.tscn.'
+      );
+    }
+
+    if (args.projectPath.includes('\0')) {
+      return this.createValidateSceneErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must not contain null bytes.'
+      );
+    }
+
+    if (!isAbsolute(args.projectPath)) {
+      return this.createValidateSceneErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    const scenePathResult = this.normalizeScenePath(args.scenePath);
+    if (scenePathResult.error) {
+      return this.createValidateSceneErrorResponse(
+        'UNSAFE_SCENE_PATH',
+        scenePathResult.error
+      );
+    }
+
+    const sceneExtension = extname(scenePathResult.relativePath).toLowerCase();
+    if (!['.tscn', '.scn'].includes(sceneExtension)) {
+      return this.createValidateSceneErrorResponse(
+        'SCENE_PATH_NOT_SCENE_FILE',
+        'scenePath must point to a .tscn or .scn scene file.'
+      );
+    }
+
+    const maxDepthRequested = args.maxDepth !== undefined ? args.maxDepth : null;
+    let maxDepthApplied = 100;
+    let maxDepthClamped = false;
+    if (args.maxDepth !== undefined) {
+      if (typeof args.maxDepth !== 'number' || !Number.isFinite(args.maxDepth) || args.maxDepth < 1) {
+        return this.createValidateSceneErrorResponse(
+          'INVALID_MAX_DEPTH',
+          'maxDepth must be a number between 1 and 200.'
+        );
+      }
+
+      if (args.maxDepth > 200) {
+        maxDepthApplied = 200;
+        maxDepthClamped = true;
+      } else {
+        maxDepthApplied = Math.floor(args.maxDepth);
+      }
+    }
+
+    const booleanOptions = [
+      'includeInfo',
+      'checkResources',
+      'checkScripts',
+      'checkNodeBasics',
+      'checkCollisions',
+      'checkRendering',
+      'checkAudio',
+      'checkControls',
+      'checkOwnership',
+    ];
+    for (const option of booleanOptions) {
+      if (args[option] !== undefined && typeof args[option] !== 'boolean') {
+        return this.createValidateSceneErrorResponse(
+          'VALIDATE_SCENE_FAILED',
+          `${option} must be a boolean.`
+        );
+      }
+    }
+
+    const includeInfo = args.includeInfo !== undefined ? args.includeInfo : true;
+    const checkResources = args.checkResources !== undefined ? args.checkResources : true;
+    const checkScripts = args.checkScripts !== undefined ? args.checkScripts : true;
+    const checkNodeBasics = args.checkNodeBasics !== undefined ? args.checkNodeBasics : true;
+    const checkCollisions = args.checkCollisions !== undefined ? args.checkCollisions : true;
+    const checkRendering = args.checkRendering !== undefined ? args.checkRendering : true;
+    const checkAudio = args.checkAudio !== undefined ? args.checkAudio : true;
+    const checkControls = args.checkControls !== undefined ? args.checkControls : true;
+    const checkOwnership = args.checkOwnership !== undefined ? args.checkOwnership : true;
+
+    try {
+      const normalizedProjectPath = resolve(args.projectPath);
+      if (!existsSync(normalizedProjectPath)) {
+        return this.createValidateSceneErrorResponse(
+          'PROJECT_PATH_NOT_FOUND',
+          `Project path does not exist: ${args.projectPath}`
+        );
+      }
+
+      const projectStats = statSync(normalizedProjectPath);
+      if (!projectStats.isDirectory()) {
+        return this.createValidateSceneErrorResponse(
+          'PROJECT_PATH_NOT_DIRECTORY',
+          `Project path is not a directory: ${args.projectPath}`
+        );
+      }
+
+      const projectRoot = realpathSync(normalizedProjectPath);
+      const projectFile = join(projectRoot, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createValidateSceneErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          `Not a valid Godot project: ${args.projectPath}. The directory must contain a project.godot file.`
+        );
+      }
+
+      const sceneFilePath = resolve(projectRoot, scenePathResult.relativePath);
+      if (!this.isPathInside(projectRoot, sceneFilePath)) {
+        return this.createValidateSceneErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must stay inside the Godot project directory.'
+        );
+      }
+
+      if (!existsSync(sceneFilePath)) {
+        return this.createValidateSceneErrorResponse(
+          'SCENE_PATH_NOT_FOUND',
+          `Scene file does not exist: ${scenePathResult.resourcePath}`
+        );
+      }
+
+      const sceneFileStats = lstatSync(sceneFilePath);
+      if (sceneFileStats.isSymbolicLink()) {
+        return this.createValidateSceneErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must not be a symbolic link.'
+        );
+      }
+
+      if (!sceneFileStats.isFile()) {
+        return this.createValidateSceneErrorResponse(
+          'SCENE_PATH_NOT_FOUND',
+          `Scene path is not a file: ${scenePathResult.resourcePath}`
+        );
+      }
+
+      const realSceneFilePath = realpathSync(sceneFilePath);
+      if (!this.isPathInside(projectRoot, realSceneFilePath)) {
+        return this.createValidateSceneErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must stay inside the Godot project directory.'
+        );
+      }
+
+      const params = {
+        projectPath: projectRoot.replace(/\\/g, '/'),
+        scenePath: scenePathResult.resourcePath,
+        maxDepth: maxDepthApplied,
+        maxDepthRequested,
+        maxDepthClamped,
+        includeInfo,
+        checkResources,
+        checkScripts,
+        checkNodeBasics,
+        checkCollisions,
+        checkRendering,
+        checkAudio,
+        checkControls,
+        checkOwnership,
+      };
+
+      const { stdout, stderr } = await this.executeOperation('validate_scene', params, projectRoot);
+      const parsedResult = this.extractLastJsonObject(stdout);
+
+      if (!parsedResult) {
+        const stderrText = stderr?.trim();
+        return this.createValidateSceneErrorResponse(
+          'VALIDATE_SCENE_FAILED',
+          stderrText
+            ? `Godot did not return valid JSON for validate_scene. Stderr: ${stderrText}`
+            : 'Godot did not return valid JSON for validate_scene.'
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(parsedResult, null, 2),
+          },
+        ],
+        ...(parsedResult.success === false ? { isError: true } : {}),
+      };
+    } catch (error: any) {
+      return this.createValidateSceneErrorResponse(
+        'VALIDATE_SCENE_FAILED',
+        `Failed to validate scene: ${error?.message || 'Unknown error'}`
       );
     }
   }
