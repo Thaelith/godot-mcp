@@ -246,7 +246,9 @@ Input example:
 }
 ```
 
-If `root` is omitted, the tool scans `res://assets`. If that folder does not exist, it safely falls back to scanning the project root while still skipping ignored folders. `root` must stay inside the Godot project and can be written as either `res://assets` or `assets`.
+By default, `scan_assets` scans `res://assets`. If `root` is omitted and `res://assets` does not exist, it safely falls back to scanning the project root as `res://` while still skipping ignored folders. If `root` is explicitly provided and does not exist, the tool returns an error instead of falling back. `root` must stay inside the Godot project and can be written as either `res://assets` or `assets`.
+
+`maxResults` defaults to `500`. Values below `1` return a validation error, and values above `5000` are clamped to `5000`.
 
 Output example:
 
@@ -254,7 +256,13 @@ Output example:
 {
   "success": true,
   "projectPath": "C:/path/to/project",
+  "requestedRoot": "res://assets",
   "scanRoot": "res://assets",
+  "fallbackUsed": false,
+  "fallbackReason": null,
+  "maxResultsRequested": 100,
+  "maxResultsApplied": 100,
+  "maxResultsClamped": false,
   "totalFound": 1,
   "truncated": false,
   "assets": [
@@ -281,6 +289,21 @@ Output example:
     "resource": 0,
     "unknown": 0
   }
+}
+```
+
+Fallback example when `root` is omitted and `res://assets` is missing:
+
+```json
+{
+  "success": true,
+  "requestedRoot": null,
+  "scanRoot": "res://",
+  "fallbackUsed": true,
+  "fallbackReason": "Default res://assets folder was not found; scanned project root instead.",
+  "maxResultsRequested": null,
+  "maxResultsApplied": 500,
+  "maxResultsClamped": false
 }
 ```
 

@@ -258,6 +258,31 @@ class GodotServer {
   }
 
   /**
+   * Create a scan_assets-specific JSON error response while preserving MCP text content style.
+   */
+  private createScanAssetsErrorResponse(error: string, message: string): any {
+    console.error(`[SERVER] scan_assets error response: ${error}: ${message}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error,
+              message,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  /**
    * Validate a path to prevent path traversal attacks
    */
   private validatePath(path: string): boolean {
@@ -1775,135 +1800,164 @@ class GodotServer {
     args = this.normalizeParameters(args || {});
 
     if (!args.projectPath || typeof args.projectPath !== 'string') {
-      return this.createErrorResponse(
-        'Project path is required',
-        ['Provide projectPath as an absolute path to a Godot project directory']
+      return this.createScanAssetsErrorResponse(
+        'MISSING_PROJECT_PATH',
+        'projectPath is required and must be an absolute path to a Godot project directory.'
       );
     }
 
     if (args.projectPath.includes('\0')) {
-      return this.createErrorResponse(
-        'Invalid project path',
-        ['Provide a projectPath without null bytes']
+      return this.createScanAssetsErrorResponse(
+        'INVALID_PROJECT_PATH',
+        'projectPath must not contain null bytes.'
       );
     }
 
     if (!isAbsolute(args.projectPath)) {
-      return this.createErrorResponse(
-        'Project path must be absolute',
-        ['Provide projectPath as an absolute path to a Godot project directory']
+      return this.createScanAssetsErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must be an absolute path to a Godot project directory.'
       );
     }
 
+    const rootProvided = args.root !== undefined;
     if (args.root !== undefined && typeof args.root !== 'string') {
-      return this.createErrorResponse(
-        'Invalid root path',
-        ['Provide root as a string such as res://assets or assets']
+      return this.createScanAssetsErrorResponse(
+        'UNSAFE_ROOT_PATH',
+        'root must be a string such as res://assets or assets.'
+      );
+    }
+    if (rootProvided && !args.root.trim()) {
+      return this.createScanAssetsErrorResponse(
+        'UNSAFE_ROOT_PATH',
+        'root must not be empty when explicitly provided.'
       );
     }
 
     const includeExtensionsResult = this.normalizeExtensions(args.includeExtensions);
     if (includeExtensionsResult.error) {
-      return this.createErrorResponse(includeExtensionsResult.error);
+      return this.createScanAssetsErrorResponse(
+        'INVALID_INCLUDE_EXTENSIONS',
+        includeExtensionsResult.error
+      );
     }
 
     const excludeDirsResult = this.normalizeExcludedDirs(args.excludeDirs);
     if (excludeDirsResult.error) {
-      return this.createErrorResponse(excludeDirsResult.error);
+      return this.createScanAssetsErrorResponse(
+        'INVALID_EXCLUDE_DIRS',
+        excludeDirsResult.error
+      );
     }
 
-    let maxResults = 500;
+    const maxResultsRequested = args.maxResults !== undefined ? args.maxResults : null;
+    let maxResultsApplied = 500;
+    let maxResultsClamped = false;
     if (args.maxResults !== undefined) {
-      if (typeof args.maxResults !== 'number' || !Number.isFinite(args.maxResults) || args.maxResults < 0) {
-        return this.createErrorResponse(
-          'Invalid maxResults',
-          ['Provide maxResults as a non-negative number']
+      if (typeof args.maxResults !== 'number' || !Number.isFinite(args.maxResults) || args.maxResults < 1) {
+        return this.createScanAssetsErrorResponse(
+          'INVALID_MAX_RESULTS',
+          'maxResults must be a number between 1 and 5000.'
         );
       }
-      maxResults = Math.floor(args.maxResults);
+      if (args.maxResults > 5000) {
+        maxResultsApplied = 5000;
+        maxResultsClamped = true;
+      } else {
+        maxResultsApplied = Math.floor(args.maxResults);
+      }
     }
 
     try {
       const normalizedProjectPath = resolve(args.projectPath);
       if (!existsSync(normalizedProjectPath)) {
-        return this.createErrorResponse(
-          `Project path does not exist: ${args.projectPath}`,
-          ['Provide an existing Godot project directory']
+        return this.createScanAssetsErrorResponse(
+          'PROJECT_PATH_NOT_FOUND',
+          `Project path does not exist: ${args.projectPath}`
         );
       }
 
       const projectStats = statSync(normalizedProjectPath);
       if (!projectStats.isDirectory()) {
-        return this.createErrorResponse(
-          `Project path is not a directory: ${args.projectPath}`,
-          ['Provide a directory containing a project.godot file']
+        return this.createScanAssetsErrorResponse(
+          'PROJECT_PATH_NOT_DIRECTORY',
+          `Project path is not a directory: ${args.projectPath}`
         );
       }
 
       const projectRoot = realpathSync(normalizedProjectPath);
       const projectFile = join(projectRoot, 'project.godot');
       if (!existsSync(projectFile)) {
-        return this.createErrorResponse(
-          `Not a valid Godot project: ${args.projectPath}`,
-          [
-            'Ensure the path points to a directory containing a project.godot file',
-            'Use list_projects to find valid Godot projects',
-          ]
+        return this.createScanAssetsErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          `Not a valid Godot project: ${args.projectPath}. The directory must contain a project.godot file.`
         );
       }
 
-      const root = args.root || 'res://assets';
+      const requestedRoot = rootProvided ? args.root : null;
+      const root = rootProvided ? args.root : 'res://assets';
       const scanRootResult = this.normalizeScanRoot(root);
       if (scanRootResult.error) {
-        return this.createErrorResponse(
-          scanRootResult.error,
-          ['Use a Godot-relative root such as res://assets or assets']
+        return this.createScanAssetsErrorResponse(
+          'UNSAFE_ROOT_PATH',
+          scanRootResult.error
         );
       }
 
       let scanRootPath = resolve(projectRoot, scanRootResult.relativeRoot);
       let scanRoot = scanRootResult.scanRoot;
+      let fallbackUsed = false;
+      let fallbackReason: string | null = null;
 
       if (!this.isPathInside(projectRoot, scanRootPath)) {
-        return this.createErrorResponse(
-          'Unsafe root path',
-          ['The scan root must stay inside the Godot project directory']
+        return this.createScanAssetsErrorResponse(
+          'UNSAFE_ROOT_PATH',
+          'The scan root must stay inside the Godot project directory.'
         );
       }
 
       if (!existsSync(scanRootPath)) {
+        if (rootProvided) {
+          return this.createScanAssetsErrorResponse(
+            'SCAN_ROOT_NOT_FOUND',
+            `Scan root does not exist: ${scanRoot}`
+          );
+        }
+
         const fallbackRootPath = projectRoot;
         if (!existsSync(fallbackRootPath) || !statSync(fallbackRootPath).isDirectory()) {
-          return this.createErrorResponse(
-            `Scan root does not exist (${scanRoot}) and fallback also failed`,
-            ['Create the requested scan root or provide a valid Godot project directory']
+          return this.createScanAssetsErrorResponse(
+            'SCAN_ROOT_NOT_FOUND',
+            `Default scan root does not exist (${scanRoot}) and fallback also failed.`
           );
         }
 
         scanRootPath = fallbackRootPath;
         scanRoot = 'res://';
+        fallbackUsed = true;
+        fallbackReason = 'Default res://assets folder was not found; scanned project root instead.';
       }
 
       const scanRootStats = lstatSync(scanRootPath);
       if (scanRootStats.isSymbolicLink()) {
-        return this.createErrorResponse(
-          'Unsafe root path',
-          ['The scan root must not be a symbolic link']
+        return this.createScanAssetsErrorResponse(
+          'UNSAFE_ROOT_PATH',
+          'The scan root must not be a symbolic link.'
         );
       }
 
       if (!scanRootStats.isDirectory()) {
-        return this.createErrorResponse(
-          `Scan root is not a directory: ${scanRoot}`,
-          ['Provide a Godot-relative directory to scan']
+        return this.createScanAssetsErrorResponse(
+          'SCAN_ROOT_NOT_DIRECTORY',
+          `Scan root is not a directory: ${scanRoot}`
         );
       }
 
       const realScanRoot = realpathSync(scanRootPath);
       if (!this.isPathInside(projectRoot, realScanRoot)) {
-        return this.createErrorResponse(
-          'Unsafe root path',
-          ['The scan root must stay inside the Godot project directory']
+        return this.createScanAssetsErrorResponse(
+          'UNSAFE_ROOT_PATH',
+          'The scan root must stay inside the Godot project directory.'
         );
       }
 
@@ -1990,7 +2044,7 @@ class GodotServer {
           totalFound++;
           summary[assetType]++;
 
-          if (assets.length < maxResults) {
+          if (assets.length < maxResultsApplied) {
             assets.push(asset);
           }
         }
@@ -2006,7 +2060,13 @@ class GodotServer {
               {
                 success: true,
                 projectPath: projectRoot.replace(/\\/g, '/'),
+                requestedRoot,
                 scanRoot,
+                fallbackUsed,
+                fallbackReason,
+                maxResultsRequested,
+                maxResultsApplied,
+                maxResultsClamped,
                 totalFound,
                 truncated: totalFound > assets.length,
                 assets,
@@ -2019,12 +2079,9 @@ class GodotServer {
         ],
       };
     } catch (error: any) {
-      return this.createErrorResponse(
-        `Failed to scan assets: ${error?.message || 'Unknown error'}`,
-        [
-          'Ensure the project path exists and is readable',
-          'Check that the scan root is inside the project directory',
-        ]
+      return this.createScanAssetsErrorResponse(
+        'SCAN_ASSETS_FAILED',
+        `Failed to scan assets: ${error?.message || 'Unknown error'}`
       );
     }
   }
