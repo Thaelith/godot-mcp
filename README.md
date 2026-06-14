@@ -79,6 +79,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
   - Dry-run proposed scene blueprints and return validation issues plus a creation plan without writing files
 - **Scene Management**:
   - Create scenes from validated blueprints with controlled writes and post-save validation
+  - Apply validated node alignment plans with position-only scene writes
   - Create new scenes with specified root node types
   - Add nodes to existing scenes with customizable properties
   - Load sprites and textures into Sprite2D nodes
@@ -138,6 +139,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "read_scene_tree",
         "get_scene_layout",
         "dry_run_align_nodes",
+        "align_nodes",
         "validate_scene",
         "dry_run_scene_blueprint",
         "create_scene_from_blueprint",
@@ -777,6 +779,162 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Then call `dry_run_align_nodes` with an existing scene containing at least two positioned 2D nodes. Confirm the returned plan contains proposed local `position` values and that the scene file is unchanged.
+
+### `align_nodes`
+
+Safely applies alignment and layout changes to existing nodes in a scene. The tool runs the same planning logic as `dry_run_align_nodes`, refuses to write when that dry-run has errors, and then writes only planned local `position` changes back to the same scene file.
+
+Input examples:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "boundsSource": "visual",
+  "operations": [
+    {
+      "type": "place_relative",
+      "nodePath": "Room/Chair",
+      "referenceNodePath": "Room/Table",
+      "relation": "right_of",
+      "margin": 8
+    }
+  ],
+  "validateBeforeWrite": true,
+  "validateAfterWrite": true,
+  "includePlan": true,
+  "includeLayoutBefore": false,
+  "includeLayoutAfter": false
+}
+```
+
+The operation shapes are the same as `dry_run_align_nodes`:
+
+```json
+[
+  {
+    "type": "align",
+    "nodePaths": ["Room/Chair"],
+    "mode": "center_x",
+    "reference": {
+      "type": "node",
+      "nodePath": "Room/Table",
+      "bounds": "visual"
+    }
+  },
+  {
+    "type": "snap_to_grid",
+    "nodePaths": ["Room/Chair", "Room/Table"],
+    "gridSize": [16, 16],
+    "origin": [0, 0],
+    "mode": "position"
+  },
+  {
+    "type": "distribute",
+    "nodePaths": ["Room/A", "Room/B", "Room/C"],
+    "axis": "x",
+    "spacing": null
+  },
+  {
+    "type": "set_position",
+    "nodePaths": ["Room/Chair"],
+    "position": [100, 200],
+    "space": "local"
+  }
+]
+```
+
+Safety model:
+
+- Runs `dry_run_align_nodes` planning first and refuses to write if planning returns any error issue.
+- Applies only plan entries where `property` is `position`, `space` is `local`, and `proposedValue` is a numeric vector.
+- Does not apply arbitrary operation objects directly.
+- Does not create nodes, delete nodes, rename nodes, reparent nodes, change owners, change resources, attach scripts, or edit arbitrary properties.
+- Saves only the requested `.tscn` or `.scn` scene path.
+- Does not create backup files, assets, imports, or reimports.
+
+`validateAfterWrite` defaults to `true`. When enabled, the tool reloads the saved scene, instantiates it, and checks that changed node positions match the planned values within a small epsilon. `includeLayoutAfter` can return compact layout data after the write.
+
+Supported operations are `align`, `place_relative`, `snap_to_grid`, `distribute`, and `set_position`. `maxOperations` defaults to `50` and clamps at `500`; `maxDepth` defaults to `100` and clamps at `200`.
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "applied": true,
+  "saved": true,
+  "valid": true,
+  "severity": "ok",
+  "summary": {
+    "operationCount": 1,
+    "plannedChangeCount": 1,
+    "appliedChangeCount": 1,
+    "errorCount": 0,
+    "warningCount": 0,
+    "infoCount": 0
+  },
+  "issues": [],
+  "plan": [
+    {
+      "operationIndex": 0,
+      "operationType": "place_relative",
+      "nodePath": "Room/Chair",
+      "property": "position",
+      "space": "local",
+      "currentValue": [0, 0],
+      "proposedValue": [128, 0],
+      "delta": [128, 0],
+      "currentGlobalPosition": [0, 0],
+      "proposedGlobalPosition": [128, 0],
+      "reason": "Place Room/Chair right_of Room/Table."
+    }
+  ],
+  "appliedChanges": [
+    {
+      "nodePath": "Room/Chair",
+      "property": "position",
+      "oldValue": [0, 0],
+      "newValue": [128, 0],
+      "delta": [128, 0]
+    }
+  ],
+  "write": {
+    "saved": true,
+    "resourceSaverCode": 0,
+    "bytesWritten": 1234
+  },
+  "postValidation": {
+    "loadable": true,
+    "instantiable": true,
+    "positionChecksPassed": true,
+    "checkedNodes": 1
+  },
+  "layoutBefore": null,
+  "layoutAfter": null,
+  "limits": {
+    "maxOperationsRequested": null,
+    "maxOperationsApplied": 50,
+    "maxOperationsClamped": false,
+    "maxDepthRequested": null,
+    "maxDepthApplied": 100,
+    "maxDepthClamped": false
+  }
+}
+```
+
+The first version writes only node positions. It fully supports 2D `Node2D` and `Control` position writes; `Node3D` writes are limited to local `[x, y, z]` positions produced by `set_position` or transform-position `snap_to_grid`. Bounds-based 3D alignment is not guessed.
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Then call `align_nodes` on a scene with positioned nodes, inspect the result with `read_scene_tree` or `get_scene_layout`, and confirm only the requested scene file changed.
 
 ### `validate_scene`
 

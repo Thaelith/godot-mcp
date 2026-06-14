@@ -160,6 +160,7 @@ class GodotServer {
     'include_warnings': 'includeWarnings',
     'bounds_source': 'boundsSource',
     'include_layout_before': 'includeLayoutBefore',
+    'include_layout_after': 'includeLayoutAfter',
     'max_operations': 'maxOperations',
     'asset_path': 'assetPath',
     'asset_paths': 'assetPaths',
@@ -375,6 +376,31 @@ class GodotServer {
    */
   private createDryRunAlignNodesErrorResponse(error: string, message: string): any {
     console.error(`[SERVER] dry_run_align_nodes error response: ${error}: ${message}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error,
+              message,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  /**
+   * Create an align_nodes-specific JSON error response while preserving MCP text content style.
+   */
+  private createAlignNodesErrorResponse(error: string, message: string): any {
+    console.error(`[SERVER] align_nodes error response: ${error}: ${message}`);
 
     return {
       content: [
@@ -1586,6 +1612,61 @@ class GodotServer {
           },
         },
         {
+          name: 'align_nodes',
+          description: 'Safely apply planned node alignment position changes to an existing Godot scene',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Absolute path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Godot scene path such as res://scenes/Room.tscn or scenes/Room.tscn',
+              },
+              operations: {
+                type: 'array',
+                description: 'Non-empty array of alignment/layout operations to plan and apply',
+              },
+              boundsSource: {
+                type: 'string',
+                enum: ['visual', 'collision', 'control', 'transform'],
+                description: 'Bounds source to use for operations by default (default: visual)',
+              },
+              validateBeforeWrite: {
+                type: 'boolean',
+                description: 'Whether to abort before writing if dry-run planning has errors (default: true)',
+              },
+              validateAfterWrite: {
+                type: 'boolean',
+                description: 'Whether to reload the saved scene and verify applied positions (default: true)',
+              },
+              includePlan: {
+                type: 'boolean',
+                description: 'Whether to return the dry-run plan used for writing (default: true)',
+              },
+              includeLayoutBefore: {
+                type: 'boolean',
+                description: 'Whether to include compact layout data before applying changes (default: false)',
+              },
+              includeLayoutAfter: {
+                type: 'boolean',
+                description: 'Whether to include compact layout data after applying changes (default: false)',
+              },
+              maxOperations: {
+                type: 'number',
+                description: 'Maximum operations to evaluate and apply (default: 50, max: 500)',
+              },
+              maxDepth: {
+                type: 'number',
+                description: 'Maximum scene tree depth to inspect (default: 100, max: 200)',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'operations'],
+          },
+        },
+        {
           name: 'dry_run_scene_blueprint',
           description: 'Validate and simulate a scene blueprint read-only without creating or modifying files',
           inputSchema: {
@@ -1931,6 +2012,8 @@ class GodotServer {
           return await this.handleGetSceneLayout(request.params.arguments);
         case 'dry_run_align_nodes':
           return await this.handleDryRunAlignNodes(request.params.arguments);
+        case 'align_nodes':
+          return await this.handleAlignNodes(request.params.arguments);
         case 'dry_run_scene_blueprint':
           return await this.handleDryRunSceneBlueprint(request.params.arguments);
         case 'create_scene_from_blueprint':
@@ -4047,6 +4130,259 @@ class GodotServer {
       return this.createDryRunAlignNodesErrorResponse(
         'DRY_RUN_ALIGN_NODES_FAILED',
         `Failed to dry-run node alignment: ${error?.message || 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * Handle the align_nodes tool
+   */
+  private async handleAlignNodes(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || typeof args.projectPath !== 'string') {
+      return this.createAlignNodesErrorResponse(
+        'MISSING_PROJECT_PATH',
+        'projectPath is required and must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    if (!args.scenePath || typeof args.scenePath !== 'string') {
+      return this.createAlignNodesErrorResponse(
+        'MISSING_SCENE_PATH',
+        'scenePath is required and must be a Godot scene path such as res://scenes/Room.tscn or scenes/Room.tscn.'
+      );
+    }
+
+    if (args.projectPath.includes('\0')) {
+      return this.createAlignNodesErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must not contain null bytes.'
+      );
+    }
+
+    if (!isAbsolute(args.projectPath)) {
+      return this.createAlignNodesErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    const scenePathResult = this.normalizeScenePath(args.scenePath);
+    if (scenePathResult.error) {
+      return this.createAlignNodesErrorResponse(
+        'UNSAFE_SCENE_PATH',
+        scenePathResult.error
+      );
+    }
+
+    const sceneExtension = extname(scenePathResult.relativePath).toLowerCase();
+    if (!['.tscn', '.scn'].includes(sceneExtension)) {
+      return this.createAlignNodesErrorResponse(
+        'SCENE_PATH_NOT_SCENE_FILE',
+        'scenePath must point to a .tscn or .scn scene file.'
+      );
+    }
+
+    if (args.operations === undefined) {
+      return this.createAlignNodesErrorResponse(
+        'MISSING_OPERATIONS',
+        'operations is required and must be a non-empty array of alignment operations.'
+      );
+    }
+
+    if (!Array.isArray(args.operations)) {
+      return this.createAlignNodesErrorResponse(
+        'INVALID_OPERATIONS',
+        'operations must be a non-empty array of alignment operations.'
+      );
+    }
+
+    if (args.operations.length === 0) {
+      return this.createAlignNodesErrorResponse(
+        'INVALID_OPERATIONS',
+        'operations must contain at least one alignment operation.'
+      );
+    }
+
+    const allowedBoundsSources = new Set(['visual', 'collision', 'control', 'transform']);
+    const boundsSource = args.boundsSource !== undefined ? args.boundsSource : 'visual';
+    if (typeof boundsSource !== 'string' || !allowedBoundsSources.has(boundsSource)) {
+      return this.createAlignNodesErrorResponse(
+        'INVALID_BOUNDS_SOURCE',
+        'boundsSource must be one of: visual, collision, control, transform.'
+      );
+    }
+
+    const maxOperationsRequested = args.maxOperations !== undefined ? args.maxOperations : null;
+    let maxOperationsApplied = 50;
+    let maxOperationsClamped = false;
+    if (args.maxOperations !== undefined) {
+      if (typeof args.maxOperations !== 'number' || !Number.isFinite(args.maxOperations) || args.maxOperations < 1) {
+        return this.createAlignNodesErrorResponse(
+          'INVALID_MAX_OPERATIONS',
+          'maxOperations must be a number between 1 and 500.'
+        );
+      }
+
+      if (args.maxOperations > 500) {
+        maxOperationsApplied = 500;
+        maxOperationsClamped = true;
+      } else {
+        maxOperationsApplied = Math.floor(args.maxOperations);
+      }
+    }
+
+    const maxDepthRequested = args.maxDepth !== undefined ? args.maxDepth : null;
+    let maxDepthApplied = 100;
+    let maxDepthClamped = false;
+    if (args.maxDepth !== undefined) {
+      if (typeof args.maxDepth !== 'number' || !Number.isFinite(args.maxDepth) || args.maxDepth < 1) {
+        return this.createAlignNodesErrorResponse(
+          'INVALID_MAX_DEPTH',
+          'maxDepth must be a number between 1 and 200.'
+        );
+      }
+
+      if (args.maxDepth > 200) {
+        maxDepthApplied = 200;
+        maxDepthClamped = true;
+      } else {
+        maxDepthApplied = Math.floor(args.maxDepth);
+      }
+    }
+
+    const booleanOptions = [
+      'validateBeforeWrite',
+      'validateAfterWrite',
+      'includePlan',
+      'includeLayoutBefore',
+      'includeLayoutAfter',
+    ];
+    for (const option of booleanOptions) {
+      if (args[option] !== undefined && typeof args[option] !== 'boolean') {
+        return this.createAlignNodesErrorResponse(
+          'ALIGN_NODES_FAILED',
+          `${option} must be a boolean.`
+        );
+      }
+    }
+
+    const validateBeforeWrite = args.validateBeforeWrite !== undefined ? args.validateBeforeWrite : true;
+    const validateAfterWrite = args.validateAfterWrite !== undefined ? args.validateAfterWrite : true;
+    const includePlan = args.includePlan !== undefined ? args.includePlan : true;
+    const includeLayoutBefore = args.includeLayoutBefore !== undefined ? args.includeLayoutBefore : false;
+    const includeLayoutAfter = args.includeLayoutAfter !== undefined ? args.includeLayoutAfter : false;
+
+    try {
+      const normalizedProjectPath = resolve(args.projectPath);
+      if (!existsSync(normalizedProjectPath)) {
+        return this.createAlignNodesErrorResponse(
+          'PROJECT_PATH_NOT_FOUND',
+          `Project path does not exist: ${args.projectPath}`
+        );
+      }
+
+      const projectStats = statSync(normalizedProjectPath);
+      if (!projectStats.isDirectory()) {
+        return this.createAlignNodesErrorResponse(
+          'PROJECT_PATH_NOT_DIRECTORY',
+          `Project path is not a directory: ${args.projectPath}`
+        );
+      }
+
+      const projectRoot = realpathSync(normalizedProjectPath);
+      const projectFile = join(projectRoot, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createAlignNodesErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          `Not a valid Godot project: ${args.projectPath}. The directory must contain a project.godot file.`
+        );
+      }
+
+      const sceneFilePath = resolve(projectRoot, scenePathResult.relativePath);
+      if (!this.isPathInside(projectRoot, sceneFilePath)) {
+        return this.createAlignNodesErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must stay inside the Godot project directory.'
+        );
+      }
+
+      if (!existsSync(sceneFilePath)) {
+        return this.createAlignNodesErrorResponse(
+          'SCENE_PATH_NOT_FOUND',
+          `Scene file does not exist: ${scenePathResult.resourcePath}`
+        );
+      }
+
+      const sceneFileStats = lstatSync(sceneFilePath);
+      if (sceneFileStats.isSymbolicLink()) {
+        return this.createAlignNodesErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must not be a symbolic link.'
+        );
+      }
+
+      if (!sceneFileStats.isFile()) {
+        return this.createAlignNodesErrorResponse(
+          'SCENE_PATH_NOT_FOUND',
+          `Scene path is not a file: ${scenePathResult.resourcePath}`
+        );
+      }
+
+      const realSceneFilePath = realpathSync(sceneFilePath);
+      if (!this.isPathInside(projectRoot, realSceneFilePath)) {
+        return this.createAlignNodesErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must stay inside the Godot project directory.'
+        );
+      }
+
+      const params = {
+        projectPath: projectRoot.replace(/\\/g, '/'),
+        scenePath: scenePathResult.resourcePath,
+        operations: args.operations,
+        boundsSource,
+        validateBeforeWrite,
+        validateAfterWrite,
+        includePlan,
+        includeLayoutBefore,
+        includeLayoutAfter,
+        maxOperations: maxOperationsApplied,
+        maxOperationsRequested,
+        maxOperationsClamped,
+        maxDepth: maxDepthApplied,
+        maxDepthRequested,
+        maxDepthClamped,
+      };
+
+      const { stdout, stderr } = await this.executeOperation('align_nodes', params, projectRoot);
+      const parsedResult = this.extractLastJsonObject(stdout);
+
+      if (!parsedResult) {
+        const stderrText = stderr?.trim();
+        return this.createAlignNodesErrorResponse(
+          'ALIGN_NODES_FAILED',
+          stderrText
+            ? `Godot did not return valid JSON for align_nodes. Stderr: ${stderrText}`
+            : 'Godot did not return valid JSON for align_nodes.'
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(parsedResult, null, 2),
+          },
+        ],
+        ...(parsedResult.success === false ? { isError: true } : {}),
+      };
+    } catch (error: any) {
+      return this.createAlignNodesErrorResponse(
+        'ALIGN_NODES_FAILED',
+        `Failed to align nodes: ${error?.message || 'Unknown error'}`
       );
     }
   }

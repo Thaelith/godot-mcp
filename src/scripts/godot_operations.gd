@@ -28,7 +28,7 @@ func _init():
     
     var operation = args[operation_index]
     var params_json = args[params_index]
-    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "dry_run_align_nodes" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
+    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "dry_run_align_nodes" or operation == "align_nodes" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
 
     if quiet_output:
         debug_mode = false
@@ -69,6 +69,8 @@ func _init():
             get_scene_layout(params)
         "dry_run_align_nodes":
             dry_run_align_nodes(params)
+        "align_nodes":
+            align_nodes(params)
         "validate_scene":
             validate_scene(params)
         "get_asset_info":
@@ -1728,13 +1730,17 @@ func dry_align_finish_result(project_path, scene_path, operations, processed_cou
     }
     return result
 
-func dry_run_align_nodes(params):
+func dry_align_has_error_issues(issues):
+    for issue in issues:
+        if issue.has("severity") and issue["severity"] == "error":
+            return true
+    return false
+
+func dry_run_align_nodes_result(params, provided_scene_root=null):
     if not params.has("scene_path"):
-        print(JSON.stringify(dry_align_error("MISSING_SCENE_PATH", "scene_path is required.")))
-        return
+        return dry_align_error("MISSING_SCENE_PATH", "scene_path is required.")
     if not params.has("operations") or typeof(params.operations) != TYPE_ARRAY or params.operations.is_empty():
-        print(JSON.stringify(dry_align_error("MISSING_OPERATIONS", "operations must be a non-empty array.")))
-        return
+        return dry_align_error("MISSING_OPERATIONS", "operations must be a non-empty array.")
 
     var scene_path = normalize_resource_scene_path(params.scene_path)
     var project_path = params.project_path if params.has("project_path") else ProjectSettings.globalize_path("res://")
@@ -1753,19 +1759,20 @@ func dry_run_align_nodes(params):
         "maxDepthClamped": params.max_depth_clamped if params.has("max_depth_clamped") else false
     }
 
-    if not FileAccess.file_exists(scene_path):
-        print(JSON.stringify(dry_align_error("SCENE_PATH_NOT_FOUND", "Scene file does not exist: " + scene_path)))
-        return
-
-    var scene_resource = ResourceLoader.load(scene_path)
-    if scene_resource == null or not (scene_resource is PackedScene):
-        print(JSON.stringify(dry_align_error("SCENE_LOAD_FAILED", "Failed to load scene as PackedScene: " + scene_path)))
-        return
-
-    var scene_root = scene_resource.instantiate()
+    var scene_root = provided_scene_root
+    var owns_scene_root = false
     if scene_root == null:
-        print(JSON.stringify(dry_align_error("SCENE_INSTANTIATE_FAILED", "Failed to instantiate scene: " + scene_path)))
-        return
+        if not FileAccess.file_exists(scene_path):
+            return dry_align_error("SCENE_PATH_NOT_FOUND", "Scene file does not exist: " + scene_path)
+
+        var scene_resource = ResourceLoader.load(scene_path)
+        if scene_resource == null or not (scene_resource is PackedScene):
+            return dry_align_error("SCENE_LOAD_FAILED", "Failed to load scene as PackedScene: " + scene_path)
+
+        scene_root = scene_resource.instantiate()
+        if scene_root == null:
+            return dry_align_error("SCENE_INSTANTIATE_FAILED", "Failed to instantiate scene: " + scene_path)
+        owns_scene_root = true
 
     var issues = []
     var plan = []
@@ -1809,8 +1816,306 @@ func dry_run_align_nodes(params):
             dry_align_add_issue(issues, "error", "UNKNOWN_OPERATION_TYPE", "Operation type is not supported: " + operation_type, operation_index, operation_type)
 
     var result = dry_align_finish_result(project_path, scene_path, operations, processed_count, issues, plan, include_plan, include_layout_before, layout_data, bounds_source, limits)
-    print(JSON.stringify(result))
+    if owns_scene_root:
+        scene_root.free()
+    return result
+
+func dry_run_align_nodes(params):
+    print(JSON.stringify(dry_run_align_nodes_result(params)))
+
+func align_nodes_error(error_code, message, issues=[]):
+    return {
+        "success": false,
+        "error": error_code,
+        "message": message,
+        "issues": issues
+    }
+
+func align_nodes_array_close(a, b, epsilon=0.001):
+    if typeof(a) != TYPE_ARRAY or typeof(b) != TYPE_ARRAY:
+        return false
+    if a.size() != b.size():
+        return false
+    for index in range(a.size()):
+        if abs(a[index] - b[index]) > epsilon:
+            return false
+    return true
+
+func align_nodes_set_local_position(node, value):
+    if node is Control or node is Node2D:
+        if not dry_align_is_number_array_any_size(value, [2]):
+            return {"success": false, "error": "UNSUPPORTED_NODE_DIMENSION", "message": "2D nodes require a [x, y] position."}
+        node.position = Vector2(value[0], value[1])
+        return {"success": true}
+
+    if node is Node3D:
+        if not dry_align_is_number_array_any_size(value, [3]):
+            return {"success": false, "error": "UNSUPPORTED_NODE_DIMENSION", "message": "3D nodes require a [x, y, z] position."}
+        node.position = Vector3(value[0], value[1], value[2])
+        return {"success": true}
+
+    return {"success": false, "error": "UNSUPPORTED_NODE_DIMENSION", "message": "Node does not support local position assignment."}
+
+func align_nodes_apply_plan(scene_root, max_depth, plan, issues):
+    var node_by_path = {}
+    dry_align_collect_node_map(scene_root, scene_root, max_depth, 0, node_by_path)
+    var applied_changes = []
+
+    for plan_item in plan:
+        if typeof(plan_item) != TYPE_DICTIONARY:
+            dry_align_add_issue(issues, "warning", "UNSUPPORTED_PLANNED_CHANGE", "Planned change was skipped because it was not an object.")
+            continue
+
+        var node_path = plan_item["nodePath"] if plan_item.has("nodePath") else null
+        var property_name = plan_item["property"] if plan_item.has("property") else null
+        var proposed_value = plan_item["proposedValue"] if plan_item.has("proposedValue") else null
+        var space = plan_item["space"] if plan_item.has("space") else null
+
+        if property_name != "position" or space != "local" or typeof(proposed_value) != TYPE_ARRAY:
+            dry_align_add_issue(issues, "warning", "UNSUPPORTED_PLANNED_CHANGE", "Only local position changes are applied by align_nodes.", plan_item["operationIndex"] if plan_item.has("operationIndex") else -1, plan_item["operationType"] if plan_item.has("operationType") else null, node_path)
+            continue
+
+        if node_path == null or not node_by_path.has(node_path):
+            dry_align_add_issue(issues, "error", "NODE_NOT_FOUND", "Planned target node was not found in the scene.", plan_item["operationIndex"] if plan_item.has("operationIndex") else -1, plan_item["operationType"] if plan_item.has("operationType") else null, node_path, "Run read_scene_tree or get_scene_layout to inspect current node paths.")
+            return {"success": false, "error": "NODE_NOT_FOUND", "message": "A planned target node was not found.", "appliedChanges": applied_changes}
+
+        var node = node_by_path[node_path]
+        var old_value = dry_align_get_local_position(node)
+        if old_value == null:
+            dry_align_add_issue(issues, "error", "UNSUPPORTED_NODE_DIMENSION", "Node does not expose a supported local position.", plan_item["operationIndex"] if plan_item.has("operationIndex") else -1, plan_item["operationType"] if plan_item.has("operationType") else null, node_path)
+            return {"success": false, "error": "UNSUPPORTED_NODE_DIMENSION", "message": "A planned target node cannot be positioned.", "appliedChanges": applied_changes}
+
+        var set_result = align_nodes_set_local_position(node, proposed_value)
+        if not set_result["success"]:
+            dry_align_add_issue(issues, "error", set_result["error"], set_result["message"], plan_item["operationIndex"] if plan_item.has("operationIndex") else -1, plan_item["operationType"] if plan_item.has("operationType") else null, node_path)
+            return {"success": false, "error": set_result["error"], "message": set_result["message"], "appliedChanges": applied_changes}
+
+        applied_changes.append({
+            "nodePath": node_path,
+            "property": "position",
+            "oldValue": old_value,
+            "newValue": dry_align_duplicate_array(proposed_value),
+            "delta": dry_align_array_delta(proposed_value, old_value)
+        })
+
+    return {
+        "success": true,
+        "appliedChanges": applied_changes
+    }
+
+func align_nodes_post_validate(scene_path, applied_changes, max_depth):
+    var scene_resource = ResourceLoader.load(scene_path, "", ResourceLoader.CACHE_MODE_IGNORE)
+    if scene_resource == null or not (scene_resource is PackedScene):
+        return {
+            "success": false,
+            "message": "Saved scene could not be loaded as a PackedScene.",
+            "postValidation": {
+                "loadable": false,
+                "instantiable": false,
+                "positionChecksPassed": false,
+                "checkedNodes": 0
+            }
+        }
+
+    var scene_root = scene_resource.instantiate()
+    if scene_root == null:
+        return {
+            "success": false,
+            "message": "Saved scene could not be instantiated.",
+            "postValidation": {
+                "loadable": true,
+                "instantiable": false,
+                "positionChecksPassed": false,
+                "checkedNodes": 0
+            }
+        }
+
+    var node_by_path = {}
+    dry_align_collect_node_map(scene_root, scene_root, max_depth, 0, node_by_path)
+    var checked_nodes = 0
+    var position_checks_passed = true
+
+    for change in applied_changes:
+        var node_path = change["nodePath"]
+        if not node_by_path.has(node_path):
+            position_checks_passed = false
+            continue
+        var node = node_by_path[node_path]
+        var local_position = dry_align_get_local_position(node)
+        if local_position == null or not align_nodes_array_close(local_position, change["newValue"]):
+            position_checks_passed = false
+        checked_nodes += 1
+
     scene_root.free()
+    return {
+        "success": position_checks_passed,
+        "message": "Saved scene positions did not match the planned values." if not position_checks_passed else "Post-validation passed.",
+        "postValidation": {
+            "loadable": true,
+            "instantiable": true,
+            "positionChecksPassed": position_checks_passed,
+            "checkedNodes": checked_nodes
+        }
+    }
+
+func align_nodes_result(project_path, scene_path, dry_run_result, issues, plan, applied_changes, save_error, bytes_written, post_validation, layout_after, include_plan, applied, saved):
+    var counts = dry_align_issue_counts(issues)
+    var summary = dry_run_result["summary"].duplicate(true)
+    summary["appliedChangeCount"] = applied_changes.size()
+    summary["errorCount"] = counts["errorCount"]
+    summary["warningCount"] = counts["warningCount"]
+    summary["infoCount"] = counts["infoCount"]
+
+    return {
+        "success": true,
+        "projectPath": project_path,
+        "scenePath": scene_path,
+        "applied": applied,
+        "saved": saved,
+        "valid": counts["errorCount"] == 0,
+        "severity": dry_align_severity_from_counts(counts),
+        "summary": summary,
+        "issues": issues,
+        "plan": plan if include_plan else [],
+        "appliedChanges": applied_changes,
+        "write": {
+            "saved": saved,
+            "resourceSaverCode": save_error,
+            "bytesWritten": bytes_written
+        },
+        "postValidation": post_validation,
+        "layoutBefore": dry_run_result["layoutBefore"] if dry_run_result.has("layoutBefore") else null,
+        "layoutAfter": layout_after,
+        "limits": dry_run_result["limits"]
+    }
+
+func align_nodes(params):
+    if not params.has("scene_path"):
+        print(JSON.stringify(align_nodes_error("MISSING_SCENE_PATH", "scene_path is required.")))
+        return
+    if not params.has("operations") or typeof(params.operations) != TYPE_ARRAY or params.operations.is_empty():
+        print(JSON.stringify(align_nodes_error("MISSING_OPERATIONS", "operations must be a non-empty array.")))
+        return
+
+    var scene_path = normalize_resource_scene_path(params.scene_path)
+    var project_path = params.project_path if params.has("project_path") else ProjectSettings.globalize_path("res://")
+    var max_depth = int(params.max_depth) if params.has("max_depth") else 100
+    var include_plan = params.include_plan if params.has("include_plan") else true
+    var include_layout_after = params.include_layout_after if params.has("include_layout_after") else false
+    var validate_after_write = params.validate_after_write if params.has("validate_after_write") else true
+
+    if not FileAccess.file_exists(scene_path):
+        print(JSON.stringify(align_nodes_error("SCENE_PATH_NOT_FOUND", "Scene file does not exist: " + scene_path)))
+        return
+
+    var scene_resource = ResourceLoader.load(scene_path)
+    if scene_resource == null or not (scene_resource is PackedScene):
+        print(JSON.stringify(align_nodes_error("SCENE_LOAD_FAILED", "Failed to load scene as PackedScene: " + scene_path)))
+        return
+
+    var scene_root = scene_resource.instantiate()
+    if scene_root == null:
+        print(JSON.stringify(align_nodes_error("SCENE_INSTANTIATE_FAILED", "Failed to instantiate scene: " + scene_path)))
+        return
+
+    var dry_run_params = params.duplicate(true)
+    dry_run_params["scene_path"] = scene_path
+    dry_run_params["include_plan"] = true
+    var dry_run_result = dry_run_align_nodes_result(dry_run_params, scene_root)
+    if not dry_run_result.has("success") or not dry_run_result["success"]:
+        scene_root.free()
+        print(JSON.stringify(align_nodes_error(
+            dry_run_result["error"] if dry_run_result.has("error") else "ALIGN_NODES_FAILED",
+            dry_run_result["message"] if dry_run_result.has("message") else "Alignment dry-run failed."
+        )))
+        return
+
+    var issues = dry_run_result["issues"].duplicate(true)
+    var plan = dry_run_result["plan"].duplicate(true)
+    if dry_align_has_error_issues(issues):
+        scene_root.free()
+        var validation_error = align_nodes_error("DRY_RUN_VALIDATION_FAILED", "Alignment dry-run validation failed; scene was not written.", issues)
+        validation_error["plan"] = plan if include_plan else []
+        validation_error["layoutBefore"] = dry_run_result["layoutBefore"] if dry_run_result.has("layoutBefore") else null
+        validation_error["limits"] = dry_run_result["limits"]
+        print(JSON.stringify(validation_error))
+        return
+
+    if plan.is_empty():
+        dry_align_add_issue(issues, "info", "NO_CHANGES_PLANNED", "Dry-run produced no applicable position changes.")
+        scene_root.free()
+        var no_change_result = align_nodes_result(project_path, scene_path, dry_run_result, issues, plan, [], null, 0, null, null, include_plan, false, false)
+        print(JSON.stringify(no_change_result))
+        return
+
+    var apply_result = align_nodes_apply_plan(scene_root, max_depth, plan, issues)
+    if not apply_result["success"] or dry_align_has_error_issues(issues):
+        scene_root.free()
+        var apply_error = align_nodes_error(apply_result["error"] if apply_result.has("error") else "APPLY_ALIGNMENT_FAILED", apply_result["message"] if apply_result.has("message") else "Failed to apply planned alignment changes.", issues)
+        apply_error["plan"] = plan if include_plan else []
+        apply_error["appliedChanges"] = apply_result["appliedChanges"] if apply_result.has("appliedChanges") else []
+        apply_error["layoutBefore"] = dry_run_result["layoutBefore"] if dry_run_result.has("layoutBefore") else null
+        apply_error["limits"] = dry_run_result["limits"]
+        print(JSON.stringify(apply_error))
+        return
+
+    var applied_changes = apply_result["appliedChanges"]
+    if applied_changes.is_empty():
+        dry_align_add_issue(issues, "info", "NO_CHANGES_PLANNED", "No supported planned changes were applicable.")
+        scene_root.free()
+        var no_applicable_result = align_nodes_result(project_path, scene_path, dry_run_result, issues, plan, applied_changes, null, 0, null, null, include_plan, false, false)
+        print(JSON.stringify(no_applicable_result))
+        return
+
+    var layout_after = null
+    if include_layout_after:
+        var layout_after_data = dry_align_build_layout(scene_root, max_depth)
+        var bounds_source = params.bounds_source if params.has("bounds_source") else "visual"
+        layout_after = dry_align_compact_layout_before(layout_after_data["nodes"], layout_after_data["sceneBounds"], bounds_source)
+
+    var packed_scene = PackedScene.new()
+    var pack_result = packed_scene.pack(scene_root)
+    if pack_result != OK:
+        scene_root.free()
+        print(JSON.stringify(align_nodes_error("PACK_SCENE_FAILED", "Failed to pack the aligned scene; scene was not written.", issues)))
+        return
+
+    var save_error = ResourceSaver.save(packed_scene, scene_path)
+    if save_error != OK:
+        scene_root.free()
+        print(JSON.stringify(align_nodes_error("SAVE_SCENE_FAILED", "Failed to save the aligned scene.", issues)))
+        return
+
+    var bytes_written = 0
+    var file = FileAccess.open(scene_path, FileAccess.READ)
+    if file != null:
+        bytes_written = file.get_length()
+        file.close()
+
+    var post_validation = null
+    if validate_after_write:
+        var post_result = align_nodes_post_validate(scene_path, applied_changes, max_depth)
+        post_validation = post_result["postValidation"]
+        if not post_result["success"]:
+            scene_root.free()
+            var post_error = align_nodes_error("POST_VALIDATE_FAILED", post_result["message"], issues)
+            post_error["plan"] = plan if include_plan else []
+            post_error["appliedChanges"] = applied_changes
+            post_error["write"] = {
+                "saved": true,
+                "resourceSaverCode": save_error,
+                "bytesWritten": bytes_written
+            }
+            post_error["postValidation"] = post_validation
+            post_error["layoutBefore"] = dry_run_result["layoutBefore"] if dry_run_result.has("layoutBefore") else null
+            post_error["layoutAfter"] = layout_after
+            post_error["limits"] = dry_run_result["limits"]
+            print(JSON.stringify(post_error))
+            return
+
+    scene_root.free()
+    var result = align_nodes_result(project_path, scene_path, dry_run_result, issues, plan, applied_changes, save_error, bytes_written, post_validation, layout_after, include_plan, true, true)
+    print(JSON.stringify(result))
 
 func is_nearly_zero(value):
     return abs(value) <= 0.0001
