@@ -156,6 +156,13 @@ class GodotServer {
     'include_dependencies': 'includeDependencies',
     'include_scene_preview': 'includeScenePreview',
     'include_placement_hints': 'includePlacementHints',
+    'allow_overwrite': 'allowOverwrite',
+    'validate_assets': 'validateAssets',
+    'validate_node_types': 'validateNodeTypes',
+    'validate_properties': 'validateProperties',
+    'validate_hierarchy': 'validateHierarchy',
+    'include_plan': 'includePlan',
+    'max_nodes': 'maxNodes',
     'check_resources': 'checkResources',
     'check_scripts': 'checkScripts',
     'check_node_basics': 'checkNodeBasics',
@@ -356,6 +363,31 @@ class GodotServer {
    */
   private createGetAssetInfoErrorResponse(error: string, message: string): any {
     console.error(`[SERVER] get_asset_info error response: ${error}: ${message}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error,
+              message,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  /**
+   * Create a dry_run_scene_blueprint-specific JSON error response while preserving MCP text content style.
+   */
+  private createDryRunSceneBlueprintErrorResponse(error: string, message: string): any {
+    console.error(`[SERVER] dry_run_scene_blueprint error response: ${error}: ${message}`);
 
     return {
       content: [
@@ -1374,6 +1406,56 @@ class GodotServer {
           },
         },
         {
+          name: 'dry_run_scene_blueprint',
+          description: 'Validate and simulate a scene blueprint read-only without creating or modifying files',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Absolute path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Target Godot scene path such as res://scenes/Room.tscn or scenes/Room.tscn',
+              },
+              blueprint: {
+                type: 'object',
+                description: 'Structured scene blueprint with root and optional flat node list',
+              },
+              allowOverwrite: {
+                type: 'boolean',
+                description: 'Whether an existing target scene would be overwritten by a future write tool (default: false)',
+              },
+              validateAssets: {
+                type: 'boolean',
+                description: 'Whether to validate referenced asset paths (default: true)',
+              },
+              validateNodeTypes: {
+                type: 'boolean',
+                description: 'Whether to validate Godot node types with ClassDB (default: true)',
+              },
+              validateProperties: {
+                type: 'boolean',
+                description: 'Whether to validate common safe property shapes (default: true)',
+              },
+              validateHierarchy: {
+                type: 'boolean',
+                description: 'Whether to validate parent paths, duplicates, and hierarchy consistency (default: true)',
+              },
+              includePlan: {
+                type: 'boolean',
+                description: 'Whether to return a normalized creation plan (default: true)',
+              },
+              maxNodes: {
+                type: 'number',
+                description: 'Maximum blueprint nodes including root (default: 250, max: 2000)',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'blueprint'],
+          },
+        },
+        {
           name: 'validate_scene',
           description: 'Validate a Godot scene read-only and return structured issues for AI-safe editing',
           inputSchema: {
@@ -1623,6 +1705,8 @@ class GodotServer {
           return await this.handleGetAssetInfo(request.params.arguments);
         case 'read_scene_tree':
           return await this.handleReadSceneTree(request.params.arguments);
+        case 'dry_run_scene_blueprint':
+          return await this.handleDryRunSceneBlueprint(request.params.arguments);
         case 'validate_scene':
           return await this.handleValidateScene(request.params.arguments);
         case 'create_scene':
@@ -2682,6 +2766,211 @@ class GodotServer {
       return this.createGetAssetInfoErrorResponse(
         'GET_ASSET_INFO_FAILED',
         `Failed to get asset info: ${error?.message || 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * Handle the dry_run_scene_blueprint tool
+   */
+  private async handleDryRunSceneBlueprint(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || typeof args.projectPath !== 'string') {
+      return this.createDryRunSceneBlueprintErrorResponse(
+        'MISSING_PROJECT_PATH',
+        'projectPath is required and must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    if (!args.scenePath || typeof args.scenePath !== 'string') {
+      return this.createDryRunSceneBlueprintErrorResponse(
+        'MISSING_SCENE_PATH',
+        'scenePath is required and must be a target Godot scene path such as res://scenes/Room.tscn or scenes/Room.tscn.'
+      );
+    }
+
+    if (args.blueprint === undefined) {
+      return this.createDryRunSceneBlueprintErrorResponse(
+        'MISSING_BLUEPRINT',
+        'blueprint is required and must be an object.'
+      );
+    }
+
+    if (args.blueprint === null || typeof args.blueprint !== 'object' || Array.isArray(args.blueprint)) {
+      return this.createDryRunSceneBlueprintErrorResponse(
+        'INVALID_BLUEPRINT',
+        'blueprint must be an object with a root definition and optional nodes array.'
+      );
+    }
+
+    if (args.projectPath.includes('\0')) {
+      return this.createDryRunSceneBlueprintErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must not contain null bytes.'
+      );
+    }
+
+    if (!isAbsolute(args.projectPath)) {
+      return this.createDryRunSceneBlueprintErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    const scenePathResult = this.normalizeScenePath(args.scenePath);
+    if (scenePathResult.error) {
+      return this.createDryRunSceneBlueprintErrorResponse(
+        'UNSAFE_SCENE_PATH',
+        scenePathResult.error
+      );
+    }
+
+    const sceneExtension = extname(scenePathResult.relativePath).toLowerCase();
+    if (!['.tscn', '.scn'].includes(sceneExtension)) {
+      return this.createDryRunSceneBlueprintErrorResponse(
+        'SCENE_PATH_NOT_SCENE_FILE',
+        'scenePath must point to a .tscn or .scn scene file.'
+      );
+    }
+
+    const maxNodesRequested = args.maxNodes !== undefined ? args.maxNodes : null;
+    let maxNodesApplied = 250;
+    let maxNodesClamped = false;
+    if (args.maxNodes !== undefined) {
+      if (typeof args.maxNodes !== 'number' || !Number.isFinite(args.maxNodes) || args.maxNodes < 1) {
+        return this.createDryRunSceneBlueprintErrorResponse(
+          'INVALID_MAX_NODES',
+          'maxNodes must be a number between 1 and 2000.'
+        );
+      }
+
+      if (args.maxNodes > 2000) {
+        maxNodesApplied = 2000;
+        maxNodesClamped = true;
+      } else {
+        maxNodesApplied = Math.floor(args.maxNodes);
+      }
+    }
+
+    const booleanOptions = [
+      'allowOverwrite',
+      'validateAssets',
+      'validateNodeTypes',
+      'validateProperties',
+      'validateHierarchy',
+      'includePlan',
+    ];
+    for (const option of booleanOptions) {
+      if (args[option] !== undefined && typeof args[option] !== 'boolean') {
+        return this.createDryRunSceneBlueprintErrorResponse(
+          'DRY_RUN_SCENE_BLUEPRINT_FAILED',
+          `${option} must be a boolean.`
+        );
+      }
+    }
+
+    const allowOverwrite = args.allowOverwrite !== undefined ? args.allowOverwrite : false;
+    const validateAssets = args.validateAssets !== undefined ? args.validateAssets : true;
+    const validateNodeTypes = args.validateNodeTypes !== undefined ? args.validateNodeTypes : true;
+    const validateProperties = args.validateProperties !== undefined ? args.validateProperties : true;
+    const validateHierarchy = args.validateHierarchy !== undefined ? args.validateHierarchy : true;
+    const includePlan = args.includePlan !== undefined ? args.includePlan : true;
+
+    try {
+      const normalizedProjectPath = resolve(args.projectPath);
+      if (!existsSync(normalizedProjectPath)) {
+        return this.createDryRunSceneBlueprintErrorResponse(
+          'PROJECT_PATH_NOT_FOUND',
+          `Project path does not exist: ${args.projectPath}`
+        );
+      }
+
+      const projectStats = statSync(normalizedProjectPath);
+      if (!projectStats.isDirectory()) {
+        return this.createDryRunSceneBlueprintErrorResponse(
+          'PROJECT_PATH_NOT_DIRECTORY',
+          `Project path is not a directory: ${args.projectPath}`
+        );
+      }
+
+      const projectRoot = realpathSync(normalizedProjectPath);
+      const projectFile = join(projectRoot, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createDryRunSceneBlueprintErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          `Not a valid Godot project: ${args.projectPath}. The directory must contain a project.godot file.`
+        );
+      }
+
+      const sceneFilePath = resolve(projectRoot, scenePathResult.relativePath);
+      if (!this.isPathInside(projectRoot, sceneFilePath)) {
+        return this.createDryRunSceneBlueprintErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must stay inside the Godot project directory.'
+        );
+      }
+
+      if (existsSync(sceneFilePath)) {
+        const sceneFileStats = lstatSync(sceneFilePath);
+        if (sceneFileStats.isSymbolicLink()) {
+          return this.createDryRunSceneBlueprintErrorResponse(
+            'UNSAFE_SCENE_PATH',
+            'scenePath must not be a symbolic link.'
+          );
+        }
+
+        const realSceneFilePath = realpathSync(sceneFilePath);
+        if (!this.isPathInside(projectRoot, realSceneFilePath)) {
+          return this.createDryRunSceneBlueprintErrorResponse(
+            'UNSAFE_SCENE_PATH',
+            'scenePath must stay inside the Godot project directory.'
+          );
+        }
+      }
+
+      const params = {
+        projectPath: projectRoot.replace(/\\/g, '/'),
+        scenePath: scenePathResult.resourcePath,
+        blueprint: args.blueprint,
+        allowOverwrite,
+        validateAssets,
+        validateNodeTypes,
+        validateProperties,
+        validateHierarchy,
+        includePlan,
+        maxNodes: maxNodesApplied,
+        maxNodesRequested,
+        maxNodesClamped,
+      };
+
+      const { stdout, stderr } = await this.executeOperation('dry_run_scene_blueprint', params, projectRoot);
+      const parsedResult = this.extractLastJsonObject(stdout);
+
+      if (!parsedResult) {
+        const stderrText = stderr?.trim();
+        return this.createDryRunSceneBlueprintErrorResponse(
+          'DRY_RUN_SCENE_BLUEPRINT_FAILED',
+          stderrText
+            ? `Godot did not return valid JSON for dry_run_scene_blueprint. Stderr: ${stderrText}`
+            : 'Godot did not return valid JSON for dry_run_scene_blueprint.'
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(parsedResult, null, 2),
+          },
+        ],
+        ...(parsedResult.success === false ? { isError: true } : {}),
+      };
+    } catch (error: any) {
+      return this.createDryRunSceneBlueprintErrorResponse(
+        'DRY_RUN_SCENE_BLUEPRINT_FAILED',
+        `Failed to dry-run scene blueprint: ${error?.message || 'Unknown error'}`
       );
     }
   }

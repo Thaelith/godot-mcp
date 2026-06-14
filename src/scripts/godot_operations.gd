@@ -28,7 +28,7 @@ func _init():
     
     var operation = args[operation_index]
     var params_json = args[params_index]
-    var quiet_output = operation == "read_scene_tree" or operation == "validate_scene" or operation == "get_asset_info"
+    var quiet_output = operation == "read_scene_tree" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint"
 
     if quiet_output:
         debug_mode = false
@@ -69,6 +69,8 @@ func _init():
             validate_scene(params)
         "get_asset_info":
             get_asset_info(params)
+        "dry_run_scene_blueprint":
+            dry_run_scene_blueprint(params)
         "create_scene":
             create_scene(params)
         "add_node":
@@ -806,6 +808,620 @@ func validate_scene(params):
     var result = finish_validation_result(project_path, scene_path, scene_root, issues, summary, limits, options)
     print(JSON.stringify(result))
     scene_root.free()
+
+func dry_run_get_value(data, keys, default_value=null):
+    for key in keys:
+        if data.has(key):
+            return data[key]
+    return default_value
+
+func dry_run_has_value(data, keys):
+    for key in keys:
+        if data.has(key):
+            return true
+    return false
+
+func dry_run_add_issue(issues, severity, code, message, node_path=null, node_type=null, prop_name=null, asset_path=null, suggestion=null):
+    var issue = {
+        "severity": severity,
+        "code": code,
+        "message": message,
+        "nodePath": node_path,
+        "nodeType": node_type
+    }
+
+    if prop_name != null:
+        issue["property"] = prop_name
+    if asset_path != null:
+        issue["asset"] = asset_path
+    if suggestion != null:
+        issue["suggestion"] = suggestion
+
+    issues.append(issue)
+
+func dry_run_is_number_value(value):
+    return typeof(value) == TYPE_INT or typeof(value) == TYPE_FLOAT
+
+func dry_run_is_number_array(value, expected_size):
+    if typeof(value) != TYPE_ARRAY:
+        return false
+    if value.size() != expected_size:
+        return false
+    for item in value:
+        if not dry_run_is_number_value(item):
+            return false
+    return true
+
+func dry_run_has_unsupported_children(data):
+    if not data.has("children"):
+        return false
+    var children = data.children
+    if typeof(children) != TYPE_ARRAY:
+        return true
+    return children.size() > 0
+
+func dry_run_validate_node_name(name_value):
+    if typeof(name_value) != TYPE_STRING:
+        return "Node name must be a string."
+
+    var node_name = name_value.strip_edges()
+    if node_name.is_empty():
+        return "Node name must not be empty."
+    if node_name.contains("\u0000"):
+        return "Node name must not contain null bytes."
+    if node_name.contains("/") or node_name.contains("\\"):
+        return "Node name must not contain path separators."
+    if node_name == "." or node_name == ".." or node_name.contains(".."):
+        return "Node name must not contain path traversal."
+
+    return null
+
+func dry_run_normalize_scene_node_path(path_value):
+    if typeof(path_value) != TYPE_STRING:
+        return {"error": "Node path must be a string."}
+
+    var raw_path = path_value.strip_edges()
+    if raw_path.is_empty():
+        return {"error": "Node path must not be empty."}
+    if raw_path.contains("\u0000"):
+        return {"error": "Node path must not contain null bytes."}
+
+    var slash_path = raw_path.replace("\\", "/")
+    if slash_path.begins_with("res://") or slash_path.contains("://"):
+        return {"error": "Node paths must be scene-relative paths, not resource paths."}
+    if slash_path.begins_with("/") or (slash_path.length() >= 2 and slash_path.substr(1, 1) == ":"):
+        return {"error": "Node paths must not be absolute filesystem paths."}
+
+    var clean_parts = []
+    for part in slash_path.split("/"):
+        if part.is_empty():
+            continue
+        if part == "." or part == "..":
+            return {"error": "Node paths must not contain traversal segments."}
+        clean_parts.append(part)
+
+    if clean_parts.is_empty():
+        return {"error": "Node path must contain at least one segment."}
+
+    return {"path": "/".join(clean_parts)}
+
+func dry_run_parent_path_from_path(node_path):
+    var slash_index = node_path.rfind("/")
+    if slash_index == -1:
+        return ""
+    return node_path.substr(0, slash_index)
+
+func dry_run_normalize_asset_path(asset_value):
+    if typeof(asset_value) != TYPE_STRING:
+        return {"error": "Asset path must be a string."}
+
+    var raw_path = asset_value.strip_edges()
+    if raw_path.is_empty():
+        return {"error": "Asset path must not be empty."}
+    if raw_path.contains("\u0000"):
+        return {"error": "Asset path must not contain null bytes."}
+
+    var slash_path = raw_path.replace("\\", "/")
+    var relative_path = slash_path
+    if slash_path.begins_with("res://"):
+        relative_path = slash_path.substr("res://".length())
+    elif slash_path.contains("://"):
+        return {"error": "Only res:// asset paths are allowed."}
+
+    if relative_path.begins_with("/") or (relative_path.length() >= 2 and relative_path.substr(1, 1) == ":") or relative_path.contains(":"):
+        return {"error": "Asset path must be relative to the Godot project."}
+
+    var clean_parts = []
+    for part in relative_path.split("/"):
+        if part.is_empty():
+            continue
+        if part == "." or part == "..":
+            return {"error": "Asset path must not escape the Godot project."}
+        clean_parts.append(part)
+
+    if clean_parts.is_empty():
+        return {"error": "Asset path must contain a file path."}
+
+    return {"path": "res://" + "/".join(clean_parts)}
+
+func dry_run_class_is_or_inherits(node_type, base_type):
+    if node_type == base_type:
+        return true
+    if not ClassDB.class_exists(node_type):
+        return false
+    return ClassDB.is_parent_class(node_type, base_type)
+
+func dry_run_is_registered_custom_class(node_type):
+    var global_classes = ProjectSettings.get_global_class_list()
+    for global_class in global_classes:
+        if global_class.has("class") and global_class["class"] == node_type:
+            return true
+    return false
+
+func dry_run_validate_node_type(node_type, node_path, issues):
+    if typeof(node_type) != TYPE_STRING or node_type.strip_edges().is_empty():
+        dry_run_add_issue(issues, "error", "INVALID_NODE_TYPE", "Node type must be a non-empty Godot class name.", node_path, node_type, null, null, "Use a valid Godot node type such as Node2D, Sprite2D, Control, or Node3D.")
+        return
+
+    var clean_type = node_type.strip_edges()
+    if clean_type.contains("/") or clean_type.contains("\\") or clean_type.contains("://") or clean_type.get_extension().to_lower() == "gd":
+        dry_run_add_issue(issues, "error", "INVALID_NODE_TYPE", "Node type must be a Godot class name, not a script or filesystem path.", node_path, clean_type, null, null, "Use built-in node types for dry-run blueprints; attach scripts in a later explicit step.")
+        return
+
+    if not ClassDB.class_exists(clean_type):
+        if dry_run_is_registered_custom_class(clean_type):
+            dry_run_add_issue(issues, "error", "CUSTOM_NODE_TYPE_UNSUPPORTED", "Custom script classes are not supported by dry-run yet.", node_path, clean_type, null, null, "Use a built-in Godot node type in the blueprint and attach custom scripts later.")
+        else:
+            dry_run_add_issue(issues, "error", "INVALID_NODE_TYPE", "Node type does not exist or cannot be instantiated.", node_path, clean_type, null, null, "Use a valid Godot node type such as Node2D, Sprite2D, Control, or Node3D.")
+        return
+
+    if not ClassDB.can_instantiate(clean_type):
+        dry_run_add_issue(issues, "error", "INVALID_NODE_TYPE", "Node type exists but cannot be instantiated.", node_path, clean_type, null, null, "Use a concrete Godot node type.")
+
+func dry_run_expected_vector_size(node_type, property_name):
+    if property_name == "size":
+        return 2
+    if dry_run_class_is_or_inherits(node_type, "Node3D"):
+        return 3
+    if dry_run_class_is_or_inherits(node_type, "Node2D") or dry_run_class_is_or_inherits(node_type, "Control"):
+        return 2
+    return 0
+
+func dry_run_validate_properties_for_spec(spec, options, issues):
+    var props = spec["properties"]
+    if props == null:
+        return {}
+
+    if typeof(props) != TYPE_DICTIONARY:
+        dry_run_add_issue(issues, "error", "INVALID_PROPERTY_VALUE", "properties must be an object.", spec["path"], spec["type"], "properties", null, "Use an object mapping safe property names to values.")
+        return {}
+
+    if not options["validateProperties"]:
+        return props
+
+    var node_type = spec["type"]
+    var known_properties = [
+        "position",
+        "scale",
+        "rotation",
+        "rotation_degrees",
+        "z_index",
+        "visible",
+        "size",
+        "text",
+        "disabled",
+        "enabled",
+        "centered",
+        "flip_h",
+        "flip_v"
+    ]
+
+    for property_name in props.keys():
+        var value = props[property_name]
+        if not known_properties.has(property_name):
+            dry_run_add_issue(issues, "warning", "UNKNOWN_PROPERTY", "Property is not in the dry-run safe property allowlist.", spec["path"], node_type, property_name, null, "Only common properties are validated; verify this property before applying a future write operation.")
+            continue
+
+        if property_name == "position" or property_name == "scale":
+            var expected_size = dry_run_expected_vector_size(node_type, property_name)
+            var valid_vector = false
+            if expected_size == 0:
+                valid_vector = dry_run_is_number_array(value, 2) or dry_run_is_number_array(value, 3)
+            else:
+                valid_vector = dry_run_is_number_array(value, expected_size)
+            if not valid_vector:
+                dry_run_add_issue(issues, "error", "INVALID_PROPERTY_VALUE", property_name + " must be a numeric array with the expected vector size.", spec["path"], node_type, property_name, null, "Use [x, y] for Node2D/Control or [x, y, z] for Node3D.")
+        elif property_name == "size":
+            if not dry_run_is_number_array(value, 2):
+                dry_run_add_issue(issues, "error", "INVALID_PROPERTY_VALUE", "size must be a numeric [width, height] array.", spec["path"], node_type, property_name, null, "Use a numeric array with two values.")
+        elif property_name == "rotation" or property_name == "rotation_degrees" or property_name == "z_index":
+            if not dry_run_is_number_value(value):
+                dry_run_add_issue(issues, "error", "INVALID_PROPERTY_VALUE", property_name + " must be a number.", spec["path"], node_type, property_name, null, "Use a numeric value.")
+        elif property_name == "visible" or property_name == "disabled" or property_name == "enabled" or property_name == "centered" or property_name == "flip_h" or property_name == "flip_v":
+            if typeof(value) != TYPE_BOOL:
+                dry_run_add_issue(issues, "error", "INVALID_PROPERTY_VALUE", property_name + " must be a boolean.", spec["path"], node_type, property_name, null, "Use true or false.")
+        elif property_name == "text":
+            if typeof(value) != TYPE_STRING:
+                dry_run_add_issue(issues, "error", "INVALID_PROPERTY_VALUE", "text must be a string.", spec["path"], node_type, property_name, null, "Use a string value.")
+
+    return props
+
+func dry_run_infer_asset_property(asset_type, extension):
+    if asset_type == "texture":
+        return "texture"
+    if asset_type == "audio":
+        return "stream"
+    if asset_type == "scene":
+        return "instance"
+    if asset_type == "model":
+        if extension == ".obj" or extension == ".fbx":
+            return "mesh"
+        return "instance"
+    return null
+
+func dry_run_asset_matches_node(asset_type, asset_property, node_type):
+    if asset_type == "texture":
+        return asset_property == "texture" and (dry_run_class_is_or_inherits(node_type, "Sprite2D") or dry_run_class_is_or_inherits(node_type, "TextureRect"))
+    if asset_type == "audio":
+        return asset_property == "stream" and (node_type == "AudioStreamPlayer" or node_type == "AudioStreamPlayer2D" or node_type == "AudioStreamPlayer3D")
+    if asset_type == "scene":
+        return asset_property == "instance"
+    if asset_type == "model":
+        if asset_property == "instance":
+            return true
+        return asset_property == "mesh" and dry_run_class_is_or_inherits(node_type, "MeshInstance3D")
+    return true
+
+func dry_run_validate_asset_for_spec(spec, options, issues):
+    var asset_value = spec["asset"]
+    if asset_value == null:
+        return
+
+    var normalized = dry_run_normalize_asset_path(asset_value)
+    if normalized.has("error"):
+        dry_run_add_issue(issues, "error", "UNSAFE_ASSET_PATH", normalized["error"], spec["path"], spec["type"], "asset", str(asset_value), "Use a res:// asset path that stays inside the Godot project.")
+        return
+
+    var asset_path = normalized["path"]
+    spec["asset"] = asset_path
+    var extension = "." + asset_path.get_extension().to_lower()
+    var asset_type = get_asset_type_from_extension(extension)
+    spec["assetType"] = asset_type
+
+    if asset_type == "unknown":
+        dry_run_add_issue(issues, "warning", "UNKNOWN_ASSET_TYPE", "Asset extension is not recognized by the dry-run asset catalog.", spec["path"], spec["type"], "asset", asset_path, "Use a supported Godot asset extension or verify this asset manually.")
+
+    if options["validateAssets"]:
+        if not ResourceLoader.exists(asset_path) and not FileAccess.file_exists(asset_path):
+            dry_run_add_issue(issues, "error", "ASSET_NOT_FOUND", "Referenced asset does not exist.", spec["path"], spec["type"], "asset", asset_path, "Use an existing asset path from scan_assets.")
+
+    var asset_property = spec["assetProperty"]
+    if asset_property == null:
+        asset_property = dry_run_infer_asset_property(asset_type, extension)
+        spec["assetProperty"] = asset_property
+        if asset_property != null:
+            dry_run_add_issue(issues, "info", "INFERRED_ASSET_PROPERTY", "assetProperty was inferred from the asset type.", spec["path"], spec["type"], "assetProperty", asset_path, "Set assetProperty explicitly if a different assignment is intended.")
+    elif typeof(asset_property) != TYPE_STRING or asset_property.strip_edges().is_empty():
+        dry_run_add_issue(issues, "error", "INVALID_PROPERTY_VALUE", "assetProperty must be a non-empty string when provided.", spec["path"], spec["type"], "assetProperty", asset_path, "Use a property such as texture, stream, mesh, or instance.")
+        return
+    else:
+        spec["assetProperty"] = asset_property.strip_edges()
+
+    if asset_property != null and not dry_run_asset_matches_node(asset_type, asset_property, spec["type"]):
+        dry_run_add_issue(issues, "warning", "POSSIBLE_ASSET_NODE_MISMATCH", "Asset type and target node type may not be compatible.", spec["path"], spec["type"], spec["assetProperty"], asset_path, "Use a matching node type or set assetProperty explicitly.")
+
+func dry_run_detect_cycle(node_path, parent_by_path, visiting, visited):
+    if visiting.has(node_path):
+        return true
+    if visited.has(node_path):
+        return false
+
+    visiting[node_path] = true
+    if parent_by_path.has(node_path):
+        var parent_path = parent_by_path[node_path]
+        if parent_by_path.has(parent_path):
+            if dry_run_detect_cycle(parent_path, parent_by_path, visiting, visited):
+                return true
+
+    visiting.erase(node_path)
+    visited[node_path] = true
+    return false
+
+func dry_run_add_plan_actions(plan, root_spec, node_specs):
+    plan.append({
+        "action": "create_root",
+        "path": root_spec["path"],
+        "type": root_spec["type"],
+        "name": root_spec["name"]
+    })
+
+    if root_spec["properties"].size() > 0:
+        plan.append({
+            "action": "set_properties",
+            "path": root_spec["path"],
+            "properties": root_spec["properties"]
+        })
+
+    for spec in node_specs:
+        if spec["path"].is_empty() or spec["parentPath"].is_empty():
+            continue
+
+        plan.append({
+            "action": "add_node",
+            "path": spec["path"],
+            "parentPath": spec["parentPath"],
+            "type": spec["type"],
+            "name": spec["name"]
+        })
+
+        if spec["asset"] != null:
+            plan.append({
+                "action": "assign_asset",
+                "path": spec["path"],
+                "asset": spec["asset"],
+                "assetProperty": spec["assetProperty"]
+            })
+
+        if spec["properties"].size() > 0:
+            plan.append({
+                "action": "set_properties",
+                "path": spec["path"],
+                "properties": spec["properties"]
+            })
+
+func dry_run_finish_result(project_path, scene_path, root_spec, node_specs, issues, limits, include_plan, plan, target_exists):
+    var error_count = 0
+    var warning_count = 0
+    var info_count = 0
+    for issue in issues:
+        if issue["severity"] == "error":
+            error_count += 1
+        elif issue["severity"] == "warning":
+            warning_count += 1
+        elif issue["severity"] == "info":
+            info_count += 1
+
+    var severity = "ok"
+    if error_count > 0:
+        severity = "error"
+    elif warning_count > 0:
+        severity = "warning"
+    elif info_count > 0:
+        severity = "info"
+
+    var node_types = {}
+    if root_spec["type"] != null:
+        node_types[root_spec["type"]] = 1
+    for spec in node_specs:
+        var spec_type = spec["type"] if spec["type"] != null else "unknown"
+        if not node_types.has(spec_type):
+            node_types[spec_type] = 0
+        node_types[spec_type] += 1
+
+    var asset_reference_count = 0
+    for spec in node_specs:
+        if spec["asset"] != null:
+            asset_reference_count += 1
+
+    var result = {
+        "success": true,
+        "projectPath": project_path,
+        "scenePath": scene_path,
+        "wouldCreate": error_count == 0,
+        "wouldOverwrite": target_exists,
+        "valid": error_count == 0,
+        "severity": severity,
+        "summary": {
+            "totalNodes": 1 + node_specs.size(),
+            "rootType": root_spec["type"],
+            "nodeTypes": node_types,
+            "assetReferenceCount": asset_reference_count,
+            "errorCount": error_count,
+            "warningCount": warning_count,
+            "infoCount": info_count
+        },
+        "issues": issues,
+        "limits": limits
+    }
+
+    if include_plan:
+        result["plan"] = plan
+
+    return result
+
+func dry_run_scene_blueprint(params):
+    if not params.has("scene_path"):
+        print_json_error("MISSING_SCENE_PATH", "scene_path is required.")
+        return
+    if not params.has("blueprint"):
+        print_json_error("MISSING_BLUEPRINT", "blueprint is required.")
+        return
+    if typeof(params.blueprint) != TYPE_DICTIONARY:
+        print_json_error("INVALID_BLUEPRINT", "blueprint must be an object.")
+        return
+
+    var scene_path = normalize_resource_scene_path(params.scene_path)
+    var project_path = params.project_path if params.has("project_path") else ProjectSettings.globalize_path("res://")
+    var blueprint = params.blueprint
+    var max_nodes = params.max_nodes if params.has("max_nodes") else 250
+    var allow_overwrite = params.allow_overwrite if params.has("allow_overwrite") else false
+    var include_plan = params.include_plan if params.has("include_plan") else true
+    var options = {
+        "validateAssets": params.validate_assets if params.has("validate_assets") else true,
+        "validateNodeTypes": params.validate_node_types if params.has("validate_node_types") else true,
+        "validateProperties": params.validate_properties if params.has("validate_properties") else true,
+        "validateHierarchy": params.validate_hierarchy if params.has("validate_hierarchy") else true
+    }
+    var limits = {
+        "maxNodesRequested": params.max_nodes_requested if params.has("max_nodes_requested") else null,
+        "maxNodesApplied": max_nodes,
+        "maxNodesClamped": params.max_nodes_clamped if params.has("max_nodes_clamped") else false
+    }
+
+    var issues = []
+    if not blueprint.has("root") or typeof(blueprint.root) != TYPE_DICTIONARY:
+        print_json_error("INVALID_ROOT", "blueprint.root is required and must be an object.")
+        return
+
+    var root = blueprint.root
+    var root_type = dry_run_get_value(root, ["type"], null)
+    if typeof(root_type) == TYPE_STRING:
+        root_type = root_type.strip_edges()
+
+    var root_name = dry_run_get_value(root, ["name"], null)
+    if root_name == null:
+        root_name = scene_path.get_file().get_basename()
+    var root_name_error = dry_run_validate_node_name(root_name)
+    if root_name_error != null:
+        dry_run_add_issue(issues, "error", "INVALID_NODE_NAME", root_name_error, str(root_name), root_type, "name", null, "Use a simple node name without slashes or traversal.")
+        root_name = str(root_name).strip_edges()
+
+    var root_path = str(root_name)
+    var root_spec = {
+        "path": root_path,
+        "parentPath": "",
+        "type": root_type,
+        "name": root_name,
+        "properties": dry_run_get_value(root, ["properties"], null),
+        "asset": null,
+        "assetProperty": null
+    }
+
+    if typeof(root_type) != TYPE_STRING or root_type.is_empty():
+        dry_run_add_issue(issues, "error", "INVALID_ROOT", "root.type is required and must be a string.", root_path, root_type, "type", null, "Use a valid Godot node type such as Node2D, Control, or Node3D.")
+    elif options["validateNodeTypes"]:
+        dry_run_validate_node_type(root_type, root_path, issues)
+
+    if dry_run_has_unsupported_children(root):
+        dry_run_add_issue(issues, "error", "NESTED_CHILDREN_UNSUPPORTED", "Nested children are not supported by dry_run_scene_blueprint yet; use the flat nodes array.", root_path, root_type, "children", null, "Move child definitions into blueprint.nodes with parentPath values.")
+
+    var raw_nodes = []
+    if blueprint.has("nodes"):
+        if typeof(blueprint.nodes) == TYPE_ARRAY:
+            raw_nodes = blueprint.nodes
+        else:
+            dry_run_add_issue(issues, "error", "INVALID_BLUEPRINT", "blueprint.nodes must be an array when provided.", root_path, root_type, "nodes", null, "Use an array of flat node definitions.")
+
+    if 1 + raw_nodes.size() > max_nodes:
+        dry_run_add_issue(issues, "error", "BLUEPRINT_TOO_LARGE", "Blueprint node count exceeds maxNodes.", root_path, root_type, null, null, "Reduce the blueprint size or raise maxNodes up to 2000.")
+
+    var node_specs = []
+    var path_set = {}
+    path_set[root_path] = true
+    var parent_by_path = {}
+
+    for index in range(raw_nodes.size()):
+        var node_data = raw_nodes[index]
+        if typeof(node_data) != TYPE_DICTIONARY:
+            dry_run_add_issue(issues, "error", "INVALID_BLUEPRINT", "Each blueprint node must be an object.", root_path, root_type, "nodes", null, "Use objects with type, name, and parentPath or path.")
+            continue
+
+        var node_type = dry_run_get_value(node_data, ["type"], null)
+        if typeof(node_type) == TYPE_STRING:
+            node_type = node_type.strip_edges()
+
+        var node_name = dry_run_get_value(node_data, ["name"], null)
+        var node_name_error = dry_run_validate_node_name(node_name)
+        if node_name_error != null:
+            dry_run_add_issue(issues, "error", "INVALID_NODE_NAME", node_name_error, null, node_type, "name", null, "Use a simple node name without slashes or traversal.")
+            node_name = str(node_name).strip_edges()
+
+        var node_path = dry_run_get_value(node_data, ["path"], null)
+        var parent_path = dry_run_get_value(node_data, ["parentPath", "parent_path"], null)
+
+        if node_path == null and parent_path != null and node_name_error == null:
+            node_path = str(parent_path).strip_edges().replace("\\", "/") + "/" + str(node_name)
+
+        if node_path != null:
+            var normalized_path = dry_run_normalize_scene_node_path(node_path)
+            if normalized_path.has("error"):
+                dry_run_add_issue(issues, "error", "INVALID_NODE_PATH", normalized_path["error"], str(node_path), node_type, "path", null, "Use a relative scene path such as " + root_path + "/Child.")
+                node_path = str(node_path)
+            else:
+                node_path = normalized_path["path"]
+        else:
+            dry_run_add_issue(issues, "error", "INVALID_NODE_PATH", "Node must provide path or parentPath plus name.", null, node_type, "path", null, "Provide parentPath and name, or a full scene-relative path.")
+            node_path = ""
+
+        if parent_path == null and not str(node_path).is_empty():
+            parent_path = dry_run_parent_path_from_path(str(node_path))
+
+        if parent_path != null:
+            var normalized_parent_path = dry_run_normalize_scene_node_path(parent_path)
+            if normalized_parent_path.has("error"):
+                dry_run_add_issue(issues, "error", "INVALID_NODE_PATH", normalized_parent_path["error"], str(node_path), node_type, "parentPath", null, "Use a relative parent path such as " + root_path + ".")
+                parent_path = str(parent_path)
+            else:
+                parent_path = normalized_parent_path["path"]
+        else:
+            dry_run_add_issue(issues, "error", "MISSING_PARENT", "Node parentPath could not be inferred.", str(node_path), node_type, "parentPath", null, "Provide parentPath or a path with a parent segment.")
+            parent_path = ""
+
+        if not str(node_path).begins_with(root_path + "/"):
+            dry_run_add_issue(issues, "error", "INVALID_NODE_PATH", "Node path must start with the root node name.", str(node_path), node_type, "path", null, "Use paths under " + root_path + ".")
+
+        if node_path == root_path:
+            dry_run_add_issue(issues, "error", "DUPLICATE_NODE_PATH", "Node path duplicates the root path.", str(node_path), node_type, "path", null, "Use a unique child path below the root.")
+        elif path_set.has(node_path):
+            dry_run_add_issue(issues, "error", "DUPLICATE_NODE_PATH", "Duplicate node path in blueprint.", str(node_path), node_type, "path", null, "Use unique paths for every node.")
+        else:
+            path_set[node_path] = true
+
+        if parent_path == node_path:
+            dry_run_add_issue(issues, "error", "SELF_PARENT", "Node cannot be parented to itself.", str(node_path), node_type, "parentPath", null, "Set parentPath to an existing ancestor path.")
+
+        if typeof(node_type) != TYPE_STRING or node_type.is_empty():
+            dry_run_add_issue(issues, "error", "INVALID_NODE_TYPE", "Node type is required and must be a string.", str(node_path), node_type, "type", null, "Use a valid Godot node type such as Node2D, Sprite2D, Control, or Node3D.")
+        elif options["validateNodeTypes"]:
+            dry_run_validate_node_type(node_type, str(node_path), issues)
+
+        if dry_run_has_unsupported_children(node_data):
+            dry_run_add_issue(issues, "error", "NESTED_CHILDREN_UNSUPPORTED", "Nested children are not supported by dry_run_scene_blueprint yet; use the flat nodes array.", str(node_path), node_type, "children", null, "Move child definitions into blueprint.nodes with parentPath values.")
+
+        var spec = {
+            "path": str(node_path),
+            "parentPath": str(parent_path),
+            "type": node_type,
+            "name": node_name,
+            "asset": dry_run_get_value(node_data, ["asset"], null),
+            "assetProperty": dry_run_get_value(node_data, ["assetProperty", "asset_property"], null),
+            "assetType": null,
+            "properties": dry_run_get_value(node_data, ["properties"], null)
+        }
+
+        if spec["asset"] != null:
+            dry_run_validate_asset_for_spec(spec, options, issues)
+
+        spec["properties"] = dry_run_validate_properties_for_spec(spec, options, issues)
+        node_specs.append(spec)
+        parent_by_path[spec["path"]] = spec["parentPath"]
+
+    root_spec["properties"] = dry_run_validate_properties_for_spec(root_spec, options, issues)
+
+    if options["validateHierarchy"]:
+        for spec in node_specs:
+            if not path_set.has(spec["parentPath"]):
+                dry_run_add_issue(issues, "error", "MISSING_PARENT", "parentPath does not exist in the blueprint.", spec["path"], spec["type"], "parentPath", null, "Add the parent node or change parentPath to an existing path.")
+
+        var visiting = {}
+        var visited = {}
+        for spec in node_specs:
+            if dry_run_detect_cycle(spec["path"], parent_by_path, visiting, visited):
+                dry_run_add_issue(issues, "error", "HIERARCHY_CYCLE", "Hierarchy contains a parent cycle.", spec["path"], spec["type"], "parentPath", null, "Make parent paths form a tree rooted at " + root_path + ".")
+                break
+
+    var target_exists = FileAccess.file_exists(scene_path)
+    if target_exists and not allow_overwrite:
+        dry_run_add_issue(issues, "error", "TARGET_SCENE_EXISTS", "Target scene already exists and allowOverwrite is false.", root_path, root_type, null, null, "Set allowOverwrite to true only when replacing the scene is intended.")
+    elif target_exists and allow_overwrite:
+        dry_run_add_issue(issues, "warning", "TARGET_SCENE_WOULD_BE_OVERWRITTEN", "Target scene already exists and would be overwritten by a future write tool.", root_path, root_type, null, null, "Review the existing scene before applying a write operation.")
+
+    var plan = []
+    if include_plan:
+        dry_run_add_plan_actions(plan, root_spec, node_specs)
+
+    var result = dry_run_finish_result(project_path, scene_path, root_spec, node_specs, issues, limits, include_plan, plan, target_exists)
+    print(JSON.stringify(result))
 
 func get_asset_type_from_extension(extension):
     if [".png", ".jpg", ".jpeg", ".webp", ".svg", ".tga", ".bmp"].has(extension):

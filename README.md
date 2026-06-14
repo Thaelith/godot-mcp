@@ -74,6 +74,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 - **Scene Inspection**:
   - Read existing scene trees into structured, read-only JSON before making changes
   - Validate scenes read-only and return structured issues before AI-assisted edits
+  - Dry-run proposed scene blueprints and return validation issues plus a creation plan without writing files
 - **Scene Management**:
   - Create new scenes with specified root node types
   - Add nodes to existing scenes with customizable properties
@@ -133,6 +134,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "get_asset_info",
         "read_scene_tree",
         "validate_scene",
+        "dry_run_scene_blueprint",
         "create_scene",
         "add_node",
         "load_sprite",
@@ -579,6 +581,131 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Then call `validate_scene` from the inspector with a local Godot project path and an existing scene file.
+
+### `dry_run_scene_blueprint`
+
+Validates and simulates a proposed scene blueprint without writing, saving, importing, reimporting, or modifying any project files. This is a read-only planning tool for checking whether a later `create_scene_from_blueprint` operation would be safe and likely buildable; it does not create the scene.
+
+Input example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "allowOverwrite": false,
+  "validateAssets": true,
+  "validateNodeTypes": true,
+  "validateProperties": true,
+  "validateHierarchy": true,
+  "includePlan": true,
+  "maxNodes": 250,
+  "blueprint": {
+    "root": {
+      "type": "Node2D",
+      "name": "Room",
+      "properties": {
+        "position": [0, 0]
+      }
+    },
+    "nodes": [
+      {
+        "path": "Room/Floor",
+        "parentPath": "Room",
+        "type": "Sprite2D",
+        "name": "Floor",
+        "asset": "res://assets/rooms/floor.png",
+        "assetProperty": "texture",
+        "properties": {
+          "position": [0, 0],
+          "scale": [1, 1],
+          "z_index": 0
+        }
+      }
+    ]
+  }
+}
+```
+
+Supported blueprint fields:
+
+- `root.type` is required; `root.name` defaults to the target scene filename when omitted.
+- `root.properties` and node `properties` support common safe fields such as `position`, `scale`, `rotation`, `rotation_degrees`, `z_index`, `visible`, `size`, `text`, `disabled`, `enabled`, `centered`, `flip_h`, and `flip_v`.
+- `nodes` is an optional flat array. Each node needs `type`, `name`, and either `parentPath` or `path`.
+- If `path` is omitted, it is derived from `parentPath/name`. If `parentPath` is omitted, it is inferred from `path`.
+- `asset` is optional. If `assetProperty` is omitted, the dry run infers common assignments such as `texture`, `stream`, `instance`, or `mesh`.
+- Nested `children` are not supported yet; use the flat `nodes` array.
+
+`scenePath` can be written as `res://scenes/Room.tscn` or `scenes/Room.tscn`. It must stay inside the Godot project and must end in `.tscn` or `.scn`. If the target scene already exists, `allowOverwrite: false` returns a `TARGET_SCENE_EXISTS` error issue. With `allowOverwrite: true`, the tool reports `TARGET_SCENE_WOULD_BE_OVERWRITTEN` as a warning, but still does not write anything.
+
+`maxNodes` counts the root plus all blueprint nodes. It defaults to `250`; values below `1` return a validation error, and values above `2000` are clamped to `2000`.
+
+Issue severities mean:
+
+- `error`: blueprint should not be applied
+- `warning`: blueprint may apply but likely has problems
+- `info`: useful note, not a problem
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "wouldCreate": true,
+  "wouldOverwrite": false,
+  "valid": true,
+  "severity": "ok",
+  "summary": {
+    "totalNodes": 2,
+    "rootType": "Node2D",
+    "nodeTypes": {
+      "Node2D": 1,
+      "Sprite2D": 1
+    },
+    "assetReferenceCount": 1,
+    "errorCount": 0,
+    "warningCount": 0,
+    "infoCount": 0
+  },
+  "issues": [],
+  "plan": [
+    {
+      "action": "create_root",
+      "path": "Room",
+      "type": "Node2D",
+      "name": "Room"
+    },
+    {
+      "action": "add_node",
+      "path": "Room/Floor",
+      "parentPath": "Room",
+      "type": "Sprite2D",
+      "name": "Floor"
+    },
+    {
+      "action": "assign_asset",
+      "path": "Room/Floor",
+      "asset": "res://assets/rooms/floor.png",
+      "assetProperty": "texture"
+    }
+  ],
+  "limits": {
+    "maxNodesRequested": 250,
+    "maxNodesApplied": 250,
+    "maxNodesClamped": false
+  }
+}
+```
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Then call `dry_run_scene_blueprint` from the inspector with a local Godot project path, a target scene path, and a simple blueprint. Confirm the target scene file is not created.
 
 ## Troubleshooting
 
