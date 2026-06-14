@@ -2808,76 +2808,121 @@ func place_asset_write_error(error_code, message, issues=[]):
         "issues": issues
     }
 
-# A resource path proves provenance only when it is a standalone res:// asset.
-# Embedded sub-resources ("res://scene.tscn::Id") and runtime resources ("")
-# carry no provenance, so for those presence of the resource is the check.
-func place_asset_resource_matches(resource, asset_path):
+# Reports how a resource assignment was verified. A standalone res:// path proves
+# provenance and is matched exactly. Embedded sub-resources ("res://scene.tscn::Id")
+# and runtime resources ("") carry no provenance, so presence is the check.
+# Returns {assigned, check, message, warning}.
+func place_asset_resource_assignment(resource, asset_path):
     if resource == null:
-        return false
+        return {"assigned": false, "check": "missing", "message": "No resource was assigned to the node.", "warning": null}
     var path = resource.resource_path
     if path.begins_with("res://") and not path.contains("::"):
-        return path == asset_path
-    return true
+        if path == asset_path:
+            return {"assigned": true, "check": "standalone_resource_path_match", "message": "Resource path matched the requested asset.", "warning": null}
+        return {"assigned": false, "check": "standalone_resource_path_match", "message": "Assigned resource path '" + path + "' did not match the requested asset.", "warning": null}
+    return {"assigned": true, "check": "embedded_or_runtime_resource_presence", "message": "Assigned resource is embedded or runtime; validated by presence.", "warning": "POST_VALIDATION_PRESENCE_ONLY"}
 
+# Verifies the asset assignment on the saved node.
+# Returns {assigned, check, message, warning, failHard}. failHard marks an
+# assignment whose absence is a hard post-validation failure; soft cases (font
+# limitations, instance provenance) report assigned/warning without hard failing.
 func place_asset_check_assignment(node, asset_path, asset_property, asset_type):
     if asset_type == "texture":
         if (node is Sprite2D or node is TextureRect) and node.texture != null:
-            return place_asset_resource_matches(node.texture, asset_path)
-        return false
+            var r = place_asset_resource_assignment(node.texture, asset_path)
+            r["failHard"] = true
+            return r
+        return {"assigned": false, "check": "missing", "message": "Texture node has no texture assigned.", "warning": null, "failHard": true}
     if asset_type == "audio":
         if (node is AudioStreamPlayer or node is AudioStreamPlayer2D or node is AudioStreamPlayer3D) and node.stream != null:
-            return place_asset_resource_matches(node.stream, asset_path)
-        return false
+            var r = place_asset_resource_assignment(node.stream, asset_path)
+            r["failHard"] = true
+            return r
+        return {"assigned": false, "check": "missing", "message": "Audio node has no stream assigned.", "warning": null, "failHard": true}
     if asset_type == "model":
         if asset_property == "mesh":
-            return node is MeshInstance3D and node.mesh != null
-        # instance assignment: node existence is the provenance check
-        return true
+            if node is MeshInstance3D and node.mesh != null:
+                var r = place_asset_resource_assignment(node.mesh, asset_path)
+                r["failHard"] = true
+                return r
+            return {"assigned": false, "check": "missing", "message": "MeshInstance3D has no mesh assigned.", "warning": null, "failHard": true}
+        return {"assigned": true, "check": "model_instance_node_exists", "message": "Model instance validated by node existence.", "warning": "ASSIGNMENT_PROVENANCE_LIMITED", "failHard": false}
     if asset_type == "scene":
-        # instance assignment: node existence is the provenance check
-        return true
+        return {"assigned": true, "check": "scene_instance_node_exists", "message": "Scene instance validated by node existence.", "warning": "ASSIGNMENT_PROVENANCE_LIMITED", "failHard": false}
     if asset_type == "font":
-        if node is Label:
-            return node.has_theme_font_override("font") or true
-        return true
+        if node is Label and node.has_theme_font_override("font"):
+            var font_res = node.get_theme_font("font")
+            var font_path = font_res.resource_path if font_res != null else ""
+            if font_path.begins_with("res://") and not font_path.contains("::") and font_path == asset_path:
+                return {"assigned": true, "check": "font_override_present", "message": "Label font override matched the requested asset.", "warning": null, "failHard": true}
+            return {"assigned": true, "check": "font_override_present", "message": "Label font override is present (provenance unverified).", "warning": "ASSIGNMENT_PROVENANCE_LIMITED", "failHard": true}
+        return {"assigned": false, "check": "skipped", "message": "Label font override was not applied; font assignment is limited in this environment.", "warning": "FONT_ASSIGNMENT_LIMITED", "failHard": false}
     if asset_type == "resource":
         if asset_property != null and create_scene_blueprint_node_has_property(node, asset_property):
-            return node.get(asset_property) != null
-        return true
-    return true
+            var val = node.get(asset_property)
+            if val == null:
+                return {"assigned": false, "check": "missing", "message": "Resource property '" + str(asset_property) + "' is null after assignment.", "warning": null, "failHard": true}
+            if val is Resource:
+                var r = place_asset_resource_assignment(val, asset_path)
+                r["failHard"] = true
+                return r
+            return {"assigned": true, "check": "embedded_or_runtime_resource_presence", "message": "Resource property is set to a non-resource value; validated by presence.", "warning": "POST_VALIDATION_PRESENCE_ONLY", "failHard": false}
+        return {"assigned": true, "check": "skipped", "message": "Resource assignment was skipped; no explicit assetProperty applied.", "warning": "ASSIGNMENT_PROVENANCE_LIMITED", "failHard": false}
+    return {"assigned": true, "check": "skipped", "message": "No assignment check applies to this asset type.", "warning": null, "failHard": false}
 
+# Verifies the planned local position on the saved node. Returns {matches, message}.
+# Unsupported node/dimension combinations fail rather than silently passing.
 func place_asset_check_position(node, expected_position):
     if expected_position == null:
-        return true
+        return {"matches": true, "message": "No position was planned."}
     var eps = 0.001
-    if node is Node3D and expected_position.size() == 3:
-        var p3 = node.position
-        return abs(p3.x - expected_position[0]) <= eps and abs(p3.y - expected_position[1]) <= eps and abs(p3.z - expected_position[2]) <= eps
-    if node is Node2D and expected_position.size() == 2:
-        var p2 = node.position
-        return abs(p2.x - expected_position[0]) <= eps and abs(p2.y - expected_position[1]) <= eps
-    if node is Control and expected_position.size() == 2:
-        var pc = node.position
-        return abs(pc.x - expected_position[0]) <= eps and abs(pc.y - expected_position[1]) <= eps
-    return true
+    if expected_position.size() == 3:
+        if node is Node3D:
+            var p3 = node.position
+            if abs(p3.x - expected_position[0]) <= eps and abs(p3.y - expected_position[1]) <= eps and abs(p3.z - expected_position[2]) <= eps:
+                return {"matches": true, "message": "Position matched within epsilon."}
+            return {"matches": false, "message": "Node3D position did not match the planned position."}
+        return {"matches": false, "message": "A 3D position was planned but the node is not a Node3D."}
+    if expected_position.size() == 2:
+        if node is Node2D or node is Control:
+            var p2 = node.position
+            if abs(p2.x - expected_position[0]) <= eps and abs(p2.y - expected_position[1]) <= eps:
+                return {"matches": true, "message": "Position matched within epsilon."}
+            return {"matches": false, "message": "Position did not match the planned position."}
+        return {"matches": false, "message": "A 2D position was planned but the node is not a Node2D or Control."}
+    return {"matches": false, "message": "Planned position has an unsupported dimension."}
+
+func place_asset_empty_post_validation():
+    return {
+        "loadable": null,
+        "instantiable": null,
+        "nodeExists": null,
+        "assetAssigned": null,
+        "positionMatches": null,
+        "details": {
+            "assignmentCheck": null,
+            "assignmentMessage": null,
+            "positionMessage": null
+        }
+    }
 
 func place_asset_post_validate(scene_path, new_node_path, asset_path, asset_property, asset_type, expected_position):
-    var post = {
-        "loadable": false,
-        "instantiable": false,
-        "nodeExists": false,
-        "assetAssigned": false,
-        "positionMatches": false
-    }
+    var post = place_asset_empty_post_validation()
+    post["loadable"] = false
+    post["instantiable"] = false
+    post["nodeExists"] = false
+    post["assetAssigned"] = false
+    post["positionMatches"] = false
+    var warnings = []
 
     var scene_resource = ResourceLoader.load(scene_path, "", ResourceLoader.CACHE_MODE_IGNORE)
     if scene_resource == null or not (scene_resource is PackedScene):
-        return {"success": false, "message": "Saved scene could not be loaded as a PackedScene.", "postValidation": post}
+        return {"success": false, "message": "Saved scene could not be loaded as a PackedScene.", "postValidation": post, "warnings": warnings}
     post["loadable"] = true
 
     var root = scene_resource.instantiate()
     if root == null:
-        return {"success": false, "message": "Saved scene could not be instantiated.", "postValidation": post}
+        return {"success": false, "message": "Saved scene could not be instantiated.", "postValidation": post, "warnings": warnings}
     post["instantiable"] = true
 
     var rel = new_node_path
@@ -2887,16 +2932,28 @@ func place_asset_post_validate(scene_path, new_node_path, asset_path, asset_prop
     var node = root.get_node_or_null(NodePath(rel))
     if node == null:
         root.free()
-        return {"success": false, "message": "New node was not found in the saved scene.", "postValidation": post}
+        return {"success": false, "message": "New node was not found in the saved scene.", "postValidation": post, "warnings": warnings}
     post["nodeExists"] = true
 
-    post["assetAssigned"] = place_asset_check_assignment(node, asset_path, asset_property, asset_type)
-    post["positionMatches"] = place_asset_check_position(node, expected_position)
+    var assignment = place_asset_check_assignment(node, asset_path, asset_property, asset_type)
+    var position = place_asset_check_position(node, expected_position)
     root.free()
 
-    if not post["assetAssigned"] or not post["positionMatches"]:
-        return {"success": false, "message": "Post-validation failed for the placed asset.", "postValidation": post}
-    return {"success": true, "message": "", "postValidation": post}
+    post["assetAssigned"] = assignment["assigned"]
+    post["positionMatches"] = position["matches"]
+    post["details"]["assignmentCheck"] = assignment["check"]
+    post["details"]["assignmentMessage"] = assignment["message"]
+    post["details"]["positionMessage"] = position["message"]
+
+    if assignment.has("warning") and assignment["warning"] != null:
+        warnings.append({"code": assignment["warning"], "message": assignment["message"]})
+
+    var assignment_failed = (not assignment["assigned"]) and assignment.get("failHard", true)
+    if assignment_failed:
+        return {"success": false, "message": assignment["message"], "postValidation": post, "warnings": warnings}
+    if not position["matches"]:
+        return {"success": false, "message": position["message"], "postValidation": post, "warnings": warnings}
+    return {"success": true, "message": "", "postValidation": post, "warnings": warnings}
 
 func place_asset_in_scene(params):
     var validate_before_write = params.validate_before_write if params.has("validate_before_write") else true
@@ -2996,13 +3053,7 @@ func place_asset_in_scene(params):
         bytes_written = file.get_length()
         file.close()
 
-    var post_validation = {
-        "loadable": null,
-        "instantiable": null,
-        "nodeExists": null,
-        "assetAssigned": null,
-        "positionMatches": null
-    }
+    var post_validation = place_asset_empty_post_validation()
     if validate_after_write:
         var expected_position = planned["properties"]["position"] if planned["properties"].has("position") else null
         var post_result = place_asset_post_validate(planned["scene_path"], planned["proposed_path"], planned["asset_path"], planned["asset_property"], planned["asset_type"], expected_position)
@@ -3013,6 +3064,9 @@ func place_asset_in_scene(params):
             post_error["postValidation"] = post_validation
             print(JSON.stringify(post_error))
             return
+        # Surface non-fatal provenance/font limitations as warnings rather than hiding them.
+        for w in post_result["warnings"]:
+            place_asset_add_issue(issues, "warning", w["code"], w["message"], planned["proposed_path"], planned["asset_path"], "assetProperty", "Asset was placed but exact assignment provenance could not be fully verified.")
 
     scene_root.free()
 

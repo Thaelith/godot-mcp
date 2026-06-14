@@ -1179,7 +1179,14 @@ Output example:
     "properties": { "position": [128, 64] }
   },
   "write": { "saved": true, "resourceSaverCode": 0, "bytesWritten": 1234 },
-  "postValidation": { "loadable": true, "instantiable": true, "nodeExists": true, "assetAssigned": true, "positionMatches": true },
+  "postValidation": {
+    "loadable": true, "instantiable": true, "nodeExists": true, "assetAssigned": true, "positionMatches": true,
+    "details": {
+      "assignmentCheck": "standalone_resource_path_match",
+      "assignmentMessage": "Resource path matched the requested asset.",
+      "positionMessage": "Position matched within epsilon."
+    }
+  },
   "layoutBefore": null,
   "layoutAfter": null,
   "limits": { "maxDepthRequested": null, "maxDepthApplied": 100, "maxDepthClamped": false }
@@ -1196,7 +1203,14 @@ Output example:
 
 **Safe property allowlist:** `position`, `scale`, `rotation`, `rotation_degrees`, `z_index`, `visible`, `size`, `text`, `disabled`, `enabled`, `centered`, `flip_h`, `flip_v`, `offset`, `zoom`, `volume_db`, `autoplay`. Unknown or unsupported properties are skipped with `UNKNOWN_PROPERTY_SKIPPED` (placement is not failed). `script`, `owner`, groups, signals, and metadata are never written.
 
-**`validateBeforeWrite`** (default `true`): runs the planner and aborts with `DRY_RUN_VALIDATION_FAILED` before saving if the plan has any error issue. **`validateAfterWrite`** (default `true`): reloads the saved scene and verifies it loads as a `PackedScene`, instantiates, the new node exists, the asset assignment is present (matching `assetPath` when standalone provenance exists), and the planned position matches within an epsilon of `0.001`; failure returns `POST_VALIDATE_FAILED`.
+**`validateBeforeWrite`** (default `true`): runs the planner and aborts with `DRY_RUN_VALIDATION_FAILED` before saving if the plan has any error issue.
+
+**`validateAfterWrite`** (default `true`): reloads the saved scene with cache ignored and verifies five things — it loads as a `PackedScene`, it instantiates, the new node exists, the asset assignment is present, and the planned position matches within an epsilon of `0.001`. Failure returns `POST_VALIDATE_FAILED`. The result includes a `postValidation.details` object describing exactly how the assignment and position were checked:
+
+- `assignmentCheck` is one of `standalone_resource_path_match` (a standalone `res://` resource whose path must equal `assetPath` exactly), `embedded_or_runtime_resource_presence` (an embedded sub-resource like `scene.tscn::Id` or a runtime resource with no standalone path — validated by presence), `scene_instance_node_exists` / `model_instance_node_exists` (instances validated by node existence when exact asset provenance is unavailable), `font_override_present` (a real `Label` font override exists), `skipped`, or `missing`.
+- When provenance cannot be fully verified the placement still succeeds but a non-fatal warning issue is added: `POST_VALIDATION_PRESENCE_ONLY` (embedded/runtime resource), `ASSIGNMENT_PROVENANCE_LIMITED` (instance / unverified font provenance), or `FONT_ASSIGNMENT_LIMITED` (a `Label` font override could not be applied in this environment). These remain warnings; a write only fails when an assignment that must exist is actually absent or a standalone path mismatches.
+- Font assignment validation requires an actual `Label.has_theme_font_override("font")` — it never reports `assetAssigned: true` without a real override.
+- Position validation only passes for supported node/dimension pairs: a 2-component position requires a `Node2D` or `Control`; a 3-component position requires a `Node3D`. Unsupported combinations report `assetAssigned`/`positionMatches` honestly and fail instead of silently passing. When no position was planned, `positionMatches` is `true` with an explanatory `positionMessage`.
 
 **Current limitations:** no live editor plugin, no arbitrary script attachment, no arbitrary property editing, no signal/group/metadata support, `.gd`/`.json`/`.cfg` are not placeable, custom script node classes are not supported, and only one node is added per call. Instanced scenes/models verify provenance by node existence only.
 
