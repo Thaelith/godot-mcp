@@ -27,6 +27,7 @@ const expectedTools = [
   'get_asset_info',
   'read_scene_tree',
   'get_scene_layout',
+  'capture_scene_preview',
   'validate_scene',
   'dry_run_place_asset_in_scene',
   'place_asset_in_scene',
@@ -128,6 +129,12 @@ function assertOnlyAllowedDiff(diff, allowed, label) {
   const isAllowed = (filePath) => allowed.some((prefix) => filePath === prefix || filePath.startsWith(`${prefix}/`));
   const unexpected = [...diff.added, ...diff.removed, ...diff.changed].filter((filePath) => !isAllowed(filePath));
   assert.deepEqual(unexpected, [], `${label} touched unexpected files: ${JSON.stringify({ diff, unexpected }, null, 2)}`);
+}
+
+function godotResourceToFilePath(projectRoot, resourcePath) {
+  assert.equal(typeof resourcePath, 'string', 'resource path should be a string');
+  assert.ok(resourcePath.startsWith('res://'), `expected res:// path, got ${resourcePath}`);
+  return path.join(projectRoot, resourcePath.slice('res://'.length).replace(/\//g, path.sep));
 }
 
 function writeFixtureProject(projectRoot) {
@@ -410,6 +417,14 @@ async function runAlwaysSmoke({ godotPathForServer }) {
       'UNSAFE_SCENE_PATH'
     );
     logPass('inspect_scene_edit_context unsafe scenePath');
+
+    await expectStructuredError(
+      client,
+      'capture_scene_preview',
+      { projectPath: process.cwd(), scenePath: '../outside.tscn' },
+      'UNSAFE_SCENE_PATH'
+    );
+    logPass('capture_scene_preview unsafe scenePath');
   } finally {
     await client.close();
   }
@@ -471,6 +486,25 @@ async function runIntegrationSmoke({ godotPath }) {
     assert.equal(validation.parsed?.success, true);
     assert.ok(validation.parsed?.summary);
     logPass('validate_scene');
+
+    const previewBefore = snapshotProjectFiles(projectRoot);
+    const preview = await client.callTool('capture_scene_preview', {
+      projectPath: projectRoot,
+      scenePath: 'scenes/Main.tscn',
+      fileName: 'main_smoke_preview',
+      width: 320,
+      height: 180,
+      includeMetadata: true,
+      maxWaitFrames: 2,
+    });
+    assert.equal(preview.parsed?.success, true, JSON.stringify(preview.parsed, null, 2));
+    assert.ok(preview.parsed?.previewPath);
+    assert.ok(existsSync(godotResourceToFilePath(projectRoot, preview.parsed.previewPath)), 'preview PNG should exist');
+    assert.ok(preview.parsed?.metadataPath);
+    assert.ok(existsSync(godotResourceToFilePath(projectRoot, preview.parsed.metadataPath)), 'preview metadata JSON should exist');
+    assert.equal(sha256File(scenePath), originalSceneHash, 'capture_scene_preview should not modify the scene file');
+    assertOnlyAllowedDiff(diffSnapshots(previewBefore, snapshotProjectFiles(projectRoot)), ['.godot_mcp/previews'], 'capture_scene_preview');
+    logPass('capture_scene_preview');
 
     const beforeCheckpointSnapshot = snapshotProjectFiles(projectRoot);
     const checkpoint = await client.callTool('create_scene_checkpoint', {

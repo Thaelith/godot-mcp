@@ -26,6 +26,11 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Install preview runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
       - name: Install Godot
         env:
           GODOT_VERSION: 4.6.2
@@ -44,4 +49,4 @@ jobs:
           echo "GODOT_PATH=${GODOT_BIN}" >> "${GITHUB_ENV}"
 
       - name: Full smoke tests
-        run: npm run smoke
+        run: xvfb-run -a npm run smoke

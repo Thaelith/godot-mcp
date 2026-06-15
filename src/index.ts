@@ -159,6 +159,8 @@ class GodotServer {
     'validate_after_restore': 'validateAfterRestore',
     'sort_order': 'sortOrder',
     'output_path': 'outputPath',
+    'output_dir': 'outputDir',
+    'file_name': 'fileName',
     'mesh_item_names': 'meshItemNames',
     'new_path': 'newPath',
     'file_path': 'filePath',
@@ -169,6 +171,7 @@ class GodotServer {
     'exclude_dirs': 'excludeDirs',
     'max_results': 'maxResults',
     'max_depth': 'maxDepth',
+    'max_wait_frames': 'maxWaitFrames',
     'include_properties': 'includeProperties',
     'include_scripts': 'includeScripts',
     'include_groups': 'includeGroups',
@@ -679,6 +682,31 @@ class GodotServer {
   }
 
   /**
+   * Create a capture_scene_preview-specific JSON error response while preserving MCP text content style.
+   */
+  private captureScenePreviewErrorResponse(error: string, message: string): any {
+    console.error(`[SERVER] capture_scene_preview error response: ${error}: ${message}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error,
+              message,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  /**
    * Create a dry_run_scene_patch-specific JSON error response while preserving MCP text content style.
    */
   private createDryRunScenePatchErrorResponse(error: string, message: string): any {
@@ -1011,6 +1039,122 @@ class GodotServer {
 
   private checkpointResourcePath(relativePath: string): string {
     return `res://${relativePath.replace(/\\/g, '/')}`;
+  }
+
+  /**
+   * Sanitize an optional preview filename into a safe PNG basename.
+   */
+  private sanitizePreviewFileName(fileName: unknown, sceneRelativePath: string): { baseName: string; error?: string } {
+    if (fileName === undefined || fileName === null) {
+      return {
+        baseName: `${this.sceneCheckpointId(sceneRelativePath)}_${this.checkpointTimestamp()}`,
+      };
+    }
+
+    if (typeof fileName !== 'string') {
+      return { baseName: '', error: 'fileName must be a string when provided.' };
+    }
+
+    if (fileName.includes('\0')) {
+      return { baseName: '', error: 'fileName must not contain null bytes.' };
+    }
+
+    const trimmed = fileName.trim().replace(/\.(png|json)$/i, '');
+    if (!trimmed) {
+      return { baseName: '', error: 'fileName must not be empty when provided.' };
+    }
+
+    const sanitized = trimmed
+      .toLowerCase()
+      .replace(/[^a-z0-9 _-]/g, '_')
+      .replace(/[\s-]+/g, '_')
+      .replace(/_+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 96);
+
+    if (!sanitized) {
+      return { baseName: '', error: 'fileName must contain at least one safe filename character.' };
+    }
+
+    return { baseName: sanitized };
+  }
+
+  /**
+   * Convert a preview output directory such as res://.godot_mcp/previews
+   * into a safe project-relative directory.
+   */
+  private normalizePreviewOutputDir(outputDir: unknown): { relativePath: string; resourcePath: string; error?: string } {
+    if (outputDir !== undefined && outputDir !== null && typeof outputDir !== 'string') {
+      return { relativePath: '', resourcePath: '', error: 'outputDir must be a string when provided.' };
+    }
+
+    const rawOutputDir = outputDir === undefined || outputDir === null
+      ? 'res://.godot_mcp/previews'
+      : outputDir.trim();
+
+    if (!rawOutputDir) {
+      return { relativePath: '', resourcePath: '', error: 'outputDir must not be empty.' };
+    }
+
+    const normalized = this.normalizeScanRoot(rawOutputDir);
+    if (normalized.error) {
+      return { relativePath: '', resourcePath: '', error: normalized.error.replace(/root path/g, 'outputDir') };
+    }
+
+    const relativePath = normalized.relativeRoot;
+    if (!relativePath) {
+      return { relativePath: '', resourcePath: '', error: 'outputDir must point to a project-local folder, not the project root.' };
+    }
+
+    const parts = relativePath.replace(/\\/g, '/').split('/').filter(Boolean);
+    const blockedParts = new Set(['.git', '.godot', 'node_modules']);
+    if (parts.some(part => blockedParts.has(part.toLowerCase()))) {
+      return { relativePath: '', resourcePath: '', error: 'outputDir must not point to .git, .godot, or node_modules.' };
+    }
+
+    return {
+      relativePath,
+      resourcePath: `res://${relativePath}`,
+    };
+  }
+
+  /**
+   * Reject symlink or non-directory ancestors before creating a preview directory.
+   */
+  private validatePreviewOutputAncestors(projectRoot: string, outputDirRelativePath: string): { error?: string; message?: string } {
+    const parts = outputDirRelativePath.replace(/\\/g, '/').split('/').filter(Boolean);
+    let currentPath = projectRoot;
+
+    for (const part of parts) {
+      currentPath = resolve(currentPath, part);
+      if (!this.isPathInside(projectRoot, currentPath)) {
+        return {
+          error: 'UNSAFE_OUTPUT_DIR',
+          message: 'outputDir must stay inside the Godot project directory.',
+        };
+      }
+
+      if (!existsSync(currentPath)) {
+        continue;
+      }
+
+      const stats = lstatSync(currentPath);
+      if (stats.isSymbolicLink()) {
+        return {
+          error: 'OUTPUT_DIR_IS_SYMLINK',
+          message: 'outputDir and its existing parent directories must not be symbolic links.',
+        };
+      }
+
+      if (!stats.isDirectory()) {
+        return {
+          error: 'UNSAFE_OUTPUT_DIR',
+          message: 'outputDir and its existing parent paths must be directories.',
+        };
+      }
+    }
+
+    return {};
   }
 
   private createCheckpointPaths(
@@ -3018,7 +3162,7 @@ class GodotServer {
       // Build argument array for execFile to prevent command injection
       // Using execFile with argument arrays avoids shell interpretation entirely
       const args = [
-        '--headless',
+        ...(operation === 'capture_scene_preview' ? ['--rendering-driver', 'opengl3'] : ['--headless']),
         '--path',
         projectPath,  // Safe: passed as argument, not interpolated into shell command
         '--script',
@@ -3362,6 +3506,56 @@ class GodotServer {
               assetRoot: {
                 type: 'string',
                 description: 'Optional Godot project-relative asset folder such as res://assets or assets',
+              },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'capture_scene_preview',
+          description: 'Render a read-only preview PNG for a Godot scene and return the preview path plus metadata',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Absolute path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Existing Godot scene path such as res://scenes/Main.tscn or scenes/Main.tscn',
+              },
+              outputDir: {
+                type: 'string',
+                description: 'Project-relative output folder for previews (default: res://.godot_mcp/previews)',
+              },
+              fileName: {
+                type: 'string',
+                description: 'Optional preview filename; sanitized and saved as .png',
+              },
+              width: {
+                type: 'number',
+                description: 'Preview width in pixels (default: 1280, min: 64, max: 4096)',
+              },
+              height: {
+                type: 'number',
+                description: 'Preview height in pixels (default: 720, min: 64, max: 4096)',
+              },
+              transparent: {
+                type: 'boolean',
+                description: 'Whether to request a transparent viewport background (default: false)',
+              },
+              includeMetadata: {
+                type: 'boolean',
+                description: 'Whether to write adjacent JSON metadata (default: true)',
+              },
+              overwrite: {
+                type: 'boolean',
+                description: 'Whether to overwrite an existing preview with the same sanitized name (default: false)',
+              },
+              maxWaitFrames: {
+                type: 'number',
+                description: 'Frames to wait before capture (default: 3, min: 1, max: 60)',
               },
             },
             required: ['projectPath', 'scenePath'],
@@ -4447,6 +4641,8 @@ class GodotServer {
           return await this.handleInspectProjectCapabilities(request.params.arguments);
         case 'inspect_scene_edit_context':
           return await this.handleInspectSceneEditContext(request.params.arguments);
+        case 'capture_scene_preview':
+          return await this.handleCaptureScenePreview(request.params.arguments);
         case 'scan_assets':
           return await this.handleScanAssets(request.params.arguments);
         case 'get_asset_info':
@@ -5622,6 +5818,346 @@ class GodotServer {
       return this.inspectSceneEditContextErrorResponse(
         'INSPECT_SCENE_EDIT_CONTEXT_FAILED',
         `Failed to inspect scene edit context: ${error?.message || 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * Handle the capture_scene_preview tool
+   */
+  private async handleCaptureScenePreview(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || typeof args.projectPath !== 'string') {
+      return this.captureScenePreviewErrorResponse(
+        'MISSING_PROJECT_PATH',
+        'projectPath is required and must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    if (!args.scenePath || typeof args.scenePath !== 'string') {
+      return this.captureScenePreviewErrorResponse(
+        'MISSING_SCENE_PATH',
+        'scenePath is required and must be a Godot scene path such as res://scenes/Main.tscn or scenes/Main.tscn.'
+      );
+    }
+
+    if (args.projectPath.includes('\0')) {
+      return this.captureScenePreviewErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must not contain null bytes.'
+      );
+    }
+
+    if (!isAbsolute(args.projectPath)) {
+      return this.captureScenePreviewErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    const scenePathResult = this.normalizeScenePath(args.scenePath);
+    if (scenePathResult.error) {
+      return this.captureScenePreviewErrorResponse(
+        'UNSAFE_SCENE_PATH',
+        scenePathResult.error
+      );
+    }
+
+    const sceneExtension = extname(scenePathResult.relativePath).toLowerCase();
+    if (!['.tscn', '.scn'].includes(sceneExtension)) {
+      return this.captureScenePreviewErrorResponse(
+        'SCENE_PATH_NOT_SCENE_FILE',
+        'scenePath must point to a .tscn or .scn scene file.'
+      );
+    }
+
+    const outputDirResult = this.normalizePreviewOutputDir(args.outputDir);
+    if (outputDirResult.error) {
+      return this.captureScenePreviewErrorResponse(
+        'UNSAFE_OUTPUT_DIR',
+        outputDirResult.error
+      );
+    }
+
+    const fileNameResult = this.sanitizePreviewFileName(args.fileName, scenePathResult.relativePath);
+    if (fileNameResult.error) {
+      return this.captureScenePreviewErrorResponse(
+        'INVALID_FILE_NAME',
+        fileNameResult.error
+      );
+    }
+
+    const booleanOptions = ['transparent', 'includeMetadata', 'overwrite'];
+    for (const option of booleanOptions) {
+      if (args[option] !== undefined && typeof args[option] !== 'boolean') {
+        return this.captureScenePreviewErrorResponse(
+          'CAPTURE_SCENE_PREVIEW_FAILED',
+          `${option} must be a boolean.`
+        );
+      }
+    }
+
+    const widthRequested = args.width !== undefined ? args.width : null;
+    let widthApplied = 1280;
+    let widthClamped = false;
+    if (args.width !== undefined) {
+      if (typeof args.width !== 'number' || !Number.isFinite(args.width) || args.width < 64) {
+        return this.captureScenePreviewErrorResponse(
+          'INVALID_PREVIEW_SIZE',
+          'width must be a number between 64 and 4096.'
+        );
+      }
+
+      if (args.width > 4096) {
+        widthApplied = 4096;
+        widthClamped = true;
+      } else {
+        widthApplied = Math.floor(args.width);
+      }
+    }
+
+    const heightRequested = args.height !== undefined ? args.height : null;
+    let heightApplied = 720;
+    let heightClamped = false;
+    if (args.height !== undefined) {
+      if (typeof args.height !== 'number' || !Number.isFinite(args.height) || args.height < 64) {
+        return this.captureScenePreviewErrorResponse(
+          'INVALID_PREVIEW_SIZE',
+          'height must be a number between 64 and 4096.'
+        );
+      }
+
+      if (args.height > 4096) {
+        heightApplied = 4096;
+        heightClamped = true;
+      } else {
+        heightApplied = Math.floor(args.height);
+      }
+    }
+
+    const maxWaitFramesRequested = args.maxWaitFrames !== undefined ? args.maxWaitFrames : null;
+    let maxWaitFramesApplied = 3;
+    let maxWaitFramesClamped = false;
+    if (args.maxWaitFrames !== undefined) {
+      if (typeof args.maxWaitFrames !== 'number' || !Number.isFinite(args.maxWaitFrames) || args.maxWaitFrames < 1) {
+        return this.captureScenePreviewErrorResponse(
+          'INVALID_MAX_WAIT_FRAMES',
+          'maxWaitFrames must be a number between 1 and 60.'
+        );
+      }
+
+      if (args.maxWaitFrames > 60) {
+        maxWaitFramesApplied = 60;
+        maxWaitFramesClamped = true;
+      } else {
+        maxWaitFramesApplied = Math.floor(args.maxWaitFrames);
+      }
+    }
+
+    const transparent = args.transparent !== undefined ? args.transparent : false;
+    const includeMetadata = args.includeMetadata !== undefined ? args.includeMetadata : true;
+    const overwrite = args.overwrite !== undefined ? args.overwrite : false;
+
+    try {
+      const normalizedProjectPath = resolve(args.projectPath);
+      if (!existsSync(normalizedProjectPath)) {
+        return this.captureScenePreviewErrorResponse(
+          'PROJECT_PATH_NOT_FOUND',
+          `Project path does not exist: ${args.projectPath}`
+        );
+      }
+
+      const projectStats = lstatSync(normalizedProjectPath);
+      if (projectStats.isSymbolicLink()) {
+        return this.captureScenePreviewErrorResponse(
+          'PROJECT_PATH_IS_SYMLINK',
+          'projectPath must not be a symbolic link.'
+        );
+      }
+
+      if (!projectStats.isDirectory()) {
+        return this.captureScenePreviewErrorResponse(
+          'PROJECT_PATH_NOT_DIRECTORY',
+          `Project path is not a directory: ${args.projectPath}`
+        );
+      }
+
+      const projectRoot = realpathSync(normalizedProjectPath);
+      const projectFile = join(projectRoot, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.captureScenePreviewErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          `Not a valid Godot project: ${args.projectPath}. The directory must contain a project.godot file.`
+        );
+      }
+
+      const projectFileStats = lstatSync(projectFile);
+      if (projectFileStats.isSymbolicLink() || !projectFileStats.isFile()) {
+        return this.captureScenePreviewErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          'project.godot must be a regular file and must not be a symbolic link.'
+        );
+      }
+
+      const sceneFilePath = resolve(projectRoot, scenePathResult.relativePath);
+      if (!this.isPathInside(projectRoot, sceneFilePath)) {
+        return this.captureScenePreviewErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must stay inside the Godot project directory.'
+        );
+      }
+
+      if (!existsSync(sceneFilePath)) {
+        return this.captureScenePreviewErrorResponse(
+          'SCENE_PATH_NOT_FOUND',
+          `Scene file does not exist: ${scenePathResult.resourcePath}`
+        );
+      }
+
+      const sceneFileStats = lstatSync(sceneFilePath);
+      if (sceneFileStats.isSymbolicLink()) {
+        return this.captureScenePreviewErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must not be a symbolic link.'
+        );
+      }
+
+      if (!sceneFileStats.isFile()) {
+        return this.captureScenePreviewErrorResponse(
+          'SCENE_PATH_NOT_FOUND',
+          `Scene path is not a file: ${scenePathResult.resourcePath}`
+        );
+      }
+
+      const realSceneFilePath = realpathSync(sceneFilePath);
+      if (!this.isPathInside(projectRoot, realSceneFilePath)) {
+        return this.captureScenePreviewErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must stay inside the Godot project directory.'
+        );
+      }
+
+      const outputDirPath = resolve(projectRoot, outputDirResult.relativePath);
+      if (!this.isPathInside(projectRoot, outputDirPath)) {
+        return this.captureScenePreviewErrorResponse(
+          'UNSAFE_OUTPUT_DIR',
+          'outputDir must stay inside the Godot project directory.'
+        );
+      }
+
+      const ancestorValidation = this.validatePreviewOutputAncestors(projectRoot, outputDirResult.relativePath);
+      if (ancestorValidation.error) {
+        return this.captureScenePreviewErrorResponse(
+          ancestorValidation.error,
+          ancestorValidation.message || 'outputDir is not safe.'
+        );
+      }
+
+      mkdirSync(outputDirPath, { recursive: true });
+
+      const outputDirStats = lstatSync(outputDirPath);
+      if (outputDirStats.isSymbolicLink()) {
+        return this.captureScenePreviewErrorResponse(
+          'OUTPUT_DIR_IS_SYMLINK',
+          'outputDir must not be a symbolic link.'
+        );
+      }
+
+      if (!outputDirStats.isDirectory()) {
+        return this.captureScenePreviewErrorResponse(
+          'UNSAFE_OUTPUT_DIR',
+          'outputDir must be a directory.'
+        );
+      }
+
+      const realOutputDirPath = realpathSync(outputDirPath);
+      if (!this.isPathInside(projectRoot, realOutputDirPath)) {
+        return this.captureScenePreviewErrorResponse(
+          'UNSAFE_OUTPUT_DIR',
+          'Resolved outputDir must stay inside the Godot project directory.'
+        );
+      }
+
+      let previewBaseName = fileNameResult.baseName;
+      let previewRelativePath = `${outputDirResult.relativePath}/${previewBaseName}.png`;
+      let previewFilePath = resolve(projectRoot, previewRelativePath);
+      let metadataRelativePath = `${outputDirResult.relativePath}/${previewBaseName}.json`;
+      let metadataFilePath = resolve(projectRoot, metadataRelativePath);
+
+      if (!overwrite) {
+        let counter = 1;
+        while (existsSync(previewFilePath) || existsSync(metadataFilePath)) {
+          previewBaseName = `${fileNameResult.baseName}_${String(counter).padStart(2, '0')}`;
+          previewRelativePath = `${outputDirResult.relativePath}/${previewBaseName}.png`;
+          previewFilePath = resolve(projectRoot, previewRelativePath);
+          metadataRelativePath = `${outputDirResult.relativePath}/${previewBaseName}.json`;
+          metadataFilePath = resolve(projectRoot, metadataRelativePath);
+          counter += 1;
+        }
+      }
+
+      for (const candidatePath of [previewFilePath, metadataFilePath]) {
+        if (!this.isPathInside(projectRoot, candidatePath) || !this.isPathInside(realOutputDirPath, candidatePath)) {
+          return this.captureScenePreviewErrorResponse(
+            'UNSAFE_OUTPUT_DIR',
+            'Generated preview paths must stay inside outputDir.'
+          );
+        }
+
+        if (existsSync(candidatePath) && lstatSync(candidatePath).isSymbolicLink()) {
+          return this.captureScenePreviewErrorResponse(
+            'OUTPUT_DIR_IS_SYMLINK',
+            'Preview output files must not be symbolic links.'
+          );
+        }
+      }
+
+      const params = {
+        projectPath: projectRoot.replace(/\\/g, '/'),
+        scenePath: scenePathResult.resourcePath,
+        previewPath: `res://${previewRelativePath.replace(/\\/g, '/')}`,
+        metadataPath: includeMetadata ? `res://${metadataRelativePath.replace(/\\/g, '/')}` : null,
+        width: widthApplied,
+        height: heightApplied,
+        widthRequested,
+        heightRequested,
+        widthClamped,
+        heightClamped,
+        transparent,
+        includeMetadata,
+        overwrite,
+        maxWaitFrames: maxWaitFramesApplied,
+        maxWaitFramesRequested,
+        maxWaitFramesClamped,
+      };
+
+      const { stdout, stderr } = await this.executeOperation('capture_scene_preview', params, projectRoot);
+      const parsedResult = this.extractLastJsonObject(stdout);
+
+      if (!parsedResult) {
+        const stderrText = stderr?.trim();
+        return this.captureScenePreviewErrorResponse(
+          'CAPTURE_SCENE_PREVIEW_FAILED',
+          stderrText
+            ? `Godot did not return valid JSON for capture_scene_preview. Stderr: ${stderrText}`
+            : 'Godot did not return valid JSON for capture_scene_preview.'
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(parsedResult, null, 2),
+          },
+        ],
+        ...(parsedResult.success === false ? { isError: true } : {}),
+      };
+    } catch (error: any) {
+      return this.captureScenePreviewErrorResponse(
+        'CAPTURE_SCENE_PREVIEW_FAILED',
+        `Failed to capture scene preview: ${error?.message || 'Unknown error'}`
       );
     }
   }

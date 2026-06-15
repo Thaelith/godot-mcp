@@ -28,7 +28,7 @@ func _init():
     
     var operation = args[operation_index]
     var params_json = args[params_index]
-    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "dry_run_align_nodes" or operation == "align_nodes" or operation == "dry_run_place_asset_in_scene" or operation == "place_asset_in_scene" or operation == "dry_run_update_node_properties" or operation == "update_node_properties" or operation == "dry_run_scene_patch" or operation == "apply_scene_patch" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
+    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "capture_scene_preview" or operation == "dry_run_align_nodes" or operation == "align_nodes" or operation == "dry_run_place_asset_in_scene" or operation == "place_asset_in_scene" or operation == "dry_run_update_node_properties" or operation == "update_node_properties" or operation == "dry_run_scene_patch" or operation == "apply_scene_patch" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
 
     if quiet_output:
         debug_mode = false
@@ -67,6 +67,8 @@ func _init():
             read_scene_tree(params)
         "get_scene_layout":
             get_scene_layout(params)
+        "capture_scene_preview":
+            await capture_scene_preview(params)
         "dry_run_align_nodes":
             dry_run_align_nodes(params)
         "align_nodes":
@@ -917,6 +919,181 @@ func get_scene_layout(params):
 
     print(JSON.stringify(result))
     scene_root.free()
+
+func capture_preview_error(error_code, message, warnings=[]):
+    return {
+        "success": false,
+        "error": error_code,
+        "message": message,
+        "warnings": warnings
+    }
+
+func capture_preview_add_warning(warnings, code, message):
+    warnings.append({
+        "code": code,
+        "message": message
+    })
+
+func capture_preview_timestamp():
+    var datetime = Time.get_datetime_dict_from_system(true)
+    return "%04d-%02d-%02dT%02d:%02d:%02dZ" % [
+        datetime["year"],
+        datetime["month"],
+        datetime["day"],
+        datetime["hour"],
+        datetime["minute"],
+        datetime["second"]
+    ]
+
+func capture_preview_has_camera(node):
+    if node is Camera2D or node is Camera3D:
+        return true
+
+    for child in node.get_children():
+        if capture_preview_has_camera(child):
+            return true
+
+    return false
+
+func capture_preview_file_size(path):
+    var file = FileAccess.open(path, FileAccess.READ)
+    if file == null:
+        return 0
+    var size = file.get_length()
+    file.close()
+    return size
+
+func capture_scene_preview(params):
+    if not params.has("scene_path"):
+        print(JSON.stringify(capture_preview_error("MISSING_SCENE_PATH", "scene_path is required.")))
+        return
+
+    if not params.has("preview_path"):
+        print(JSON.stringify(capture_preview_error("CAPTURE_SCENE_PREVIEW_FAILED", "preview_path is required.")))
+        return
+
+    var scene_path = normalize_resource_scene_path(params.scene_path)
+    var preview_path = normalize_resource_scene_path(params.preview_path)
+    var metadata_path = normalize_resource_scene_path(params.metadata_path) if params.has("metadata_path") and params.metadata_path != null else null
+    var project_path = params.project_path if params.has("project_path") else ProjectSettings.globalize_path("res://")
+    var width = int(params.width) if params.has("width") else 1280
+    var height = int(params.height) if params.has("height") else 720
+    var transparent = params.transparent if params.has("transparent") else false
+    var include_metadata = params.include_metadata if params.has("include_metadata") else true
+    var max_wait_frames = int(params.max_wait_frames) if params.has("max_wait_frames") else 3
+    var max_wait_frames_requested = params.max_wait_frames_requested if params.has("max_wait_frames_requested") else null
+    var max_wait_frames_clamped = params.max_wait_frames_clamped if params.has("max_wait_frames_clamped") else false
+    var width_requested = params.width_requested if params.has("width_requested") else null
+    var height_requested = params.height_requested if params.has("height_requested") else null
+    var width_clamped = params.width_clamped if params.has("width_clamped") else false
+    var height_clamped = params.height_clamped if params.has("height_clamped") else false
+    var warnings = []
+
+    if not FileAccess.file_exists(scene_path):
+        print(JSON.stringify(capture_preview_error("SCENE_PATH_NOT_FOUND", "Scene file does not exist: " + scene_path, warnings)))
+        return
+
+    var scene_resource = ResourceLoader.load(scene_path)
+    if scene_resource == null or not (scene_resource is PackedScene):
+        print(JSON.stringify(capture_preview_error("SCENE_LOAD_FAILED", "Failed to load scene as PackedScene: " + scene_path, warnings)))
+        return
+
+    var scene_root = scene_resource.instantiate()
+    if scene_root == null:
+        print(JSON.stringify(capture_preview_error("SCENE_INSTANTIATE_FAILED", "Failed to instantiate scene: " + scene_path, warnings)))
+        return
+
+    if not capture_preview_has_camera(scene_root):
+        capture_preview_add_warning(warnings, "NO_CAMERA_FOUND", "No Camera2D or Camera3D was found in the scene.")
+        capture_preview_add_warning(warnings, "PREVIEW_MAY_BE_EMPTY", "Preview may be empty or use the default viewport transform.")
+
+    var viewport = SubViewport.new()
+    viewport.size = Vector2i(width, height)
+    viewport.transparent_bg = transparent
+    viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+    viewport.disable_3d = false
+    viewport.gui_disable_input = true
+
+    get_root().add_child(viewport)
+    viewport.add_child(scene_root)
+
+    for _frame_index in range(max_wait_frames):
+        await process_frame
+
+    RenderingServer.force_draw(false)
+    await process_frame
+
+    var texture = viewport.get_texture()
+    if texture == null:
+        viewport.remove_child(scene_root)
+        scene_root.free()
+        viewport.queue_free()
+        print(JSON.stringify(capture_preview_error("VIEWPORT_RENDER_FAILED", "SubViewport did not produce a texture.", warnings)))
+        return
+
+    var image = texture.get_image()
+    if image == null or image.get_width() <= 0 or image.get_height() <= 0:
+        viewport.remove_child(scene_root)
+        scene_root.free()
+        viewport.queue_free()
+        print(JSON.stringify(capture_preview_error("IMAGE_CAPTURE_FAILED", "Failed to capture a preview image from the viewport.", warnings)))
+        return
+
+    var save_result = image.save_png(preview_path)
+    if save_result != OK:
+        viewport.remove_child(scene_root)
+        scene_root.free()
+        viewport.queue_free()
+        print(JSON.stringify(capture_preview_error("PREVIEW_SAVE_FAILED", "Failed to save preview PNG to: " + preview_path, warnings)))
+        return
+
+    var captured_at = capture_preview_timestamp()
+    var metadata_written = false
+    if include_metadata and metadata_path != null:
+        var metadata = {
+            "scenePath": scene_path,
+            "previewPath": preview_path,
+            "capturedAt": captured_at,
+            "width": width,
+            "height": height,
+            "transparent": transparent
+        }
+        var metadata_file = FileAccess.open(metadata_path, FileAccess.WRITE)
+        if metadata_file == null:
+            capture_preview_add_warning(warnings, "METADATA_WRITE_SKIPPED", "Metadata JSON could not be opened for writing.")
+        else:
+            metadata_file.store_string(JSON.stringify(metadata, "  "))
+            metadata_file.close()
+            metadata_written = true
+
+    var result = {
+        "success": true,
+        "projectPath": project_path,
+        "scenePath": scene_path,
+        "previewPath": preview_path,
+        "metadataPath": metadata_path if metadata_written else null,
+        "created": true,
+        "width": width,
+        "height": height,
+        "transparent": transparent,
+        "warnings": warnings,
+        "summary": {
+            "outputSizeBytes": capture_preview_file_size(preview_path),
+            "metadataWritten": metadata_written,
+            "maxWaitFramesRequested": max_wait_frames_requested,
+            "maxWaitFramesApplied": max_wait_frames,
+            "maxWaitFramesClamped": max_wait_frames_clamped,
+            "widthRequested": width_requested,
+            "heightRequested": height_requested,
+            "widthClamped": width_clamped,
+            "heightClamped": height_clamped
+        }
+    }
+
+    print(JSON.stringify(result))
+    viewport.remove_child(scene_root)
+    scene_root.free()
+    viewport.queue_free()
 
 func dry_align_error(error_code, message):
     return {

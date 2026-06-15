@@ -282,13 +282,13 @@ npm run smoke
 
 If Godot is not available, the suite still verifies the server starts, required tools are registered, and TypeScript-side safety errors are returned for invalid project and unsafe scene paths. It prints `Godot not found; skipped integration tests` in that mode. When Godot is found, it runs the full integration flow.
 
-GitHub Actions runs `npm run smoke` on Ubuntu with Node.js 20 without installing Godot, so the standard CI workflow covers the build and no-Godot MCP smoke checks on push and pull requests. A separate optional **Godot Integration** workflow can be run manually from GitHub Actions; it installs pinned Godot 4.6.2 stable, sets `GODOT_PATH`, and runs the full integration smoke suite. Run the same full integration smoke tests locally with Godot installed or `GODOT_PATH` set before changing writer, layout, checkpoint, or patch behavior.
+GitHub Actions runs `npm run smoke` on Ubuntu with Node.js 20 without installing Godot, so the standard CI workflow covers the build and no-Godot MCP smoke checks on push and pull requests. A separate optional **Godot Integration** workflow can be run manually from GitHub Actions; it installs pinned Godot 4.6.2 stable, sets `GODOT_PATH`, runs the full integration smoke suite under `xvfb-run`, and exercises preview capture. Run the same full integration smoke tests locally with Godot installed or `GODOT_PATH` set before changing writer, layout, checkpoint, or patch behavior.
 
 Current coverage includes:
 
 - tool registration for the expanded toolchain
 - `inspect_project_capabilities` and `inspect_scene_edit_context`
-- `scan_assets`, `get_asset_info`, `read_scene_tree`, `get_scene_layout`, and `validate_scene`
+- `scan_assets`, `get_asset_info`, `read_scene_tree`, `get_scene_layout`, `capture_scene_preview`, and `validate_scene`
 - `dry_run_place_asset_in_scene`, `dry_run_align_nodes`, `dry_run_update_node_properties`, and `dry_run_scene_patch`
 - `place_asset_in_scene`, `align_nodes`, `update_node_properties`, and `apply_scene_patch`
 - `create_scene_checkpoint`, `list_scene_checkpoints`, and `restore_scene_checkpoint`
@@ -568,6 +568,60 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Call `inspect_scene_edit_context` with a valid scene. Confirm scene tree, layout, validation, checkpoint, and asset sections return compact data; validation issues do not fail the whole tool; unsafe scene paths and asset roots are rejected; large limits clamp; `res://assets` is used when present; fallback asset summary works when it is absent; and scene/asset/checkpoint files are not modified.
+
+## Scene Preview Capture
+
+### `capture_scene_preview`
+
+Renders a read-only preview PNG for an existing scene and returns the generated preview path plus compact metadata. The tool may write a PNG and optional adjacent JSON metadata file, but it does not save the scene, modify assets, create checkpoints, restore checkpoints, attach scripts, or call writer tools.
+
+Input example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Main.tscn",
+  "outputDir": "res://.godot_mcp/previews",
+  "fileName": "main_after_patch",
+  "width": 1280,
+  "height": 720,
+  "transparent": false,
+  "includeMetadata": true,
+  "overwrite": false,
+  "maxWaitFrames": 3
+}
+```
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Main.tscn",
+  "previewPath": "res://.godot_mcp/previews/main_after_patch.png",
+  "metadataPath": "res://.godot_mcp/previews/main_after_patch.json",
+  "created": true,
+  "width": 1280,
+  "height": 720,
+  "transparent": false,
+  "warnings": [],
+  "summary": {
+    "outputSizeBytes": 12345,
+    "metadataWritten": true,
+    "maxWaitFramesApplied": 3,
+    "maxWaitFramesClamped": false
+  }
+}
+```
+
+**Output location:** `outputDir` defaults to `res://.godot_mcp/previews`. The directory is created after path validation. `fileName` is sanitized; when omitted, the tool uses a timestamped name derived from the scene path. If `overwrite` is false and a preview already exists, a numeric suffix is added.
+
+**Safety model:** project and scene paths must stay inside the Godot project, scenes must be `.tscn` or `.scn`, symlink project/scene/output paths are rejected, and output is limited to the preview PNG plus optional metadata JSON under the validated output directory. `outputDir` cannot point to `.git`, `.godot`, or `node_modules`. `.godot_mcp/` is ignored by the repository so generated previews do not get committed by default.
+
+**Rendering limitations:** the tool uses Godot with an offscreen `SubViewport`. It requires a working rendering backend; on Linux CI the optional Godot Integration workflow runs it through `xvfb-run`. Scenes with an active `Camera2D` or `Camera3D` generally preview more predictably. If no camera is found, the tool still attempts a simple viewport capture and returns `NO_CAMERA_FOUND` / `PREVIEW_MAY_BE_EMPTY` warnings. Some shader, viewport, editor-only, or environment-dependent rendering may differ from the editor.
+
+**Workflow fit:** use `inspect_scene_edit_context` and `get_scene_layout` to understand a scene, use `dry_run_scene_patch` before edits, apply changes with `apply_scene_patch`, then call `capture_scene_preview` and `validate_scene` to inspect the visual result.
 
 ## Asset Catalog
 
