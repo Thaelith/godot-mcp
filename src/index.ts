@@ -169,9 +169,11 @@ class GodotServer {
     'include_children': 'includeChildren',
     'include_warnings': 'includeWarnings',
     'bounds_source': 'boundsSource',
+    'simulate_cumulative': 'simulateCumulative',
     'include_layout_before': 'includeLayoutBefore',
     'include_layout_after': 'includeLayoutAfter',
     'include_validation_before': 'includeValidationBefore',
+    'include_validation_after': 'includeValidationAfter',
     'include_checkpoints': 'includeCheckpoints',
     'include_asset_info': 'includeAssetInfo',
     'include_current_values': 'includeCurrentValues',
@@ -2710,9 +2712,21 @@ class GodotServer {
                 type: 'boolean',
                 description: 'Whether to include compact scene layout before the patch (default: false)',
               },
+              includeLayoutAfter: {
+                type: 'boolean',
+                description: 'Whether to include compact scene layout after the simulated patch (default: false)',
+              },
               includeValidationBefore: {
                 type: 'boolean',
                 description: 'Whether to include validation for the current scene before the patch (default: false)',
+              },
+              includeValidationAfter: {
+                type: 'boolean',
+                description: 'Whether to include validation for the final simulated patch state (default: false)',
+              },
+              simulateCumulative: {
+                type: 'boolean',
+                description: 'Whether to simulate valid patch steps cumulatively in memory (default: true)',
               },
               includeCheckpoints: {
                 type: 'boolean',
@@ -7541,7 +7555,10 @@ class GodotServer {
     const booleanOptions = [
       'includePlan',
       'includeLayoutBefore',
+      'includeLayoutAfter',
       'includeValidationBefore',
+      'includeValidationAfter',
+      'simulateCumulative',
       'includeCheckpoints',
     ];
     for (const option of booleanOptions) {
@@ -7555,7 +7572,10 @@ class GodotServer {
 
     const includePlan = args.includePlan !== undefined ? args.includePlan : true;
     const includeLayoutBefore = args.includeLayoutBefore !== undefined ? args.includeLayoutBefore : false;
+    const includeLayoutAfter = args.includeLayoutAfter !== undefined ? args.includeLayoutAfter : false;
     const includeValidationBefore = args.includeValidationBefore !== undefined ? args.includeValidationBefore : false;
+    const includeValidationAfter = args.includeValidationAfter !== undefined ? args.includeValidationAfter : false;
+    const simulateCumulative = args.simulateCumulative !== undefined ? args.simulateCumulative : true;
     const includeCheckpoints = args.includeCheckpoints !== undefined ? args.includeCheckpoints : true;
 
     try {
@@ -7628,7 +7648,10 @@ class GodotServer {
         steps: args.steps,
         includePlan,
         includeLayoutBefore,
+        includeLayoutAfter,
         includeValidationBefore,
+        includeValidationAfter,
+        simulateCumulative,
         includeCheckpoints,
         maxSteps: maxStepsApplied,
         maxStepsRequested,

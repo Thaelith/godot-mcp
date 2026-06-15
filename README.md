@@ -1637,7 +1637,7 @@ Call `list_scene_checkpoints` in a project with no `.godot_mcp/checkpoints/` dir
 
 ### `dry_run_scene_patch`
 
-Plans a multi-step edit to an existing scene without modifying, saving, creating checkpoints, restoring checkpoints, importing, reimporting, or writing any files. This is a read-only orchestration layer over the existing single-purpose planners.
+Plans a multi-step edit to an existing scene without modifying, saving, creating checkpoints, restoring checkpoints, importing, reimporting, or writing any files. This is a read-only orchestration layer over the existing single-purpose planners. By default, `simulateCumulative` is `true`, so valid placement, alignment, and property-update steps are applied to an in-memory scene tree that later steps can inspect.
 
 Checkpoint plus asset placement example:
 
@@ -1645,6 +1645,7 @@ Checkpoint plus asset placement example:
 {
   "projectPath": "C:/path/to/project",
   "scenePath": "res://scenes/Room.tscn",
+  "simulateCumulative": true,
   "steps": [
     {
       "type": "create_checkpoint",
@@ -1666,7 +1667,67 @@ Checkpoint plus asset placement example:
     }
   ],
   "includePlan": true,
-  "includeCheckpoints": true
+  "includeCheckpoints": true,
+  "includeLayoutAfter": true,
+  "includeValidationAfter": true
+}
+```
+
+Cumulative workflow example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "simulateCumulative": true,
+  "includeLayoutAfter": true,
+  "includeValidationAfter": true,
+  "steps": [
+    {
+      "type": "create_checkpoint",
+      "checkpointName": "before_ai_patch"
+    },
+    {
+      "type": "place_asset",
+      "assetPath": "res://assets/props/chair.png",
+      "parentPath": "Room",
+      "nodeName": "Chair",
+      "placement": {
+        "mode": "position",
+        "position": [100, 200],
+        "space": "global"
+      }
+    },
+    {
+      "type": "align_nodes",
+      "operations": [
+        {
+          "type": "place_relative",
+          "nodePath": "Room/Chair",
+          "referenceNodePath": "Room/Table",
+          "relation": "right_of",
+          "margin": 8
+        }
+      ],
+      "boundsSource": "visual"
+    },
+    {
+      "type": "update_node_properties",
+      "updates": [
+        {
+          "nodePath": "Room/Chair",
+          "properties": {
+            "z_index": 5,
+            "scale": [1.2, 1.2]
+          }
+        }
+      ]
+    },
+    {
+      "type": "validate_scene",
+      "includeInfo": true
+    }
+  ]
 }
 ```
 
@@ -1736,11 +1797,12 @@ Output example:
   "summary": {
     "stepCount": 2,
     "plannedActionCount": 4,
+    "simulatedActionCount": 3,
     "errorCount": 0,
     "warningCount": 0,
     "infoCount": 0,
     "containsWritesIfApplied": true,
-    "cumulativeSimulation": false
+    "cumulativeSimulation": true
   },
   "issues": [],
   "steps": [
@@ -1757,6 +1819,26 @@ Output example:
         }
       ],
       "issues": []
+    },
+    {
+      "stepIndex": 1,
+      "type": "place_asset",
+      "valid": true,
+      "severity": "ok",
+      "simulated": true,
+      "simulationOnly": true,
+      "simulatedNodePath": "Room/Chair",
+      "simulatedActionCount": 3,
+      "plan": [
+        {
+          "action": "add_node",
+          "path": "Room/Chair",
+          "parentPath": "Room",
+          "type": "Sprite2D",
+          "name": "Chair"
+        }
+      ],
+      "issues": []
     }
   ],
   "plan": [
@@ -1768,7 +1850,11 @@ Output example:
     }
   ],
   "layoutBefore": null,
+  "layoutAfter": null,
   "validationBefore": null,
+  "validationAfter": {
+    "validationScope": "simulated_patch_state"
+  },
   "limits": {
     "maxStepsRequested": null,
     "maxStepsApplied": 20,
@@ -1780,15 +1866,17 @@ Output example:
 }
 ```
 
-**Supported step types:** `place_asset`, `align_nodes`, `update_node_properties`, `validate_scene`, and `create_checkpoint`. These reuse the same dry-run planning paths as `dry_run_place_asset_in_scene`, `dry_run_align_nodes`, and `dry_run_update_node_properties` where applicable. `validate_scene` runs against the current scene and reports `validationScope: "pre_patch_current_scene"`.
+**Supported step types:** `place_asset`, `align_nodes`, `update_node_properties`, `validate_scene`, and `create_checkpoint`. These reuse the same dry-run planning paths as `dry_run_place_asset_in_scene`, `dry_run_align_nodes`, and `dry_run_update_node_properties` where applicable. With `simulateCumulative: true`, `validate_scene` steps run against the current simulated state and report `validationScope: "simulated_patch_state"`. With `simulateCumulative: false`, they preserve the original behavior and report `validationScope: "pre_patch_current_scene"`.
 
-**Read-only safety:** `dry_run_scene_patch` does not call writer tools, save scenes, create checkpoints, restore checkpoints, create files, modify files, import/reimport assets, attach scripts, parse script source, or modify resources. `create_checkpoint` steps only produce planned checkpoint actions. Use `create_scene_checkpoint` before running writer tools when you need a real rollback point.
+**Read-only safety:** `dry_run_scene_patch` does not call writer tools, save scenes, create checkpoints, restore checkpoints, create files, modify files, import/reimport assets, attach scripts, parse script source, or modify resources. Simulated changes happen only inside an instantiated in-memory scene tree. `create_checkpoint` steps only produce planned checkpoint actions. Use `create_scene_checkpoint` before running writer tools when you need a real rollback point.
 
-**Cumulative simulation limitation:** this first version does not simulate mutations between steps. If a later `align_nodes` or `update_node_properties` step references a node that a previous `place_asset` step would create, the tool returns `CUMULATIVE_SIMULATION_UNSUPPORTED` instead of pretending the node exists. Apply the placement first, then run a fresh dry-run for dependent edits.
+**Cumulative simulation:** when `simulateCumulative` is `true`, valid `place_asset` steps add their planned node or instance to the in-memory tree, valid `align_nodes` steps apply planned local `position` changes in memory, and valid `update_node_properties` steps apply normalized safe property changes in memory. Later steps can reference nodes placed by earlier steps. When `simulateCumulative` is `false`, the previous behavior is preserved: dependent references to planned-but-not-created nodes return `CUMULATIVE_SIMULATION_UNSUPPORTED`.
+
+**Validation and layout scopes:** `includeValidationBefore` validates the original scene as `pre_patch_current_scene`. `validate_scene` steps and `includeValidationAfter` validate the simulated state as `simulated_patch_state` when cumulative simulation is enabled. `includeLayoutBefore` returns the original compact layout; `includeLayoutAfter` returns the final simulated compact layout when cumulative simulation is enabled. If final layout or final validation is requested with `simulateCumulative: false`, the tool adds an info issue instead of pretending to validate a final patch.
 
 **Difference from future `apply_scene_patch`:** this tool only validates and plans a patch. A future writer should apply only normalized plan entries after checkpointing and validation; this dry-run never writes.
 
-`maxSteps` defaults to `20`, rejects values below `1`, and clamps above `100`. `maxDepth` defaults to `100`, rejects values below `1`, and clamps above `200`.
+`simulateCumulative` defaults to `true`. `includeLayoutAfter` and `includeValidationAfter` default to `false`. `maxSteps` defaults to `20`, rejects values below `1`, and clamps above `100`. `maxDepth` defaults to `100`, rejects values below `1`, and clamps above `200`.
 
 Manual test:
 
@@ -1797,7 +1885,7 @@ npm run build
 npx @modelcontextprotocol/inspector build/index.js
 ```
 
-Call `dry_run_scene_patch` with checkpoint, placement, alignment, property update, and validation steps. Confirm nested plans are returned, unknown step types return `UNKNOWN_STEP_TYPE`, dependent steps targeting planned-but-not-created nodes return `CUMULATIVE_SIMULATION_UNSUPPORTED`, no checkpoint files are created, and the scene file hash is unchanged.
+Call `dry_run_scene_patch` with checkpoint, placement, alignment, property update, and validation steps. Confirm nested plans are returned, cumulative mode can place a node and later align/update that same simulated node, `simulateCumulative: false` still returns `CUMULATIVE_SIMULATION_UNSUPPORTED` for dependent steps, unknown step types return `UNKNOWN_STEP_TYPE`, no checkpoint files are created, and scene/asset file hashes are unchanged.
 
 ### `validate_scene`
 

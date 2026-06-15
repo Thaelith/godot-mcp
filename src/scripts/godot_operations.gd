@@ -2629,10 +2629,10 @@ func place_asset_finish_result(project_path, scene_path, asset_path, asset_info,
     }
 
 # Shared planning logic for dry_run_place_asset_in_scene and place_asset_in_scene.
-# Loads + instantiates the scene, builds the placement plan, and returns the full
-# planning context. The caller owns scene_root and must free it (except on a
-# "fatal" result, where this function already freed any instantiated scene).
-func place_asset_plan(params):
+# Loads + instantiates the scene unless an external root is provided, builds the
+# placement plan, and returns the full planning context. Callers only free
+# scene_root when owns_scene_root is true.
+func place_asset_plan(params, provided_scene_root=null):
     if not params.has("scene_path"):
         return {"fatal": {"error": "MISSING_SCENE_PATH", "message": "scene_path is required."}}
     if not params.has("asset_path"):
@@ -2657,13 +2657,17 @@ func place_asset_plan(params):
     if not FileAccess.file_exists(asset_path):
         return {"fatal": {"error": "ASSET_PATH_NOT_FOUND", "message": "Asset file does not exist: " + asset_path}}
 
-    var scene_resource = ResourceLoader.load(scene_path)
-    if scene_resource == null or not (scene_resource is PackedScene):
-        return {"fatal": {"error": "SCENE_LOAD_FAILED", "message": "Failed to load scene as PackedScene: " + scene_path}}
-
-    var scene_root = scene_resource.instantiate()
+    var scene_root = provided_scene_root
+    var owns_scene_root = false
     if scene_root == null:
-        return {"fatal": {"error": "SCENE_INSTANTIATE_FAILED", "message": "Failed to instantiate scene: " + scene_path}}
+        var scene_resource = ResourceLoader.load(scene_path)
+        if scene_resource == null or not (scene_resource is PackedScene):
+            return {"fatal": {"error": "SCENE_LOAD_FAILED", "message": "Failed to load scene as PackedScene: " + scene_path}}
+
+        scene_root = scene_resource.instantiate()
+        if scene_root == null:
+            return {"fatal": {"error": "SCENE_INSTANTIATE_FAILED", "message": "Failed to instantiate scene: " + scene_path}}
+        owns_scene_root = true
 
     var issues = []
     var plan = []
@@ -2691,7 +2695,8 @@ func place_asset_plan(params):
         "includePlacementHints": false
     })
     if not asset_info.has("success") or not asset_info["success"]:
-        scene_root.free()
+        if owns_scene_root:
+            scene_root.free()
         return {"fatal": {
             "error": asset_info["error"] if asset_info.has("error") else "ASSET_LOAD_FAILED",
             "message": asset_info["message"] if asset_info.has("message") else "Asset could not be inspected."
@@ -2778,6 +2783,7 @@ func place_asset_plan(params):
         "plan": plan,
         "issues": issues,
         "layout_data": layout_data,
+        "owns_scene_root": owns_scene_root,
         "bounds_source": bounds_source,
         "include_plan": include_plan,
         "include_layout_before": include_layout_before,
@@ -3331,7 +3337,7 @@ func update_node_properties_finish_result(project_path, scene_path, update_count
         "limits": limits
     }
 
-func update_node_properties_plan(params):
+func update_node_properties_plan(params, provided_scene_root=null):
     if not params.has("scene_path"):
         return {"fatal": {"error": "MISSING_SCENE_PATH", "message": "scene_path is required."}}
     if not params.has("updates") or typeof(params.updates) != TYPE_ARRAY or params.updates.is_empty():
@@ -3374,13 +3380,17 @@ func update_node_properties_plan(params):
     if not FileAccess.file_exists(scene_path):
         return {"fatal": {"error": "SCENE_PATH_NOT_FOUND", "message": "Scene file does not exist: " + scene_path}}
 
-    var scene_resource = ResourceLoader.load(scene_path)
-    if scene_resource == null or not (scene_resource is PackedScene):
-        return {"fatal": {"error": "SCENE_LOAD_FAILED", "message": "Failed to load scene as PackedScene: " + scene_path}}
-
-    var scene_root = scene_resource.instantiate()
+    var scene_root = provided_scene_root
+    var owns_scene_root = false
     if scene_root == null:
-        return {"fatal": {"error": "SCENE_INSTANTIATE_FAILED", "message": "Failed to instantiate scene: " + scene_path}}
+        var scene_resource = ResourceLoader.load(scene_path)
+        if scene_resource == null or not (scene_resource is PackedScene):
+            return {"fatal": {"error": "SCENE_LOAD_FAILED", "message": "Failed to load scene as PackedScene: " + scene_path}}
+
+        scene_root = scene_resource.instantiate()
+        if scene_root == null:
+            return {"fatal": {"error": "SCENE_INSTANTIATE_FAILED", "message": "Failed to instantiate scene: " + scene_path}}
+        owns_scene_root = true
 
     var issues = []
     var plan = []
@@ -3512,6 +3522,7 @@ func update_node_properties_plan(params):
         "max_updates": max_updates,
         "max_depth": max_depth,
         "layout_data": layout_data,
+        "owns_scene_root": owns_scene_root,
         "limits": limits
     }
 
@@ -3532,7 +3543,7 @@ func scene_patch_error(error_code, message):
         "message": message
     }
 
-func scene_patch_add_issue(issues, severity, code, message, step_index=-1, step_type=null, node_path=null, suggestion=null):
+func scene_patch_add_issue(issues, severity, code, message, step_index=-1, step_type=null, node_path=null, suggestion=null, property_name=null):
     var issue = {
         "severity": severity,
         "code": code,
@@ -3546,6 +3557,8 @@ func scene_patch_add_issue(issues, severity, code, message, step_index=-1, step_
         issue["nodePath"] = node_path
     if suggestion != null:
         issue["suggestion"] = suggestion
+    if property_name != null:
+        issue["property"] = property_name
     issues.append(issue)
 
 func scene_patch_wrap_issue(issue, step_index, step_type):
@@ -3707,7 +3720,130 @@ func scene_patch_track_created_nodes(step_plan, planned_node_paths):
         if plan_item.get("action", "") == "add_node" and plan_item.has("path"):
             planned_node_paths[str(plan_item["path"])] = true
 
-func scene_patch_validation_result(project_path, scene_path, scene_root, source_params, max_depth, max_depth_requested, max_depth_clamped):
+func scene_patch_release_planned_scene_root(planned):
+    if planned.has("owns_scene_root") and planned["owns_scene_root"] and planned.has("scene_root") and planned["scene_root"] != null:
+        planned["scene_root"].free()
+
+func scene_patch_apply_place_asset_plan_to_root(scene_root, planned, issues):
+    var add_action = null
+    var assign_action = null
+    var properties_action = null
+    for plan_item in planned["plan"]:
+        if typeof(plan_item) != TYPE_DICTIONARY or not plan_item.has("action"):
+            continue
+        if plan_item["action"] == "add_node":
+            add_action = plan_item
+        elif plan_item["action"] == "assign_asset":
+            assign_action = plan_item
+        elif plan_item["action"] == "set_properties":
+            properties_action = plan_item
+
+    if add_action == null:
+        scene_patch_add_issue(issues, "error", "SIMULATION_UNSUPPORTED_ACTION", "Placement plan did not contain an add_node action.")
+        return {"success": false, "simulatedNodePath": null, "simulatedActionCount": 0}
+
+    var parent_path = add_action["parentPath"] if add_action.has("parentPath") else null
+    var parent_node = update_node_properties_find_node(scene_root, parent_path)
+    if parent_node == null:
+        scene_patch_add_issue(issues, "error", "SIMULATION_PARENT_NOT_FOUND", "Simulated parent node was not found.", -1, "place_asset", parent_path, "Use an existing parent path or place the parent in an earlier simulated step.")
+        return {"success": false, "simulatedNodePath": add_action["path"] if add_action.has("path") else null, "simulatedActionCount": 0}
+
+    var spec = {
+        "path": add_action["path"] if add_action.has("path") else planned["proposed_path"],
+        "name": add_action["name"] if add_action.has("name") else planned["node_name"],
+        "type": add_action["type"] if add_action.has("type") else planned["node_type"],
+        "asset": assign_action["asset"] if assign_action != null and assign_action.has("asset") else planned["asset_path"],
+        "assetProperty": assign_action["assetProperty"] if assign_action != null and assign_action.has("assetProperty") else planned["asset_property"],
+        "assetType": planned["asset_type"],
+        "properties": properties_action["properties"] if properties_action != null and properties_action.has("properties") and typeof(properties_action["properties"]) == TYPE_DICTIONARY else {}
+    }
+
+    var new_node = create_scene_blueprint_create_node_from_spec(spec, issues)
+    if new_node == null:
+        scene_patch_add_issue(issues, "error", "SIMULATION_APPLY_FAILED", "Failed to create the simulated node from the normalized placement plan.", -1, "place_asset", spec["path"])
+        return {"success": false, "simulatedNodePath": spec["path"], "simulatedActionCount": 0}
+
+    new_node.name = spec["name"]
+    parent_node.add_child(new_node)
+    create_scene_blueprint_set_owner_recursive(new_node, scene_root)
+
+    if not create_scene_blueprint_apply_properties(new_node, spec, issues):
+        scene_patch_add_issue(issues, "error", "SIMULATION_PROPERTY_APPLY_FAILED", "Failed to apply simulated placement properties.", -1, "place_asset", spec["path"])
+        return {"success": false, "simulatedNodePath": spec["path"], "simulatedActionCount": 1}
+
+    if not create_scene_blueprint_assign_asset(new_node, spec, issues):
+        scene_patch_add_issue(issues, "error", "SIMULATION_ASSET_ASSIGNMENT_FAILED", "Failed to assign the simulated asset.", -1, "place_asset", spec["path"])
+        return {"success": false, "simulatedNodePath": spec["path"], "simulatedActionCount": 1}
+
+    return {
+        "success": true,
+        "simulatedNodePath": spec["path"],
+        "simulatedActionCount": planned["plan"].size()
+    }
+
+func scene_patch_apply_alignment_plan_to_root(scene_root, max_depth, plan, issues):
+    var apply_result = align_nodes_apply_plan(scene_root, max_depth, plan, issues)
+    if not apply_result.has("success") or not apply_result["success"]:
+        scene_patch_add_issue(issues, "error", "SIMULATION_ALIGNMENT_APPLY_FAILED", apply_result["message"] if apply_result.has("message") else "Failed to apply simulated alignment plan.")
+        return {"success": false, "simulatedChangeCount": apply_result["appliedChanges"].size() if apply_result.has("appliedChanges") else 0}
+    return {
+        "success": true,
+        "simulatedChangeCount": apply_result["appliedChanges"].size() if apply_result.has("appliedChanges") else 0,
+        "appliedChanges": apply_result["appliedChanges"] if apply_result.has("appliedChanges") else []
+    }
+
+func scene_patch_apply_property_plan_to_root(scene_root, max_depth, plan, issues):
+    var layout_data = dry_align_build_layout(scene_root, max_depth)
+    var node_by_path = layout_data["nodeByPath"]
+    var applied_changes = []
+
+    for entry in plan:
+        if typeof(entry) != TYPE_DICTIONARY or not entry.has("nodePath") or not entry.has("property") or not entry.has("proposedValue") or not entry.has("valueType"):
+            scene_patch_add_issue(issues, "warning", "SIMULATION_UNSUPPORTED_ACTION", "Planned property change was skipped because it was missing required fields.")
+            continue
+
+        var node_path = entry["nodePath"]
+        var property_name = entry["property"]
+        if not node_by_path.has(node_path):
+            scene_patch_add_issue(issues, "error", "SIMULATION_NODE_NOT_FOUND", "Simulated target node was not found.", -1, "update_node_properties", node_path, "Use a node path that exists in the current simulated scene state.", property_name)
+            return {"success": false, "simulatedChangeCount": applied_changes.size(), "appliedChanges": applied_changes}
+
+        var node = node_by_path[node_path]
+        var node_type = node.get_class()
+        if not update_node_properties_safe_properties().has(property_name) or update_node_properties_dangerous_properties().has(property_name):
+            scene_patch_add_issue(issues, "warning", "SIMULATION_UNSUPPORTED_PROPERTY", "Planned property is not in the safe allowlist and was skipped.", -1, "update_node_properties", node_path, null, property_name)
+            continue
+
+        if not create_scene_blueprint_node_has_property(node, property_name):
+            scene_patch_add_issue(issues, "error", "SIMULATION_PROPERTY_APPLY_FAILED", "Property is not available on the simulated target node.", -1, "update_node_properties", node_path, "Use a property supported by the selected node type.", property_name)
+            return {"success": false, "simulatedChangeCount": applied_changes.size(), "appliedChanges": applied_changes}
+
+        var converted = update_node_properties_convert_plan_value(entry)
+        if not converted["success"]:
+            scene_patch_add_issue(issues, "error", "SIMULATION_PROPERTY_APPLY_FAILED", converted["message"], -1, "update_node_properties", node_path, null, property_name)
+            return {"success": false, "simulatedChangeCount": applied_changes.size(), "appliedChanges": applied_changes}
+
+        var old_value = null
+        var converted_old = update_node_properties_convert_current_value(node.get(property_name))
+        if converted_old["success"]:
+            old_value = converted_old["value"]
+        node.set(property_name, converted["value"])
+        applied_changes.append({
+            "nodePath": node_path,
+            "nodeType": node_type,
+            "property": property_name,
+            "oldValue": old_value,
+            "newValue": entry["proposedValue"],
+            "valueType": entry["valueType"]
+        })
+
+    return {
+        "success": true,
+        "simulatedChangeCount": applied_changes.size(),
+        "appliedChanges": applied_changes
+    }
+
+func scene_patch_validation_result(project_path, scene_path, scene_root, source_params, max_depth, max_depth_requested, max_depth_clamped, validation_scope="pre_patch_current_scene"):
     var options = {
         "includeInfo": dry_run_get_value(source_params, ["includeInfo", "include_info"], true),
         "checkResources": dry_run_get_value(source_params, ["checkResources", "check_resources"], true),
@@ -3736,16 +3872,16 @@ func scene_patch_validation_result(project_path, scene_path, scene_root, source_
     }
     traverse_validate_scene(scene_root, scene_root, 0, max_depth, options, summary, issues)
     var result = finish_validation_result(project_path, scene_path, scene_root, issues, summary, limits, options)
-    result["validationScope"] = "pre_patch_current_scene"
+    result["validationScope"] = validation_scope
     return result
 
-func scene_patch_place_asset_step(step, project_path, scene_path, max_depth, max_depth_requested, max_depth_clamped, include_plan, step_index, top_issues, planned_node_paths):
+func scene_patch_place_asset_step(step, project_path, scene_path, simulation_root, max_depth, max_depth_requested, max_depth_clamped, include_plan, simulate_cumulative, step_index, top_issues, planned_node_paths):
     var step_type = "place_asset"
     var step_issues = []
     var step_plan = []
 
     var cumulative_path = scene_patch_first_planned_reference(step, step_type, planned_node_paths)
-    if cumulative_path != null:
+    if not simulate_cumulative and cumulative_path != null:
         scene_patch_add_issue(step_issues, "error", "CUMULATIVE_SIMULATION_UNSUPPORTED", "This step references a node planned by an earlier step, but cumulative simulation is not supported yet.", step_index, step_type, cumulative_path, "Apply the earlier placement first, then run a new dry-run for dependent placement.")
         var wrapped_cumulative = scene_patch_wrap_step_issues(step_issues, top_issues, step_index, step_type)
         return scene_patch_step_result(step_index, step_type, wrapped_cumulative, step_plan, include_plan)
@@ -3770,7 +3906,7 @@ func scene_patch_place_asset_step(step, project_path, scene_path, max_depth, max
         "max_depth_clamped": max_depth_clamped
     }
 
-    var planned = place_asset_plan(sub_params)
+    var planned = place_asset_plan(sub_params, simulation_root if simulate_cumulative else null)
     if planned.has("fatal"):
         scene_patch_add_issue(step_issues, "error", planned["fatal"]["error"], planned["fatal"]["message"], step_index, step_type)
         var wrapped_fatal = scene_patch_wrap_step_issues(step_issues, top_issues, step_index, step_type)
@@ -3785,22 +3921,34 @@ func scene_patch_place_asset_step(step, project_path, scene_path, max_depth, max
         "proposedNodePath": planned["proposed_path"]
     }
     var wrapped_issues = scene_patch_wrap_step_issues(planned["issues"], top_issues, step_index, step_type)
-    if not dry_align_has_error_issues(planned["issues"]):
-        scene_patch_track_created_nodes(step_plan, planned_node_paths)
-    var result = scene_patch_step_result(step_index, step_type, wrapped_issues, step_plan, include_plan, {
+    var extra = {
         "assetPath": planned["asset_path"],
         "proposedNode": planned["proposed_node"],
-        "plannerSummary": summary
-    })
-    planned["scene_root"].free()
+        "plannerSummary": summary,
+        "simulated": false
+    }
+    if not dry_align_has_error_issues(planned["issues"]) and simulate_cumulative:
+        var simulation_issues = []
+        var simulation_result = scene_patch_apply_place_asset_plan_to_root(simulation_root, planned, simulation_issues)
+        var wrapped_simulation_issues = scene_patch_wrap_step_issues(simulation_issues, top_issues, step_index, step_type)
+        wrapped_issues.append_array(wrapped_simulation_issues)
+        extra["simulated"] = simulation_result["success"]
+        extra["simulationOnly"] = true
+        extra["simulatedNodePath"] = simulation_result["simulatedNodePath"] if simulation_result.has("simulatedNodePath") else planned["proposed_path"]
+        extra["simulatedActionCount"] = simulation_result["simulatedActionCount"] if simulation_result.has("simulatedActionCount") else 0
+    elif not dry_align_has_error_issues(planned["issues"]):
+        scene_patch_track_created_nodes(step_plan, planned_node_paths)
+
+    var result = scene_patch_step_result(step_index, step_type, wrapped_issues, step_plan, include_plan, extra)
+    scene_patch_release_planned_scene_root(planned)
     return result
 
-func scene_patch_align_nodes_step(step, project_path, scene_path, scene_root, max_depth, max_depth_requested, max_depth_clamped, include_plan, step_index, top_issues, planned_node_paths):
+func scene_patch_align_nodes_step(step, project_path, scene_path, scene_root, max_depth, max_depth_requested, max_depth_clamped, include_plan, simulate_cumulative, step_index, top_issues, planned_node_paths):
     var step_type = "align_nodes"
     var step_issues = []
     var step_plan = []
     var cumulative_path = scene_patch_first_planned_reference(step, step_type, planned_node_paths)
-    if cumulative_path != null:
+    if not simulate_cumulative and cumulative_path != null:
         scene_patch_add_issue(step_issues, "error", "CUMULATIVE_SIMULATION_UNSUPPORTED", "This step references a node planned by an earlier step, but cumulative simulation is not supported yet.", step_index, step_type, cumulative_path, "Apply the asset placement first, then run a new dry-run for alignment.")
         var wrapped_cumulative = scene_patch_wrap_step_issues(step_issues, top_issues, step_index, step_type)
         return scene_patch_step_result(step_index, step_type, wrapped_cumulative, step_plan, include_plan)
@@ -3829,16 +3977,26 @@ func scene_patch_align_nodes_step(step, project_path, scene_path, scene_root, ma
 
     step_plan = result["plan"] if result.has("plan") else []
     var wrapped_issues = scene_patch_wrap_step_issues(result["issues"] if result.has("issues") else [], top_issues, step_index, step_type)
-    return scene_patch_step_result(step_index, step_type, wrapped_issues, step_plan, include_plan, {
-        "plannerSummary": result["summary"] if result.has("summary") else {}
-    })
+    var extra = {
+        "plannerSummary": result["summary"] if result.has("summary") else {},
+        "simulated": false
+    }
+    if not dry_align_has_error_issues(result["issues"] if result.has("issues") else []) and simulate_cumulative:
+        var simulation_issues = []
+        var simulation_result = scene_patch_apply_alignment_plan_to_root(scene_root, max_depth, step_plan, simulation_issues)
+        var wrapped_simulation_issues = scene_patch_wrap_step_issues(simulation_issues, top_issues, step_index, step_type)
+        wrapped_issues.append_array(wrapped_simulation_issues)
+        extra["simulated"] = simulation_result["success"]
+        extra["simulationOnly"] = true
+        extra["simulatedChangeCount"] = simulation_result["simulatedChangeCount"] if simulation_result.has("simulatedChangeCount") else 0
+    return scene_patch_step_result(step_index, step_type, wrapped_issues, step_plan, include_plan, extra)
 
-func scene_patch_update_properties_step(step, project_path, scene_path, max_depth, max_depth_requested, max_depth_clamped, include_plan, step_index, top_issues, planned_node_paths):
+func scene_patch_update_properties_step(step, project_path, scene_path, simulation_root, max_depth, max_depth_requested, max_depth_clamped, include_plan, simulate_cumulative, step_index, top_issues, planned_node_paths):
     var step_type = "update_node_properties"
     var step_issues = []
     var step_plan = []
     var cumulative_path = scene_patch_first_planned_reference(step, step_type, planned_node_paths)
-    if cumulative_path != null:
+    if not simulate_cumulative and cumulative_path != null:
         scene_patch_add_issue(step_issues, "error", "CUMULATIVE_SIMULATION_UNSUPPORTED", "This step references a node planned by an earlier step, but cumulative simulation is not supported yet.", step_index, step_type, cumulative_path, "Apply the asset placement first, then run a new dry-run for property updates.")
         var wrapped_cumulative = scene_patch_wrap_step_issues(step_issues, top_issues, step_index, step_type)
         return scene_patch_step_result(step_index, step_type, wrapped_cumulative, step_plan, include_plan)
@@ -3860,7 +4018,7 @@ func scene_patch_update_properties_step(step, project_path, scene_path, max_dept
         "max_depth_requested": max_depth_requested,
         "max_depth_clamped": max_depth_clamped
     }
-    var planned = update_node_properties_plan(sub_params)
+    var planned = update_node_properties_plan(sub_params, simulation_root if simulate_cumulative else null)
     if planned.has("fatal"):
         scene_patch_add_issue(step_issues, "error", planned["fatal"]["error"], planned["fatal"]["message"], step_index, step_type)
         var wrapped_fatal = scene_patch_wrap_step_issues(step_issues, top_issues, step_index, step_type)
@@ -3868,26 +4026,38 @@ func scene_patch_update_properties_step(step, project_path, scene_path, max_dept
 
     step_plan = planned["plan"]
     var wrapped_issues = scene_patch_wrap_step_issues(planned["issues"], top_issues, step_index, step_type)
-    var result = scene_patch_step_result(step_index, step_type, wrapped_issues, step_plan, include_plan, {
+    var extra = {
         "plannerSummary": {
             "updateCount": planned["update_count"],
             "plannedChangeCount": step_plan.size()
-        }
-    })
-    planned["scene_root"].free()
+        },
+        "simulated": false
+    }
+    if not dry_align_has_error_issues(planned["issues"]) and simulate_cumulative:
+        var simulation_issues = []
+        var simulation_result = scene_patch_apply_property_plan_to_root(simulation_root, max_depth, step_plan, simulation_issues)
+        var wrapped_simulation_issues = scene_patch_wrap_step_issues(simulation_issues, top_issues, step_index, step_type)
+        wrapped_issues.append_array(wrapped_simulation_issues)
+        extra["simulated"] = simulation_result["success"]
+        extra["simulationOnly"] = true
+        extra["simulatedChangeCount"] = simulation_result["simulatedChangeCount"] if simulation_result.has("simulatedChangeCount") else 0
+
+    var result = scene_patch_step_result(step_index, step_type, wrapped_issues, step_plan, include_plan, extra)
+    scene_patch_release_planned_scene_root(planned)
     return result
 
-func scene_patch_validate_step(step, project_path, scene_path, scene_root, max_depth, max_depth_requested, max_depth_clamped, include_plan, step_index, top_issues):
+func scene_patch_validate_step(step, project_path, scene_path, scene_root, max_depth, max_depth_requested, max_depth_clamped, include_plan, simulate_cumulative, step_index, top_issues):
     var step_type = "validate_scene"
-    var validation = scene_patch_validation_result(project_path, scene_path, scene_root, step, max_depth, max_depth_requested, max_depth_clamped)
+    var validation_scope = "simulated_patch_state" if simulate_cumulative else "pre_patch_current_scene"
+    var validation = scene_patch_validation_result(project_path, scene_path, scene_root, step, max_depth, max_depth_requested, max_depth_clamped, validation_scope)
     var step_plan = [{
         "action": "validate_scene",
         "scenePath": scene_path,
-        "validationScope": "pre_patch_current_scene"
+        "validationScope": validation_scope
     }]
     var wrapped_issues = scene_patch_wrap_step_issues(validation["issues"], top_issues, step_index, step_type)
     return scene_patch_step_result(step_index, step_type, wrapped_issues, step_plan, include_plan, {
-        "validationScope": "pre_patch_current_scene",
+        "validationScope": validation_scope,
         "validation": validation
     })
 
@@ -3923,7 +4093,10 @@ func dry_run_scene_patch(params):
     var steps = params.steps
     var include_plan = params.include_plan if params.has("include_plan") else true
     var include_layout_before = params.include_layout_before if params.has("include_layout_before") else false
+    var include_layout_after = params.include_layout_after if params.has("include_layout_after") else false
     var include_validation_before = params.include_validation_before if params.has("include_validation_before") else false
+    var include_validation_after = params.include_validation_after if params.has("include_validation_after") else false
+    var simulate_cumulative = params.simulate_cumulative if params.has("simulate_cumulative") else true
     var include_checkpoints = params.include_checkpoints if params.has("include_checkpoints") else true
     var max_steps = int(params.max_steps) if params.has("max_steps") else 20
     var max_depth = int(params.max_depth) if params.has("max_depth") else 100
@@ -3950,9 +4123,14 @@ func dry_run_scene_patch(params):
     var step_results = []
     var flattened_plan = []
     var planned_action_count = 0
+    var simulated_action_count = 0
     var planned_node_paths = {}
     var contains_writes_if_applied = false
     var layout_data = dry_align_build_layout(scene_root, max_depth)
+    var validation_before = null
+    if include_validation_before:
+        validation_before = scene_patch_validation_result(project_path, scene_path, scene_root, params, max_depth, max_depth_requested, max_depth_clamped, "pre_patch_current_scene")
+
     var processed_count = min(steps.size(), max_steps)
     if steps.size() > max_steps:
         scene_patch_add_issue(issues, "error", "STEP_TOO_LARGE", "Number of patch steps exceeds maxSteps.", -1, null, null, "Reduce steps or increase maxSteps up to the supported cap.")
@@ -3978,15 +4156,15 @@ func dry_run_scene_patch(params):
         var step_result = null
         if step_type == "place_asset":
             contains_writes_if_applied = true
-            step_result = scene_patch_place_asset_step(step, project_path, scene_path, max_depth, max_depth_requested, max_depth_clamped, include_plan, step_index, issues, planned_node_paths)
+            step_result = scene_patch_place_asset_step(step, project_path, scene_path, scene_root, max_depth, max_depth_requested, max_depth_clamped, include_plan, simulate_cumulative, step_index, issues, planned_node_paths)
         elif step_type == "align_nodes":
             contains_writes_if_applied = true
-            step_result = scene_patch_align_nodes_step(step, project_path, scene_path, scene_root, max_depth, max_depth_requested, max_depth_clamped, include_plan, step_index, issues, planned_node_paths)
+            step_result = scene_patch_align_nodes_step(step, project_path, scene_path, scene_root, max_depth, max_depth_requested, max_depth_clamped, include_plan, simulate_cumulative, step_index, issues, planned_node_paths)
         elif step_type == "update_node_properties":
             contains_writes_if_applied = true
-            step_result = scene_patch_update_properties_step(step, project_path, scene_path, max_depth, max_depth_requested, max_depth_clamped, include_plan, step_index, issues, planned_node_paths)
+            step_result = scene_patch_update_properties_step(step, project_path, scene_path, scene_root, max_depth, max_depth_requested, max_depth_clamped, include_plan, simulate_cumulative, step_index, issues, planned_node_paths)
         elif step_type == "validate_scene":
-            step_result = scene_patch_validate_step(step, project_path, scene_path, scene_root, max_depth, max_depth_requested, max_depth_clamped, include_plan, step_index, issues)
+            step_result = scene_patch_validate_step(step, project_path, scene_path, scene_root, max_depth, max_depth_requested, max_depth_clamped, include_plan, simulate_cumulative, step_index, issues)
         elif step_type == "create_checkpoint":
             if include_checkpoints:
                 contains_writes_if_applied = true
@@ -4000,12 +4178,27 @@ func dry_run_scene_patch(params):
         step_results.append(step_result)
         if step_result.has("summary") and step_result["summary"].has("plannedActionCount"):
             planned_action_count += int(step_result["summary"]["plannedActionCount"])
+        if step_result.has("simulatedActionCount"):
+            simulated_action_count += int(step_result["simulatedActionCount"])
+        elif step_result.has("simulatedChangeCount"):
+            simulated_action_count += int(step_result["simulatedChangeCount"])
         if include_plan and step_result.has("plan"):
             scene_patch_add_plan_entries(flattened_plan, step_result["plan"], step_index)
 
-    var validation_before = null
-    if include_validation_before:
-        validation_before = scene_patch_validation_result(project_path, scene_path, scene_root, params, max_depth, max_depth_requested, max_depth_clamped)
+    var layout_after = null
+    if include_layout_after:
+        if simulate_cumulative:
+            var layout_after_data = dry_align_build_layout(scene_root, max_depth)
+            layout_after = dry_align_compact_layout_before(layout_after_data["nodes"], layout_after_data["sceneBounds"], "visual")
+        else:
+            scene_patch_add_issue(issues, "info", "FINAL_LAYOUT_REQUIRES_CUMULATIVE_SIMULATION", "Final layout output requires simulateCumulative=true.")
+
+    var validation_after = null
+    if include_validation_after:
+        if simulate_cumulative:
+            validation_after = scene_patch_validation_result(project_path, scene_path, scene_root, params, max_depth, max_depth_requested, max_depth_clamped, "simulated_patch_state")
+        else:
+            scene_patch_add_issue(issues, "info", "FINAL_VALIDATION_REQUIRES_CUMULATIVE_SIMULATION", "Final simulated validation requires simulateCumulative=true.")
 
     var counts = scene_patch_issue_counts(issues)
     var severity = dry_align_severity_from_counts(counts)
@@ -4018,17 +4211,20 @@ func dry_run_scene_patch(params):
         "summary": {
             "stepCount": steps.size(),
             "plannedActionCount": planned_action_count,
+            "simulatedActionCount": simulated_action_count,
             "errorCount": counts["errorCount"],
             "warningCount": counts["warningCount"],
             "infoCount": counts["infoCount"],
             "containsWritesIfApplied": contains_writes_if_applied,
-            "cumulativeSimulation": false
+            "cumulativeSimulation": simulate_cumulative
         },
         "issues": issues,
         "steps": step_results,
         "plan": flattened_plan if include_plan else [],
         "layoutBefore": dry_align_compact_layout_before(layout_data["nodes"], layout_data["sceneBounds"], "visual") if include_layout_before else null,
+        "layoutAfter": layout_after,
         "validationBefore": validation_before,
+        "validationAfter": validation_after,
         "limits": {
             "maxStepsRequested": max_steps_requested,
             "maxStepsApplied": max_steps,
