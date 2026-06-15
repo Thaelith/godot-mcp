@@ -136,6 +136,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "list_projects",
         "get_project_info",
         "inspect_project_capabilities",
+        "inspect_scene_edit_context",
         "scan_assets",
         "get_asset_info",
         "read_scene_tree",
@@ -373,6 +374,161 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Call `inspect_project_capabilities` with a valid Godot project path. Confirm metadata is detected best-effort, scenes and asset summaries are returned without modifying files, checkpoint counts reflect `.godot_mcp/checkpoints/`, large limits clamp, invalid or symlink project paths are rejected, and existing writer/checkpoint tools still register.
+
+### `inspect_scene_edit_context`
+
+Bundles the key read-only context for one scene so an AI assistant can safely plan `dry_run_scene_patch` or `apply_scene_patch` calls. It validates the project and scene path once, then combines compact scene tree, layout, validation, checkpoint, asset, and recommendation sections. Section failures are reported inside that section; validation warnings/errors do not fail the whole tool.
+
+Input example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Main.tscn",
+  "includeSceneTree": true,
+  "includeLayout": true,
+  "includeValidation": true,
+  "includeCheckpoints": true,
+  "includeAssetSummary": true,
+  "includeRecommendations": true,
+  "maxDepth": 50,
+  "maxNodes": 300,
+  "maxAssets": 100,
+  "assetRoot": "res://assets"
+}
+```
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Main.tscn",
+  "sceneFile": {
+    "sizeBytes": 1234,
+    "modifiedTime": "2026-06-15T12:00:00.000Z"
+  },
+  "sceneTree": {
+    "enabled": true,
+    "success": true,
+    "root": {
+      "name": "Main",
+      "type": "Node2D",
+      "path": "Main",
+      "childCount": 2,
+      "children": []
+    },
+    "summary": {
+      "nodeCount": 3,
+      "sourceNodeCount": 3,
+      "maxDepthApplied": 50,
+      "truncated": false,
+      "nodeTruncated": false,
+      "maxNodesApplied": 300
+    }
+  },
+  "layout": {
+    "enabled": true,
+    "success": true,
+    "rootType": "Node2D",
+    "coordinateSpace": "scene",
+    "nodes": [],
+    "summary": {
+      "totalNodes": 3,
+      "nodesWithVisualBounds": 1,
+      "nodesWithCollisionBounds": 1,
+      "returnedNodes": 3,
+      "nodeTruncated": false
+    },
+    "sceneBounds": {}
+  },
+  "validation": {
+    "enabled": true,
+    "success": true,
+    "valid": true,
+    "severity": "ok",
+    "summary": {
+      "totalNodes": 3,
+      "errorCount": 0,
+      "warningCount": 0,
+      "infoCount": 0
+    },
+    "issues": [],
+    "issueCount": 0,
+    "issuesTruncated": false
+  },
+  "checkpointSummary": {
+    "enabled": true,
+    "success": true,
+    "checkpointCount": 1,
+    "latestCheckpointPath": "res://.godot_mcp/checkpoints/scenes__main_tscn/20260615T120000Z_before_patch.tscn",
+    "latestCreatedAt": "2026-06-15T12:00:00Z",
+    "recommendation": "Use list_scene_checkpoints to choose a rollback point before restore."
+  },
+  "assetSummary": {
+    "enabled": true,
+    "success": true,
+    "root": "res://assets",
+    "fallbackUsed": false,
+    "totalFound": 12,
+    "returned": 6,
+    "byType": {
+      "textures": 4,
+      "scenes": 1,
+      "models": 0,
+      "audio": 1,
+      "fonts": 0,
+      "resources": 0,
+      "scripts": 0,
+      "data": 0,
+      "other": 6
+    },
+    "samples": {
+      "textures": ["res://assets/props/chair.png"],
+      "audio": ["res://assets/sfx/click.ogg"]
+    }
+  },
+  "recommendations": [
+    "Use get_asset_info on candidate assets before place_asset steps.",
+    "Use dry_run_scene_patch before apply_scene_patch."
+  ],
+  "toolWorkflow": {
+    "safeEditFlow": ["inspect_scene_edit_context", "get_asset_info", "dry_run_scene_patch", "apply_scene_patch", "validate_scene"],
+    "rollbackFlow": ["list_scene_checkpoints", "restore_scene_checkpoint"]
+  },
+  "limits": {
+    "maxDepthRequested": null,
+    "maxDepthApplied": 50,
+    "maxDepthClamped": false,
+    "maxNodesRequested": null,
+    "maxNodesApplied": 300,
+    "maxNodesClamped": false,
+    "maxAssetsRequested": null,
+    "maxAssetsApplied": 100,
+    "maxAssetsClamped": false
+  }
+}
+```
+
+**Read-only safety:** `inspect_scene_edit_context` does not save scenes, create checkpoints, restore checkpoints, import/reimport assets, modify files, attach scripts, parse script source, or call writer tools. It rejects unsafe `scenePath` values, symlink project/scene paths, and unsafe `assetRoot` values. Asset scanning skips symlinks and project/system folders such as `.git`, `.godot`, `.godot_mcp`, `node_modules`, build, dist, and cache folders.
+
+**Scene tree, layout, and validation:** the tool reuses the existing read-only Godot operations `read_scene_tree`, `get_scene_layout`, and `validate_scene`. Scene tree and layout output are compacted with `maxNodes`; validation returns only a compact summary plus the first 20 issues. `maxDepth` defaults to `50`, rejects values below `1`, and clamps above `200`.
+
+**Checkpoint summary:** when enabled, the tool lists checkpoint metadata for the exact scene under `res://.godot_mcp/checkpoints/` without creating, pruning, deleting, or restoring checkpoints.
+
+**Asset summary:** when `assetRoot` is provided, it must be a safe project-local folder and is scanned read-only. When omitted, `res://assets` is used if it exists. If `res://assets` is missing, the response uses a fallback summary of likely asset folders instead of returning a broad asset catalog. `maxAssets` defaults to `100`, rejects values below `1`, and clamps above `1000`.
+
+**Workflow fit:** use `inspect_project_capabilities` first to choose a likely scene, then `inspect_scene_edit_context` for the target scene, then `get_asset_info` for candidate assets, then `dry_run_scene_patch`, `apply_scene_patch`, and `validate_scene`.
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Call `inspect_scene_edit_context` with a valid scene. Confirm scene tree, layout, validation, checkpoint, and asset sections return compact data; validation issues do not fail the whole tool; unsafe scene paths and asset roots are rejected; large limits clamp; `res://assets` is used when present; fallback asset summary works when it is absent; and scene/asset/checkpoint files are not modified.
 
 ## Asset Catalog
 

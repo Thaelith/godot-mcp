@@ -147,9 +147,13 @@ class GodotServer {
     'include_checkpoint_summary': 'includeCheckpointSummary',
     'include_tool_capabilities': 'includeToolCapabilities',
     'include_recommendations': 'includeRecommendations',
+    'include_scene_tree': 'includeSceneTree',
+    'include_validation': 'includeValidation',
     'max_checkpoints_per_scene': 'maxCheckpointsPerScene',
     'max_scenes': 'maxScenes',
     'max_asset_folders': 'maxAssetFolders',
+    'max_assets': 'maxAssets',
+    'asset_root': 'assetRoot',
     'create_pre_restore_checkpoint': 'createPreRestoreCheckpoint',
     'pre_restore_checkpoint_name': 'preRestoreCheckpointName',
     'validate_after_restore': 'validateAfterRestore',
@@ -629,6 +633,31 @@ class GodotServer {
    */
   private inspectProjectCapabilitiesErrorResponse(error: string, message: string): any {
     console.error(`[SERVER] inspect_project_capabilities error response: ${error}: ${message}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error,
+              message,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  /**
+   * Create an inspect_scene_edit_context-specific JSON error response while preserving MCP text content style.
+   */
+  private inspectSceneEditContextErrorResponse(error: string, message: string): any {
+    console.error(`[SERVER] inspect_scene_edit_context error response: ${error}: ${message}`);
 
     return {
       content: [
@@ -2186,6 +2215,524 @@ class GodotServer {
     return recommendations;
   }
 
+  private sectionError(enabled: boolean, error: string, message: string): any {
+    return {
+      enabled,
+      success: false,
+      error,
+      message,
+    };
+  }
+
+  private compactSceneTreeResult(result: any, maxNodesApplied: number): any {
+    if (!result || result.success === false) {
+      return this.sectionError(true, result?.error || 'READ_SCENE_TREE_FAILED', result?.message || 'Scene tree read failed.');
+    }
+
+    let returnedNodeCount = 0;
+    let nodeTruncated = false;
+
+    const compactNode = (node: any): any | null => {
+      if (!node || typeof node !== 'object') {
+        return null;
+      }
+
+      if (returnedNodeCount >= maxNodesApplied) {
+        nodeTruncated = true;
+        return null;
+      }
+
+      returnedNodeCount += 1;
+      const compact: any = {
+        name: node.name ?? null,
+        type: node.type ?? null,
+        path: node.path ?? null,
+        childCount: typeof node.childCount === 'number'
+          ? node.childCount
+          : Array.isArray(node.children) ? node.children.length : 0,
+        children: [],
+      };
+
+      if (node.script !== undefined && node.script !== null) {
+        compact.script = node.script;
+      }
+      if (Array.isArray(node.groups) && node.groups.length > 0) {
+        compact.groups = node.groups;
+      }
+      if (node.properties && typeof node.properties === 'object') {
+        compact.properties = node.properties;
+      }
+      if (Array.isArray(node.resources) && node.resources.length > 0) {
+        compact.resources = node.resources;
+      }
+
+      const children = Array.isArray(node.children) ? node.children : [];
+      for (const child of children) {
+        const compactChild = compactNode(child);
+        if (compactChild) {
+          compact.children.push(compactChild);
+        } else {
+          nodeTruncated = true;
+          break;
+        }
+      }
+
+      if (children.length > compact.children.length) {
+        nodeTruncated = true;
+      }
+
+      return compact;
+    };
+
+    const root = compactNode(result.root);
+    const sourceNodeCount = typeof result.summary?.totalNodes === 'number'
+      ? result.summary.totalNodes
+      : returnedNodeCount;
+
+    return {
+      enabled: true,
+      success: true,
+      root,
+      summary: {
+        nodeCount: returnedNodeCount,
+        sourceNodeCount,
+        maxDepthApplied: result.limits?.maxDepthApplied ?? null,
+        truncated: Boolean(result.limits?.depthTruncated) || nodeTruncated || sourceNodeCount > returnedNodeCount,
+        nodeTruncated,
+        maxNodesApplied,
+      },
+    };
+  }
+
+  private compactLayoutResult(result: any, maxNodesApplied: number): any {
+    if (!result || result.success === false) {
+      return this.sectionError(true, result?.error || 'GET_SCENE_LAYOUT_FAILED', result?.message || 'Scene layout read failed.');
+    }
+
+    const sourceNodes = Array.isArray(result.nodes) ? result.nodes : [];
+    const returnedNodes = sourceNodes.slice(0, maxNodesApplied).map((node: any) => {
+      const compact: any = {
+        path: node.path ?? null,
+        name: node.name ?? null,
+        type: node.type ?? null,
+        parentPath: node.parentPath ?? null,
+        depth: node.depth ?? null,
+        visible: node.visible ?? null,
+      };
+
+      if (node.transform !== undefined) {
+        compact.transform = node.transform;
+      }
+      if (node.visualBounds !== undefined) {
+        compact.visualBounds = node.visualBounds;
+      }
+      if (node.collisionBounds !== undefined) {
+        compact.collisionBounds = node.collisionBounds;
+      }
+      if (node.controlRect !== undefined) {
+        compact.controlRect = node.controlRect;
+      }
+      if (Array.isArray(node.warnings) && node.warnings.length > 0) {
+        compact.warnings = node.warnings;
+      }
+
+      return compact;
+    });
+
+    return {
+      enabled: true,
+      success: true,
+      rootType: result.rootType ?? null,
+      coordinateSpace: result.coordinateSpace ?? 'scene',
+      nodes: returnedNodes,
+      summary: {
+        ...(result.summary || {}),
+        returnedNodes: returnedNodes.length,
+        sourceNodes: sourceNodes.length,
+        maxNodesApplied,
+        nodeTruncated: sourceNodes.length > returnedNodes.length,
+      },
+      sceneBounds: result.sceneBounds ?? null,
+      limits: result.limits ?? null,
+    };
+  }
+
+  private compactValidationResult(result: any, issueLimit = 20): any {
+    if (!result || result.success === false) {
+      return this.sectionError(true, result?.error || 'VALIDATE_SCENE_FAILED', result?.message || 'Scene validation failed.');
+    }
+
+    const issues = Array.isArray(result.issues) ? result.issues : [];
+    return {
+      enabled: true,
+      success: true,
+      valid: result.valid ?? false,
+      severity: result.severity ?? 'error',
+      summary: result.summary ?? null,
+      issues: issues.slice(0, issueLimit),
+      issueCount: issues.length,
+      issuesTruncated: issues.length > issueLimit,
+      limits: result.limits ?? null,
+    };
+  }
+
+  private async executeReadOnlySceneContextOperation(
+    operation: string,
+    params: OperationParams,
+    projectRoot: string,
+    errorCode: string
+  ): Promise<any> {
+    try {
+      const { stdout, stderr } = await this.executeOperation(operation, params, projectRoot);
+      const parsedResult = this.extractLastJsonObject(stdout);
+      if (!parsedResult) {
+        const stderrText = stderr?.trim();
+        return {
+          success: false,
+          error: errorCode,
+          message: stderrText
+            ? `Godot did not return valid JSON for ${operation}. Stderr: ${stderrText}`
+            : `Godot did not return valid JSON for ${operation}.`,
+        };
+      }
+
+      return parsedResult;
+    } catch (error: any) {
+      return {
+        success: false,
+        error: errorCode,
+        message: `Failed to run ${operation}: ${error?.message || 'Unknown error'}`,
+      };
+    }
+  }
+
+  private buildSceneCheckpointSummary(projectRoot: string, sceneRelativePath: string, sceneResourcePath: string): any {
+    const checkpointParentPath = resolve(projectRoot, '.godot_mcp');
+    const checkpointsRootPath = resolve(projectRoot, '.godot_mcp', 'checkpoints');
+    const emptySummary = {
+      enabled: true,
+      success: true,
+      checkpointCount: 0,
+      latestCheckpointPath: null,
+      latestCreatedAt: null,
+      recommendation: 'Use create_scene_checkpoint before applying writer tools.',
+    };
+
+    try {
+      if (existsSync(checkpointParentPath) && lstatSync(checkpointParentPath).isSymbolicLink()) {
+        return this.sectionError(true, 'CHECKPOINT_ROOT_UNSAFE', 'res://.godot_mcp/ must not be a symbolic link.');
+      }
+
+      if (!existsSync(checkpointsRootPath)) {
+        return emptySummary;
+      }
+
+      const checkpointRootStats = lstatSync(checkpointsRootPath);
+      if (checkpointRootStats.isSymbolicLink() || !checkpointRootStats.isDirectory()) {
+        return this.sectionError(true, 'CHECKPOINT_ROOT_UNSAFE', 'Checkpoint root is not a safe directory.');
+      }
+
+      const realCheckpointsRootPath = realpathSync(checkpointsRootPath);
+      if (!this.isPathInside(projectRoot, realCheckpointsRootPath)) {
+        return this.sectionError(true, 'CHECKPOINT_ROOT_UNSAFE', 'Resolved checkpoint root must stay inside the Godot project directory.');
+      }
+
+      const sceneId = this.sceneCheckpointId(sceneRelativePath);
+      const checkpointDirPath = resolve(realCheckpointsRootPath, sceneId);
+      const listed = this.listCheckpointDirectory(
+        projectRoot,
+        realCheckpointsRootPath,
+        checkpointDirPath,
+        `.godot_mcp/checkpoints/${sceneId}`,
+        sceneResourcePath,
+        true,
+        true
+      );
+
+      if (listed.error) {
+        return this.sectionError(true, listed.error, listed.message || 'Checkpoint listing failed.');
+      }
+
+      const items = listed.items.sort((a, b) => {
+        const timeCompare = (b.sortTime || 0) - (a.sortTime || 0);
+        return timeCompare !== 0
+          ? timeCompare
+          : String(b.checkpointPath).localeCompare(String(a.checkpointPath));
+      });
+
+      return {
+        enabled: true,
+        success: true,
+        checkpointCount: items.length,
+        latestCheckpointPath: items[0]?.checkpointPath ?? null,
+        latestCreatedAt: items[0]?.createdAt ?? null,
+        recommendation: items.length > 0
+          ? 'Use list_scene_checkpoints to choose a rollback point before restore.'
+          : 'Use create_scene_checkpoint before applying writer tools.',
+      };
+    } catch (error: any) {
+      return this.sectionError(
+        true,
+        'LIST_SCENE_CHECKPOINTS_FAILED',
+        `Failed to summarize scene checkpoints: ${error?.message || 'Unknown error'}`
+      );
+    }
+  }
+
+  private scanSceneContextAssets(
+    projectRoot: string,
+    scanRootPath: string,
+    rootResourcePath: string,
+    maxAssetsApplied: number
+  ): any {
+    const byType = this.createEmptyProjectAssetSummary();
+    const samples: Record<string, string[]> = {};
+    let totalFound = 0;
+    let returned = 0;
+    let scanTruncated = false;
+    const maxFilesToScan = 50000;
+    const maxDepth = 8;
+
+    const addSample = (typeKey: string, resourcePath: string) => {
+      if (returned >= maxAssetsApplied || typeKey === 'other') {
+        return;
+      }
+      if (!samples[typeKey]) {
+        samples[typeKey] = [];
+      }
+      samples[typeKey].push(resourcePath);
+      returned += 1;
+    };
+
+    const scanDirectory = (currentPath: string, depth: number) => {
+      if (scanTruncated || depth > maxDepth) {
+        return;
+      }
+
+      let entries;
+      try {
+        entries = readdirSync(currentPath, { withFileTypes: true })
+          .sort((a, b) => a.name.localeCompare(b.name));
+      } catch (error) {
+        this.logDebug(`Skipping unreadable scene context asset directory ${currentPath}: ${error}`);
+        return;
+      }
+
+      for (const entry of entries) {
+        if (scanTruncated || entry.isSymbolicLink()) {
+          continue;
+        }
+
+        const entryPath = join(currentPath, entry.name);
+        const relativeEntryPath = relative(projectRoot, entryPath).replace(/\\/g, '/');
+
+        if (entry.isDirectory()) {
+          if (this.shouldSkipProjectInspectionDirectory(relativeEntryPath)) {
+            continue;
+          }
+
+          try {
+            const directoryStats = lstatSync(entryPath);
+            if (directoryStats.isSymbolicLink() || !directoryStats.isDirectory()) {
+              continue;
+            }
+            const realDirectoryPath = realpathSync(entryPath);
+            if (!this.isPathInside(projectRoot, realDirectoryPath)) {
+              continue;
+            }
+          } catch (error) {
+            this.logDebug(`Skipping unreadable scene context asset directory ${entryPath}: ${error}`);
+            continue;
+          }
+
+          scanDirectory(entryPath, depth + 1);
+          continue;
+        }
+
+        if (!entry.isFile()) {
+          continue;
+        }
+
+        if (totalFound >= maxFilesToScan) {
+          scanTruncated = true;
+          return;
+        }
+
+        let fileStats;
+        try {
+          fileStats = lstatSync(entryPath);
+          if (fileStats.isSymbolicLink() || !fileStats.isFile()) {
+            continue;
+          }
+        } catch (error) {
+          this.logDebug(`Skipping unreadable scene context asset file ${entryPath}: ${error}`);
+          continue;
+        }
+
+        if (relativeEntryPath === '..' || relativeEntryPath.startsWith('../')) {
+          continue;
+        }
+
+        const extension = extname(entry.name).toLowerCase();
+        const typeKey = this.projectAssetSummaryKey(extension);
+        byType[typeKey] = (byType[typeKey] || 0) + 1;
+        totalFound += 1;
+        addSample(typeKey, `res://${relativeEntryPath}`);
+      }
+    };
+
+    scanDirectory(scanRootPath, 0);
+
+    return {
+      enabled: true,
+      success: true,
+      root: rootResourcePath,
+      fallbackUsed: false,
+      fallbackReason: null,
+      totalFound,
+      returned,
+      byType,
+      samples,
+      scanTruncated,
+    };
+  }
+
+  private buildSceneContextAssetSummary(
+    projectRoot: string,
+    assetRoot: unknown,
+    maxAssetsApplied: number
+  ): { summary?: any; error?: string; message?: string } {
+    try {
+      if (assetRoot !== undefined) {
+        if (typeof assetRoot !== 'string' || assetRoot.trim() === '') {
+          return { error: 'UNSAFE_ASSET_ROOT', message: 'assetRoot must be a non-empty Godot project-relative folder when provided.' };
+        }
+
+        const scanRootResult = this.normalizeScanRoot(assetRoot);
+        if (scanRootResult.error) {
+          return { error: 'UNSAFE_ASSET_ROOT', message: scanRootResult.error };
+        }
+
+        const scanRootPath = resolve(projectRoot, scanRootResult.relativeRoot);
+        if (!this.isPathInside(projectRoot, scanRootPath)) {
+          return { error: 'UNSAFE_ASSET_ROOT', message: 'assetRoot must stay inside the Godot project directory.' };
+        }
+
+        if (!existsSync(scanRootPath)) {
+          return { error: 'UNSAFE_ASSET_ROOT', message: `assetRoot does not exist: ${scanRootResult.scanRoot}` };
+        }
+
+        const scanRootStats = lstatSync(scanRootPath);
+        if (scanRootStats.isSymbolicLink()) {
+          return { error: 'UNSAFE_ASSET_ROOT', message: 'assetRoot must not be a symbolic link.' };
+        }
+
+        if (!scanRootStats.isDirectory()) {
+          return { error: 'UNSAFE_ASSET_ROOT', message: `assetRoot is not a directory: ${scanRootResult.scanRoot}` };
+        }
+
+        const realScanRootPath = realpathSync(scanRootPath);
+        if (!this.isPathInside(projectRoot, realScanRootPath)) {
+          return { error: 'UNSAFE_ASSET_ROOT', message: 'assetRoot must stay inside the Godot project directory.' };
+        }
+
+        return {
+          summary: this.scanSceneContextAssets(projectRoot, realScanRootPath, scanRootResult.scanRoot, maxAssetsApplied),
+        };
+      }
+
+      const defaultAssetsPath = resolve(projectRoot, 'assets');
+      if (existsSync(defaultAssetsPath)) {
+        const defaultAssetsStats = lstatSync(defaultAssetsPath);
+        if (!defaultAssetsStats.isSymbolicLink() && defaultAssetsStats.isDirectory()) {
+          const realDefaultAssetsPath = realpathSync(defaultAssetsPath);
+          if (this.isPathInside(projectRoot, realDefaultAssetsPath)) {
+            return {
+              summary: this.scanSceneContextAssets(projectRoot, realDefaultAssetsPath, 'res://assets', maxAssetsApplied),
+            };
+          }
+        }
+      }
+
+      const inspection = this.collectProjectInspectionFiles(projectRoot, null);
+      return {
+        summary: {
+          enabled: true,
+          success: true,
+          root: null,
+          fallbackUsed: true,
+          fallbackReason: 'Default res://assets folder was not found; returned a compact likely asset folder summary instead.',
+          totalFound: inspection.assetSummary.totalFilesScanned,
+          returned: 0,
+          byType: inspection.assetSummary.byType,
+          samples: {},
+          likelyAssetFolders: inspection.assetSummary.likelyAssetFolders.slice(0, 10),
+          scanTruncated: inspection.assetSummary.scanTruncated,
+        },
+      };
+    } catch (error: any) {
+      return {
+        summary: this.sectionError(
+          true,
+          'ASSET_SUMMARY_FAILED',
+          `Failed to summarize assets: ${error?.message || 'Unknown error'}`
+        ),
+      };
+    }
+  }
+
+  private buildSceneEditContextRecommendations(
+    sceneTree: any,
+    layout: any,
+    validation: any,
+    checkpointSummary: any,
+    assetSummary: any
+  ): string[] {
+    const recommendations: string[] = [];
+
+    if (checkpointSummary?.success && checkpointSummary.checkpointCount > 0) {
+      recommendations.push('Use list_scene_checkpoints to choose a rollback point before restore.');
+    } else if (checkpointSummary && checkpointSummary.enabled !== false) {
+      recommendations.push('Create a checkpoint before applying patch tools.');
+    }
+
+    if (validation?.success && validation.summary?.errorCount > 0) {
+      recommendations.push('Fix validation errors before applying complex patches.');
+    }
+
+    const visualAvailable = Boolean(layout?.sceneBounds?.visual?.available);
+    const collisionAvailable = Boolean(layout?.sceneBounds?.collision?.available);
+    if (layout?.success && !visualAvailable && !collisionAvailable) {
+      recommendations.push('Use explicit placement positions or add visible/collision nodes before relative placement.');
+    }
+
+    if (assetSummary?.success && assetSummary.totalFound > 0) {
+      recommendations.push('Use get_asset_info on candidate assets before place_asset steps.');
+    }
+
+    if (sceneTree?.success && layout?.success) {
+      recommendations.push('Use dry_run_scene_patch before apply_scene_patch.');
+    }
+
+    return recommendations;
+  }
+
+  private sceneEditToolWorkflow(): any {
+    return {
+      safeEditFlow: [
+        'inspect_scene_edit_context',
+        'get_asset_info',
+        'dry_run_scene_patch',
+        'apply_scene_patch',
+        'validate_scene',
+      ],
+      rollbackFlow: [
+        'list_scene_checkpoints',
+        'restore_scene_checkpoint',
+      ],
+    };
+  }
+
   /**
    * Synchronous validation for constructor use
    * This is a quick check that only verifies file existence, not executable validity
@@ -2760,6 +3307,64 @@ class GodotServer {
               },
             },
             required: ['projectPath'],
+          },
+        },
+        {
+          name: 'inspect_scene_edit_context',
+          description: 'Bundle read-only scene tree, layout, validation, checkpoint, and asset context for one Godot scene',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Absolute path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Existing Godot scene path such as res://scenes/Main.tscn or scenes/Main.tscn',
+              },
+              includeSceneTree: {
+                type: 'boolean',
+                description: 'Whether to include compact read_scene_tree output (default: true)',
+              },
+              includeLayout: {
+                type: 'boolean',
+                description: 'Whether to include compact get_scene_layout output (default: true)',
+              },
+              includeValidation: {
+                type: 'boolean',
+                description: 'Whether to include compact validate_scene output (default: true)',
+              },
+              includeCheckpoints: {
+                type: 'boolean',
+                description: 'Whether to include checkpoint summary for this scene (default: true)',
+              },
+              includeAssetSummary: {
+                type: 'boolean',
+                description: 'Whether to include compact asset summary for placement planning (default: true)',
+              },
+              includeRecommendations: {
+                type: 'boolean',
+                description: 'Whether to include concise scene-edit workflow recommendations (default: true)',
+              },
+              maxDepth: {
+                type: 'number',
+                description: 'Maximum scene tree/layout/validation depth (default: 50, max: 200)',
+              },
+              maxNodes: {
+                type: 'number',
+                description: 'Maximum scene tree/layout nodes to return in compact sections (default: 300, max: 2000)',
+              },
+              maxAssets: {
+                type: 'number',
+                description: 'Maximum representative asset paths to return (default: 100, max: 1000)',
+              },
+              assetRoot: {
+                type: 'string',
+                description: 'Optional Godot project-relative asset folder such as res://assets or assets',
+              },
+            },
+            required: ['projectPath', 'scenePath'],
           },
         },
         {
@@ -3840,6 +4445,8 @@ class GodotServer {
           return await this.handleGetProjectInfo(request.params.arguments);
         case 'inspect_project_capabilities':
           return await this.handleInspectProjectCapabilities(request.params.arguments);
+        case 'inspect_scene_edit_context':
+          return await this.handleInspectSceneEditContext(request.params.arguments);
         case 'scan_assets':
           return await this.handleScanAssets(request.params.arguments);
         case 'get_asset_info':
@@ -4614,6 +5221,407 @@ class GodotServer {
       return this.inspectProjectCapabilitiesErrorResponse(
         'INSPECT_PROJECT_CAPABILITIES_FAILED',
         `Failed to inspect project capabilities: ${error?.message || 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * Handle the inspect_scene_edit_context tool
+   */
+  private async handleInspectSceneEditContext(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || typeof args.projectPath !== 'string') {
+      return this.inspectSceneEditContextErrorResponse(
+        'MISSING_PROJECT_PATH',
+        'projectPath is required and must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    if (!args.scenePath || typeof args.scenePath !== 'string') {
+      return this.inspectSceneEditContextErrorResponse(
+        'MISSING_SCENE_PATH',
+        'scenePath is required and must be a Godot scene path such as res://scenes/Main.tscn or scenes/Main.tscn.'
+      );
+    }
+
+    if (args.projectPath.includes('\0')) {
+      return this.inspectSceneEditContextErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must not contain null bytes.'
+      );
+    }
+
+    if (!isAbsolute(args.projectPath)) {
+      return this.inspectSceneEditContextErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    const scenePathResult = this.normalizeScenePath(args.scenePath);
+    if (scenePathResult.error) {
+      return this.inspectSceneEditContextErrorResponse(
+        'UNSAFE_SCENE_PATH',
+        scenePathResult.error
+      );
+    }
+
+    const sceneExtension = extname(scenePathResult.relativePath).toLowerCase();
+    if (!['.tscn', '.scn'].includes(sceneExtension)) {
+      return this.inspectSceneEditContextErrorResponse(
+        'SCENE_PATH_NOT_SCENE_FILE',
+        'scenePath must point to a .tscn or .scn scene file.'
+      );
+    }
+
+    const booleanOptions = [
+      'includeSceneTree',
+      'includeLayout',
+      'includeValidation',
+      'includeCheckpoints',
+      'includeAssetSummary',
+      'includeRecommendations',
+    ];
+    for (const option of booleanOptions) {
+      if (args[option] !== undefined && typeof args[option] !== 'boolean') {
+        return this.inspectSceneEditContextErrorResponse(
+          'INSPECT_SCENE_EDIT_CONTEXT_FAILED',
+          `${option} must be a boolean.`
+        );
+      }
+    }
+
+    const includeSceneTree = args.includeSceneTree !== undefined ? args.includeSceneTree : true;
+    const includeLayout = args.includeLayout !== undefined ? args.includeLayout : true;
+    const includeValidation = args.includeValidation !== undefined ? args.includeValidation : true;
+    const includeCheckpoints = args.includeCheckpoints !== undefined ? args.includeCheckpoints : true;
+    const includeAssetSummary = args.includeAssetSummary !== undefined ? args.includeAssetSummary : true;
+    const includeRecommendations = args.includeRecommendations !== undefined ? args.includeRecommendations : true;
+
+    const maxDepthRequested = args.maxDepth !== undefined ? args.maxDepth : null;
+    let maxDepthApplied = 50;
+    let maxDepthClamped = false;
+    if (args.maxDepth !== undefined) {
+      if (typeof args.maxDepth !== 'number' || !Number.isFinite(args.maxDepth) || args.maxDepth < 1) {
+        return this.inspectSceneEditContextErrorResponse(
+          'INVALID_MAX_DEPTH',
+          'maxDepth must be a number between 1 and 200.'
+        );
+      }
+
+      if (args.maxDepth > 200) {
+        maxDepthApplied = 200;
+        maxDepthClamped = true;
+      } else {
+        maxDepthApplied = Math.floor(args.maxDepth);
+      }
+    }
+
+    const maxNodesRequested = args.maxNodes !== undefined ? args.maxNodes : null;
+    let maxNodesApplied = 300;
+    let maxNodesClamped = false;
+    if (args.maxNodes !== undefined) {
+      if (typeof args.maxNodes !== 'number' || !Number.isFinite(args.maxNodes) || args.maxNodes < 1) {
+        return this.inspectSceneEditContextErrorResponse(
+          'INVALID_MAX_NODES',
+          'maxNodes must be a number between 1 and 2000.'
+        );
+      }
+
+      if (args.maxNodes > 2000) {
+        maxNodesApplied = 2000;
+        maxNodesClamped = true;
+      } else {
+        maxNodesApplied = Math.floor(args.maxNodes);
+      }
+    }
+
+    const maxAssetsRequested = args.maxAssets !== undefined ? args.maxAssets : null;
+    let maxAssetsApplied = 100;
+    let maxAssetsClamped = false;
+    if (args.maxAssets !== undefined) {
+      if (typeof args.maxAssets !== 'number' || !Number.isFinite(args.maxAssets) || args.maxAssets < 1) {
+        return this.inspectSceneEditContextErrorResponse(
+          'INVALID_MAX_ASSETS',
+          'maxAssets must be a number between 1 and 1000.'
+        );
+      }
+
+      if (args.maxAssets > 1000) {
+        maxAssetsApplied = 1000;
+        maxAssetsClamped = true;
+      } else {
+        maxAssetsApplied = Math.floor(args.maxAssets);
+      }
+    }
+
+    try {
+      const normalizedProjectPath = resolve(args.projectPath);
+      if (!existsSync(normalizedProjectPath)) {
+        return this.inspectSceneEditContextErrorResponse(
+          'PROJECT_PATH_NOT_FOUND',
+          `Project path does not exist: ${args.projectPath}`
+        );
+      }
+
+      const projectPathStats = lstatSync(normalizedProjectPath);
+      if (projectPathStats.isSymbolicLink()) {
+        return this.inspectSceneEditContextErrorResponse(
+          'PROJECT_PATH_IS_SYMLINK',
+          'projectPath must not be a symbolic link.'
+        );
+      }
+
+      if (!projectPathStats.isDirectory()) {
+        return this.inspectSceneEditContextErrorResponse(
+          'PROJECT_PATH_NOT_DIRECTORY',
+          `Project path is not a directory: ${args.projectPath}`
+        );
+      }
+
+      const projectRoot = realpathSync(normalizedProjectPath);
+      const projectFile = join(projectRoot, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.inspectSceneEditContextErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          `Not a valid Godot project: ${args.projectPath}. The directory must contain a project.godot file.`
+        );
+      }
+
+      const projectFileStats = lstatSync(projectFile);
+      if (projectFileStats.isSymbolicLink() || !projectFileStats.isFile()) {
+        return this.inspectSceneEditContextErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          'project.godot must be a regular file and must not be a symbolic link.'
+        );
+      }
+
+      const sceneFilePath = resolve(projectRoot, scenePathResult.relativePath);
+      if (!this.isPathInside(projectRoot, sceneFilePath)) {
+        return this.inspectSceneEditContextErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must stay inside the Godot project directory.'
+        );
+      }
+
+      if (!existsSync(sceneFilePath)) {
+        return this.inspectSceneEditContextErrorResponse(
+          'SCENE_PATH_NOT_FOUND',
+          `Scene file does not exist: ${scenePathResult.resourcePath}`
+        );
+      }
+
+      const sceneFileStats = lstatSync(sceneFilePath);
+      if (sceneFileStats.isSymbolicLink()) {
+        return this.inspectSceneEditContextErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must not be a symbolic link.'
+        );
+      }
+
+      if (!sceneFileStats.isFile()) {
+        return this.inspectSceneEditContextErrorResponse(
+          'SCENE_PATH_NOT_FOUND',
+          `Scene path is not a file: ${scenePathResult.resourcePath}`
+        );
+      }
+
+      const realSceneFilePath = realpathSync(sceneFilePath);
+      if (!this.isPathInside(projectRoot, realSceneFilePath)) {
+        return this.inspectSceneEditContextErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must stay inside the Godot project directory.'
+        );
+      }
+
+      if (args.assetRoot !== undefined) {
+        if (typeof args.assetRoot !== 'string' || args.assetRoot.trim() === '') {
+          return this.inspectSceneEditContextErrorResponse(
+            'UNSAFE_ASSET_ROOT',
+            'assetRoot must be a non-empty Godot project-relative folder when provided.'
+          );
+        }
+
+        const assetRootResult = this.normalizeScanRoot(args.assetRoot);
+        if (assetRootResult.error) {
+          return this.inspectSceneEditContextErrorResponse(
+            'UNSAFE_ASSET_ROOT',
+            assetRootResult.error
+          );
+        }
+
+        if (assetRootResult.relativeRoot && this.shouldSkipProjectInspectionDirectory(assetRootResult.relativeRoot)) {
+          return this.inspectSceneEditContextErrorResponse(
+            'UNSAFE_ASSET_ROOT',
+            'assetRoot must not point to an excluded project/system directory.'
+          );
+        }
+
+        const assetRootPath = resolve(projectRoot, assetRootResult.relativeRoot);
+        if (!this.isPathInside(projectRoot, assetRootPath)) {
+          return this.inspectSceneEditContextErrorResponse(
+            'UNSAFE_ASSET_ROOT',
+            'assetRoot must stay inside the Godot project directory.'
+          );
+        }
+
+        if (!existsSync(assetRootPath)) {
+          return this.inspectSceneEditContextErrorResponse(
+            'UNSAFE_ASSET_ROOT',
+            `assetRoot does not exist: ${assetRootResult.scanRoot}`
+          );
+        }
+
+        const assetRootStats = lstatSync(assetRootPath);
+        if (assetRootStats.isSymbolicLink()) {
+          return this.inspectSceneEditContextErrorResponse(
+            'UNSAFE_ASSET_ROOT',
+            'assetRoot must not be a symbolic link.'
+          );
+        }
+
+        if (!assetRootStats.isDirectory()) {
+          return this.inspectSceneEditContextErrorResponse(
+            'UNSAFE_ASSET_ROOT',
+            `assetRoot is not a directory: ${assetRootResult.scanRoot}`
+          );
+        }
+
+        const realAssetRootPath = realpathSync(assetRootPath);
+        if (!this.isPathInside(projectRoot, realAssetRootPath)) {
+          return this.inspectSceneEditContextErrorResponse(
+            'UNSAFE_ASSET_ROOT',
+            'assetRoot must stay inside the Godot project directory.'
+          );
+        }
+      }
+
+      const projectPathForGodot = projectRoot.replace(/\\/g, '/');
+      const baseGodotParams = {
+        projectPath: projectPathForGodot,
+        scenePath: scenePathResult.resourcePath,
+        maxDepth: maxDepthApplied,
+        maxDepthRequested,
+        maxDepthClamped,
+      };
+
+      let sceneTree: any = { enabled: false };
+      if (includeSceneTree) {
+        const readSceneTreeResult = await this.executeReadOnlySceneContextOperation(
+          'read_scene_tree',
+          {
+            ...baseGodotParams,
+            includeProperties: true,
+            includeScripts: true,
+            includeGroups: false,
+            includeResourcePaths: true,
+          },
+          projectRoot,
+          'READ_SCENE_TREE_FAILED'
+        );
+        sceneTree = this.compactSceneTreeResult(readSceneTreeResult, maxNodesApplied);
+      }
+
+      let layout: any = { enabled: false };
+      if (includeLayout) {
+        const layoutResult = await this.executeReadOnlySceneContextOperation(
+          'get_scene_layout',
+          {
+            ...baseGodotParams,
+            includeHidden: false,
+            includeVisualBounds: true,
+            includeCollisionBounds: true,
+            includeControlRects: true,
+            includeResources: false,
+            includeChildren: false,
+            includeWarnings: true,
+          },
+          projectRoot,
+          'GET_SCENE_LAYOUT_FAILED'
+        );
+        layout = this.compactLayoutResult(layoutResult, maxNodesApplied);
+      }
+
+      let validation: any = { enabled: false };
+      if (includeValidation) {
+        const validationResult = await this.executeReadOnlySceneContextOperation(
+          'validate_scene',
+          {
+            ...baseGodotParams,
+            includeInfo: true,
+            checkResources: true,
+            checkScripts: true,
+            checkNodeBasics: true,
+            checkCollisions: true,
+            checkRendering: true,
+            checkAudio: true,
+            checkControls: true,
+            checkOwnership: true,
+          },
+          projectRoot,
+          'VALIDATE_SCENE_FAILED'
+        );
+        validation = this.compactValidationResult(validationResult, 20);
+      }
+
+      const checkpointSummary = includeCheckpoints
+        ? this.buildSceneCheckpointSummary(projectRoot, scenePathResult.relativePath, scenePathResult.resourcePath)
+        : { enabled: false };
+
+      let assetSummary: any = { enabled: false };
+      if (includeAssetSummary) {
+        const assetSummaryResult = this.buildSceneContextAssetSummary(projectRoot, args.assetRoot, maxAssetsApplied);
+        if (assetSummaryResult.error) {
+          return this.inspectSceneEditContextErrorResponse(assetSummaryResult.error, assetSummaryResult.message || 'Invalid assetRoot.');
+        }
+        assetSummary = assetSummaryResult.summary || this.sectionError(true, 'ASSET_SUMMARY_FAILED', 'Asset summary failed.');
+      }
+
+      const recommendations = includeRecommendations
+        ? this.buildSceneEditContextRecommendations(sceneTree, layout, validation, checkpointSummary, assetSummary)
+        : [];
+
+      const result = {
+        success: true,
+        projectPath: projectPathForGodot,
+        scenePath: scenePathResult.resourcePath,
+        sceneFile: {
+          sizeBytes: sceneFileStats.size,
+          modifiedTime: sceneFileStats.mtime.toISOString(),
+        },
+        sceneTree,
+        layout,
+        validation,
+        checkpointSummary,
+        assetSummary,
+        recommendations,
+        toolWorkflow: this.sceneEditToolWorkflow(),
+        limits: {
+          maxDepthRequested,
+          maxDepthApplied,
+          maxDepthClamped,
+          maxNodesRequested,
+          maxNodesApplied,
+          maxNodesClamped,
+          maxAssetsRequested,
+          maxAssetsApplied,
+          maxAssetsClamped,
+        },
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.inspectSceneEditContextErrorResponse(
+        'INSPECT_SCENE_EDIT_CONTEXT_FAILED',
+        `Failed to inspect scene edit context: ${error?.message || 'Unknown error'}`
       );
     }
   }
