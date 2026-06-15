@@ -28,7 +28,7 @@ func _init():
     
     var operation = args[operation_index]
     var params_json = args[params_index]
-    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "dry_run_align_nodes" or operation == "align_nodes" or operation == "dry_run_place_asset_in_scene" or operation == "place_asset_in_scene" or operation == "dry_run_update_node_properties" or operation == "update_node_properties" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
+    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "dry_run_align_nodes" or operation == "align_nodes" or operation == "dry_run_place_asset_in_scene" or operation == "place_asset_in_scene" or operation == "dry_run_update_node_properties" or operation == "update_node_properties" or operation == "dry_run_scene_patch" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
 
     if quiet_output:
         debug_mode = false
@@ -79,6 +79,8 @@ func _init():
             dry_run_update_node_properties(params)
         "update_node_properties":
             update_node_properties(params)
+        "dry_run_scene_patch":
+            dry_run_scene_patch(params)
         "validate_scene":
             validate_scene(params)
         "get_asset_info":
@@ -3522,6 +3524,522 @@ func dry_run_update_node_properties(params):
     var result = update_node_properties_finish_result(planned["project_path"], planned["scene_path"], planned["update_count"], planned["issues"], planned["plan"], planned["include_plan"], planned["include_layout_before"], planned["layout_data"], planned["limits"])
     print(JSON.stringify(result))
     planned["scene_root"].free()
+
+func scene_patch_error(error_code, message):
+    return {
+        "success": false,
+        "error": error_code,
+        "message": message
+    }
+
+func scene_patch_add_issue(issues, severity, code, message, step_index=-1, step_type=null, node_path=null, suggestion=null):
+    var issue = {
+        "severity": severity,
+        "code": code,
+        "message": message
+    }
+    if step_index != -1:
+        issue["stepIndex"] = step_index
+    if step_type != null:
+        issue["stepType"] = step_type
+    if node_path != null:
+        issue["nodePath"] = node_path
+    if suggestion != null:
+        issue["suggestion"] = suggestion
+    issues.append(issue)
+
+func scene_patch_wrap_issue(issue, step_index, step_type):
+    var wrapped = issue.duplicate(true) if typeof(issue) == TYPE_DICTIONARY else {
+        "severity": "error",
+        "code": "INVALID_STEP",
+        "message": "Nested planner returned a non-object issue."
+    }
+    wrapped["stepIndex"] = step_index
+    wrapped["stepType"] = step_type
+    return wrapped
+
+func scene_patch_issue_counts(issues):
+    return dry_align_issue_counts(issues)
+
+func scene_patch_severity(issues):
+    return dry_align_severity_from_counts(scene_patch_issue_counts(issues))
+
+func scene_patch_step_result(step_index, step_type, issues, plan, include_plan, extra={}):
+    var counts = scene_patch_issue_counts(issues)
+    var result = {
+        "stepIndex": step_index,
+        "type": step_type,
+        "valid": counts["errorCount"] == 0,
+        "severity": dry_align_severity_from_counts(counts),
+        "plan": plan if include_plan else [],
+        "issues": issues,
+        "summary": {
+            "plannedActionCount": plan.size(),
+            "errorCount": counts["errorCount"],
+            "warningCount": counts["warningCount"],
+            "infoCount": counts["infoCount"]
+        }
+    }
+    for key in extra.keys():
+        result[key] = extra[key]
+    return result
+
+func scene_patch_sanitize_checkpoint_name(checkpoint_name):
+    if checkpoint_name == null:
+        return {"name": "checkpoint"}
+    if typeof(checkpoint_name) != TYPE_STRING:
+        return {"error": "checkpointName must be a string when provided."}
+    if checkpoint_name.contains("\u0000"):
+        return {"error": "checkpointName must not contain null bytes."}
+
+    var raw = checkpoint_name.strip_edges().to_lower()
+    var result = ""
+    var previous_underscore = false
+    for index in range(raw.length()):
+        var code = raw.unicode_at(index)
+        var is_alpha = code >= 97 and code <= 122
+        var is_digit = code >= 48 and code <= 57
+        var is_separator = code == 32 or code == 45 or code == 95
+        if is_alpha or is_digit:
+            result += raw.substr(index, 1)
+            previous_underscore = false
+        elif is_separator or not previous_underscore:
+            result += "_"
+            previous_underscore = true
+
+    result = result.strip_edges()
+    while result.begins_with("_"):
+        result = result.substr(1)
+    while result.ends_with("_"):
+        result = result.substr(0, result.length() - 1)
+    if result.length() > 64:
+        result = result.substr(0, 64)
+    while result.ends_with("_"):
+        result = result.substr(0, result.length() - 1)
+    if result.is_empty():
+        result = "checkpoint"
+    return {"name": result}
+
+func scene_patch_normalized_node_path(path_value):
+    if typeof(path_value) != TYPE_STRING:
+        return null
+    var normalized = dry_run_normalize_scene_node_path(path_value)
+    if normalized.has("path"):
+        return normalized["path"]
+    return null
+
+func scene_patch_path_is_planned(path_value, planned_node_paths):
+    var normalized = scene_patch_normalized_node_path(path_value)
+    return normalized != null and planned_node_paths.has(normalized)
+
+func scene_patch_collect_operation_paths(operation):
+    var paths = []
+    if typeof(operation) != TYPE_DICTIONARY:
+        return paths
+
+    var node_path = dry_run_get_value(operation, ["nodePath", "node_path"], null)
+    if node_path != null:
+        paths.append(node_path)
+
+    var reference_node_path = dry_run_get_value(operation, ["referenceNodePath", "reference_node_path"], null)
+    if reference_node_path != null:
+        paths.append(reference_node_path)
+
+    var node_paths = dry_run_get_value(operation, ["nodePaths", "node_paths"], null)
+    if typeof(node_paths) == TYPE_ARRAY:
+        for path_value in node_paths:
+            paths.append(path_value)
+
+    var reference = dry_run_get_value(operation, ["reference"], null)
+    if typeof(reference) == TYPE_DICTIONARY:
+        var reference_path = dry_run_get_value(reference, ["nodePath", "node_path"], null)
+        if reference_path != null:
+            paths.append(reference_path)
+
+    return paths
+
+func scene_patch_first_planned_reference(step, step_type, planned_node_paths):
+    if step_type == "place_asset":
+        var parent_path = dry_run_get_value(step, ["parentPath", "parent_path"], null)
+        if parent_path != null and scene_patch_path_is_planned(parent_path, planned_node_paths):
+            return scene_patch_normalized_node_path(parent_path)
+
+    if step_type == "align_nodes":
+        var operations = dry_run_get_value(step, ["operations"], [])
+        if typeof(operations) == TYPE_ARRAY:
+            for operation in operations:
+                for path_value in scene_patch_collect_operation_paths(operation):
+                    if scene_patch_path_is_planned(path_value, planned_node_paths):
+                        return scene_patch_normalized_node_path(path_value)
+
+    if step_type == "update_node_properties":
+        var updates = dry_run_get_value(step, ["updates"], [])
+        if typeof(updates) == TYPE_ARRAY:
+            for update in updates:
+                if typeof(update) != TYPE_DICTIONARY:
+                    continue
+                var node_path = dry_run_get_value(update, ["nodePath", "node_path"], null)
+                if scene_patch_path_is_planned(node_path, planned_node_paths):
+                    return scene_patch_normalized_node_path(node_path)
+
+    return null
+
+func scene_patch_wrap_step_issues(step_issues, top_issues, step_index, step_type):
+    var wrapped = []
+    for issue in step_issues:
+        var item = scene_patch_wrap_issue(issue, step_index, step_type)
+        wrapped.append(item)
+        top_issues.append(item.duplicate(true))
+    return wrapped
+
+func scene_patch_add_plan_entries(flattened_plan, step_plan, step_index):
+    for plan_item in step_plan:
+        if typeof(plan_item) != TYPE_DICTIONARY:
+            continue
+        var flattened_item = plan_item.duplicate(true)
+        flattened_item["stepIndex"] = step_index
+        flattened_plan.append(flattened_item)
+
+func scene_patch_track_created_nodes(step_plan, planned_node_paths):
+    for plan_item in step_plan:
+        if typeof(plan_item) != TYPE_DICTIONARY:
+            continue
+        if plan_item.get("action", "") == "add_node" and plan_item.has("path"):
+            planned_node_paths[str(plan_item["path"])] = true
+
+func scene_patch_validation_result(project_path, scene_path, scene_root, source_params, max_depth, max_depth_requested, max_depth_clamped):
+    var options = {
+        "includeInfo": dry_run_get_value(source_params, ["includeInfo", "include_info"], true),
+        "checkResources": dry_run_get_value(source_params, ["checkResources", "check_resources"], true),
+        "checkScripts": dry_run_get_value(source_params, ["checkScripts", "check_scripts"], true),
+        "checkNodeBasics": dry_run_get_value(source_params, ["checkNodeBasics", "check_node_basics"], true),
+        "checkCollisions": dry_run_get_value(source_params, ["checkCollisions", "check_collisions"], true),
+        "checkRendering": dry_run_get_value(source_params, ["checkRendering", "check_rendering"], true),
+        "checkAudio": dry_run_get_value(source_params, ["checkAudio", "check_audio"], true),
+        "checkControls": dry_run_get_value(source_params, ["checkControls", "check_controls"], true),
+        "checkOwnership": dry_run_get_value(source_params, ["checkOwnership", "check_ownership"], true)
+    }
+    var issues = []
+    var summary = {
+        "totalNodes": 0,
+        "errorCount": 0,
+        "warningCount": 0,
+        "infoCount": 0,
+        "maxDepthReached": 0,
+        "depthTruncated": false,
+        "nodeTypes": {}
+    }
+    var limits = {
+        "maxDepthRequested": max_depth_requested,
+        "maxDepthApplied": max_depth,
+        "maxDepthClamped": max_depth_clamped
+    }
+    traverse_validate_scene(scene_root, scene_root, 0, max_depth, options, summary, issues)
+    var result = finish_validation_result(project_path, scene_path, scene_root, issues, summary, limits, options)
+    result["validationScope"] = "pre_patch_current_scene"
+    return result
+
+func scene_patch_place_asset_step(step, project_path, scene_path, max_depth, max_depth_requested, max_depth_clamped, include_plan, step_index, top_issues, planned_node_paths):
+    var step_type = "place_asset"
+    var step_issues = []
+    var step_plan = []
+
+    var cumulative_path = scene_patch_first_planned_reference(step, step_type, planned_node_paths)
+    if cumulative_path != null:
+        scene_patch_add_issue(step_issues, "error", "CUMULATIVE_SIMULATION_UNSUPPORTED", "This step references a node planned by an earlier step, but cumulative simulation is not supported yet.", step_index, step_type, cumulative_path, "Apply the earlier placement first, then run a new dry-run for dependent placement.")
+        var wrapped_cumulative = scene_patch_wrap_step_issues(step_issues, top_issues, step_index, step_type)
+        return scene_patch_step_result(step_index, step_type, wrapped_cumulative, step_plan, include_plan)
+
+    var asset_path = dry_run_get_value(step, ["assetPath", "asset_path"], null)
+    var sub_params = {
+        "project_path": project_path,
+        "scene_path": scene_path,
+        "asset_path": asset_path,
+        "parent_path": dry_run_get_value(step, ["parentPath", "parent_path"], null),
+        "node_name": dry_run_get_value(step, ["nodeName", "node_name"], null),
+        "node_type": dry_run_get_value(step, ["nodeType", "node_type"], null),
+        "asset_property": dry_run_get_value(step, ["assetProperty", "asset_property"], null),
+        "placement": dry_run_get_value(step, ["placement"], null),
+        "properties": dry_run_get_value(step, ["properties"], null),
+        "bounds_source": dry_run_get_value(step, ["boundsSource", "bounds_source"], "visual"),
+        "include_plan": true,
+        "include_layout_before": false,
+        "include_asset_info": true,
+        "max_depth": max_depth,
+        "max_depth_requested": max_depth_requested,
+        "max_depth_clamped": max_depth_clamped
+    }
+
+    var planned = place_asset_plan(sub_params)
+    if planned.has("fatal"):
+        scene_patch_add_issue(step_issues, "error", planned["fatal"]["error"], planned["fatal"]["message"], step_index, step_type)
+        var wrapped_fatal = scene_patch_wrap_step_issues(step_issues, top_issues, step_index, step_type)
+        return scene_patch_step_result(step_index, step_type, wrapped_fatal, step_plan, include_plan)
+
+    step_plan = planned["plan"]
+    var summary = {
+        "assetType": planned["asset_type"],
+        "nodeType": planned["node_type"],
+        "assetProperty": planned["asset_property"],
+        "parentPath": planned["parent_path"],
+        "proposedNodePath": planned["proposed_path"]
+    }
+    var wrapped_issues = scene_patch_wrap_step_issues(planned["issues"], top_issues, step_index, step_type)
+    if not dry_align_has_error_issues(planned["issues"]):
+        scene_patch_track_created_nodes(step_plan, planned_node_paths)
+    var result = scene_patch_step_result(step_index, step_type, wrapped_issues, step_plan, include_plan, {
+        "assetPath": planned["asset_path"],
+        "proposedNode": planned["proposed_node"],
+        "plannerSummary": summary
+    })
+    planned["scene_root"].free()
+    return result
+
+func scene_patch_align_nodes_step(step, project_path, scene_path, scene_root, max_depth, max_depth_requested, max_depth_clamped, include_plan, step_index, top_issues, planned_node_paths):
+    var step_type = "align_nodes"
+    var step_issues = []
+    var step_plan = []
+    var cumulative_path = scene_patch_first_planned_reference(step, step_type, planned_node_paths)
+    if cumulative_path != null:
+        scene_patch_add_issue(step_issues, "error", "CUMULATIVE_SIMULATION_UNSUPPORTED", "This step references a node planned by an earlier step, but cumulative simulation is not supported yet.", step_index, step_type, cumulative_path, "Apply the asset placement first, then run a new dry-run for alignment.")
+        var wrapped_cumulative = scene_patch_wrap_step_issues(step_issues, top_issues, step_index, step_type)
+        return scene_patch_step_result(step_index, step_type, wrapped_cumulative, step_plan, include_plan)
+
+    var operations = dry_run_get_value(step, ["operations"], null)
+    var operation_count = operations.size() if typeof(operations) == TYPE_ARRAY else 0
+    var sub_params = {
+        "project_path": project_path,
+        "scene_path": scene_path,
+        "operations": operations,
+        "bounds_source": dry_run_get_value(step, ["boundsSource", "bounds_source"], "visual"),
+        "include_plan": true,
+        "include_layout_before": false,
+        "max_operations": operation_count,
+        "max_operations_requested": null,
+        "max_operations_clamped": false,
+        "max_depth": max_depth,
+        "max_depth_requested": max_depth_requested,
+        "max_depth_clamped": max_depth_clamped
+    }
+    var result = dry_run_align_nodes_result(sub_params, scene_root)
+    if result.has("success") and result["success"] == false:
+        scene_patch_add_issue(step_issues, "error", result["error"], result["message"], step_index, step_type)
+        var wrapped_fatal = scene_patch_wrap_step_issues(step_issues, top_issues, step_index, step_type)
+        return scene_patch_step_result(step_index, step_type, wrapped_fatal, step_plan, include_plan)
+
+    step_plan = result["plan"] if result.has("plan") else []
+    var wrapped_issues = scene_patch_wrap_step_issues(result["issues"] if result.has("issues") else [], top_issues, step_index, step_type)
+    return scene_patch_step_result(step_index, step_type, wrapped_issues, step_plan, include_plan, {
+        "plannerSummary": result["summary"] if result.has("summary") else {}
+    })
+
+func scene_patch_update_properties_step(step, project_path, scene_path, max_depth, max_depth_requested, max_depth_clamped, include_plan, step_index, top_issues, planned_node_paths):
+    var step_type = "update_node_properties"
+    var step_issues = []
+    var step_plan = []
+    var cumulative_path = scene_patch_first_planned_reference(step, step_type, planned_node_paths)
+    if cumulative_path != null:
+        scene_patch_add_issue(step_issues, "error", "CUMULATIVE_SIMULATION_UNSUPPORTED", "This step references a node planned by an earlier step, but cumulative simulation is not supported yet.", step_index, step_type, cumulative_path, "Apply the asset placement first, then run a new dry-run for property updates.")
+        var wrapped_cumulative = scene_patch_wrap_step_issues(step_issues, top_issues, step_index, step_type)
+        return scene_patch_step_result(step_index, step_type, wrapped_cumulative, step_plan, include_plan)
+
+    var updates = dry_run_get_value(step, ["updates"], null)
+    var update_count = updates.size() if typeof(updates) == TYPE_ARRAY else 0
+    var sub_params = {
+        "project_path": project_path,
+        "scene_path": scene_path,
+        "updates": updates,
+        "include_plan": true,
+        "include_current_values": true,
+        "include_layout_before": false,
+        "validate_properties": true,
+        "max_updates": update_count,
+        "max_updates_requested": null,
+        "max_updates_clamped": false,
+        "max_depth": max_depth,
+        "max_depth_requested": max_depth_requested,
+        "max_depth_clamped": max_depth_clamped
+    }
+    var planned = update_node_properties_plan(sub_params)
+    if planned.has("fatal"):
+        scene_patch_add_issue(step_issues, "error", planned["fatal"]["error"], planned["fatal"]["message"], step_index, step_type)
+        var wrapped_fatal = scene_patch_wrap_step_issues(step_issues, top_issues, step_index, step_type)
+        return scene_patch_step_result(step_index, step_type, wrapped_fatal, step_plan, include_plan)
+
+    step_plan = planned["plan"]
+    var wrapped_issues = scene_patch_wrap_step_issues(planned["issues"], top_issues, step_index, step_type)
+    var result = scene_patch_step_result(step_index, step_type, wrapped_issues, step_plan, include_plan, {
+        "plannerSummary": {
+            "updateCount": planned["update_count"],
+            "plannedChangeCount": step_plan.size()
+        }
+    })
+    planned["scene_root"].free()
+    return result
+
+func scene_patch_validate_step(step, project_path, scene_path, scene_root, max_depth, max_depth_requested, max_depth_clamped, include_plan, step_index, top_issues):
+    var step_type = "validate_scene"
+    var validation = scene_patch_validation_result(project_path, scene_path, scene_root, step, max_depth, max_depth_requested, max_depth_clamped)
+    var step_plan = [{
+        "action": "validate_scene",
+        "scenePath": scene_path,
+        "validationScope": "pre_patch_current_scene"
+    }]
+    var wrapped_issues = scene_patch_wrap_step_issues(validation["issues"], top_issues, step_index, step_type)
+    return scene_patch_step_result(step_index, step_type, wrapped_issues, step_plan, include_plan, {
+        "validationScope": "pre_patch_current_scene",
+        "validation": validation
+    })
+
+func scene_patch_checkpoint_step(step, scene_path, include_checkpoints, include_plan, step_index, top_issues):
+    var step_type = "create_checkpoint"
+    var step_issues = []
+    var step_plan = []
+    var checkpoint_name_result = scene_patch_sanitize_checkpoint_name(dry_run_get_value(step, ["checkpointName", "checkpoint_name"], "checkpoint"))
+    if checkpoint_name_result.has("error"):
+        scene_patch_add_issue(step_issues, "error", "INVALID_CHECKPOINT_NAME", checkpoint_name_result["error"], step_index, step_type)
+    elif not include_checkpoints:
+        scene_patch_add_issue(step_issues, "info", "CHECKPOINT_STEP_SKIPPED", "Checkpoint planning is disabled by includeCheckpoints=false.", step_index, step_type)
+    else:
+        step_plan.append({
+            "action": "create_checkpoint",
+            "scenePath": scene_path,
+            "checkpointName": checkpoint_name_result["name"]
+        })
+
+    var wrapped_issues = scene_patch_wrap_step_issues(step_issues, top_issues, step_index, step_type)
+    return scene_patch_step_result(step_index, step_type, wrapped_issues, step_plan, include_plan)
+
+func dry_run_scene_patch(params):
+    if not params.has("scene_path"):
+        print(JSON.stringify(scene_patch_error("MISSING_SCENE_PATH", "scene_path is required.")))
+        return
+    if not params.has("steps") or typeof(params.steps) != TYPE_ARRAY or params.steps.is_empty():
+        print(JSON.stringify(scene_patch_error("INVALID_STEP", "steps must be a non-empty array.")))
+        return
+
+    var scene_path = normalize_resource_scene_path(params.scene_path)
+    var project_path = params.project_path if params.has("project_path") else ProjectSettings.globalize_path("res://")
+    var steps = params.steps
+    var include_plan = params.include_plan if params.has("include_plan") else true
+    var include_layout_before = params.include_layout_before if params.has("include_layout_before") else false
+    var include_validation_before = params.include_validation_before if params.has("include_validation_before") else false
+    var include_checkpoints = params.include_checkpoints if params.has("include_checkpoints") else true
+    var max_steps = int(params.max_steps) if params.has("max_steps") else 20
+    var max_depth = int(params.max_depth) if params.has("max_depth") else 100
+    var max_steps_requested = params.max_steps_requested if params.has("max_steps_requested") else null
+    var max_steps_clamped = params.max_steps_clamped if params.has("max_steps_clamped") else false
+    var max_depth_requested = params.max_depth_requested if params.has("max_depth_requested") else null
+    var max_depth_clamped = params.max_depth_clamped if params.has("max_depth_clamped") else false
+
+    if not FileAccess.file_exists(scene_path):
+        print(JSON.stringify(scene_patch_error("SCENE_PATH_NOT_FOUND", "Scene file does not exist: " + scene_path)))
+        return
+
+    var scene_resource = ResourceLoader.load(scene_path)
+    if scene_resource == null or not (scene_resource is PackedScene):
+        print(JSON.stringify(scene_patch_error("SCENE_LOAD_FAILED", "Failed to load scene as PackedScene: " + scene_path)))
+        return
+
+    var scene_root = scene_resource.instantiate()
+    if scene_root == null:
+        print(JSON.stringify(scene_patch_error("SCENE_INSTANTIATE_FAILED", "Failed to instantiate scene: " + scene_path)))
+        return
+
+    var issues = []
+    var step_results = []
+    var flattened_plan = []
+    var planned_action_count = 0
+    var planned_node_paths = {}
+    var contains_writes_if_applied = false
+    var layout_data = dry_align_build_layout(scene_root, max_depth)
+    var processed_count = min(steps.size(), max_steps)
+    if steps.size() > max_steps:
+        scene_patch_add_issue(issues, "error", "STEP_TOO_LARGE", "Number of patch steps exceeds maxSteps.", -1, null, null, "Reduce steps or increase maxSteps up to the supported cap.")
+
+    for step_index in range(processed_count):
+        var step = steps[step_index]
+        if typeof(step) != TYPE_DICTIONARY:
+            var invalid_issues = []
+            scene_patch_add_issue(invalid_issues, "error", "INVALID_STEP", "Each patch step must be an object.", step_index, null)
+            var wrapped_invalid = scene_patch_wrap_step_issues(invalid_issues, issues, step_index, null)
+            step_results.append(scene_patch_step_result(step_index, "unknown", wrapped_invalid, [], include_plan))
+            continue
+
+        var step_type = dry_run_get_value(step, ["type"], null)
+        if typeof(step_type) != TYPE_STRING:
+            var missing_type_issues = []
+            scene_patch_add_issue(missing_type_issues, "error", "INVALID_STEP", "Patch step type is required.", step_index, null)
+            var wrapped_missing_type = scene_patch_wrap_step_issues(missing_type_issues, issues, step_index, null)
+            step_results.append(scene_patch_step_result(step_index, "unknown", wrapped_missing_type, [], include_plan))
+            continue
+
+        step_type = step_type.strip_edges()
+        var step_result = null
+        if step_type == "place_asset":
+            contains_writes_if_applied = true
+            step_result = scene_patch_place_asset_step(step, project_path, scene_path, max_depth, max_depth_requested, max_depth_clamped, include_plan, step_index, issues, planned_node_paths)
+        elif step_type == "align_nodes":
+            contains_writes_if_applied = true
+            step_result = scene_patch_align_nodes_step(step, project_path, scene_path, scene_root, max_depth, max_depth_requested, max_depth_clamped, include_plan, step_index, issues, planned_node_paths)
+        elif step_type == "update_node_properties":
+            contains_writes_if_applied = true
+            step_result = scene_patch_update_properties_step(step, project_path, scene_path, max_depth, max_depth_requested, max_depth_clamped, include_plan, step_index, issues, planned_node_paths)
+        elif step_type == "validate_scene":
+            step_result = scene_patch_validate_step(step, project_path, scene_path, scene_root, max_depth, max_depth_requested, max_depth_clamped, include_plan, step_index, issues)
+        elif step_type == "create_checkpoint":
+            if include_checkpoints:
+                contains_writes_if_applied = true
+            step_result = scene_patch_checkpoint_step(step, scene_path, include_checkpoints, include_plan, step_index, issues)
+        else:
+            var unknown_issues = []
+            scene_patch_add_issue(unknown_issues, "error", "UNKNOWN_STEP_TYPE", "Patch step type is not supported: " + step_type, step_index, step_type)
+            var wrapped_unknown = scene_patch_wrap_step_issues(unknown_issues, issues, step_index, step_type)
+            step_result = scene_patch_step_result(step_index, step_type, wrapped_unknown, [], include_plan)
+
+        step_results.append(step_result)
+        if step_result.has("summary") and step_result["summary"].has("plannedActionCount"):
+            planned_action_count += int(step_result["summary"]["plannedActionCount"])
+        if include_plan and step_result.has("plan"):
+            scene_patch_add_plan_entries(flattened_plan, step_result["plan"], step_index)
+
+    var validation_before = null
+    if include_validation_before:
+        validation_before = scene_patch_validation_result(project_path, scene_path, scene_root, params, max_depth, max_depth_requested, max_depth_clamped)
+
+    var counts = scene_patch_issue_counts(issues)
+    var severity = dry_align_severity_from_counts(counts)
+    var result = {
+        "success": true,
+        "projectPath": project_path,
+        "scenePath": scene_path,
+        "valid": counts["errorCount"] == 0,
+        "severity": severity,
+        "summary": {
+            "stepCount": steps.size(),
+            "plannedActionCount": planned_action_count,
+            "errorCount": counts["errorCount"],
+            "warningCount": counts["warningCount"],
+            "infoCount": counts["infoCount"],
+            "containsWritesIfApplied": contains_writes_if_applied,
+            "cumulativeSimulation": false
+        },
+        "issues": issues,
+        "steps": step_results,
+        "plan": flattened_plan if include_plan else [],
+        "layoutBefore": dry_align_compact_layout_before(layout_data["nodes"], layout_data["sceneBounds"], "visual") if include_layout_before else null,
+        "validationBefore": validation_before,
+        "limits": {
+            "maxStepsRequested": max_steps_requested,
+            "maxStepsApplied": max_steps,
+            "maxStepsClamped": max_steps_clamped,
+            "maxDepthRequested": max_depth_requested,
+            "maxDepthApplied": max_depth,
+            "maxDepthClamped": max_depth_clamped
+        }
+    }
+    print(JSON.stringify(result))
+    scene_root.free()
 
 func update_node_properties_write_error(error_code, message, issues=[]):
     return {

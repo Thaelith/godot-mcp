@@ -148,6 +148,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "create_scene_checkpoint",
         "restore_scene_checkpoint",
         "list_scene_checkpoints",
+        "dry_run_scene_patch",
         "validate_scene",
         "dry_run_scene_blueprint",
         "create_scene_from_blueprint",
@@ -1633,6 +1634,170 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Call `list_scene_checkpoints` in a project with no `.godot_mcp/checkpoints/` directory and confirm it returns an empty list. Create checkpoints, list all, list by `scenePath`, test `asc` and `desc`, remove or corrupt one metadata file to verify missing/malformed metadata behavior, and confirm the tool does not modify files.
+
+### `dry_run_scene_patch`
+
+Plans a multi-step edit to an existing scene without modifying, saving, creating checkpoints, restoring checkpoints, importing, reimporting, or writing any files. This is a read-only orchestration layer over the existing single-purpose planners.
+
+Checkpoint plus asset placement example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "steps": [
+    {
+      "type": "create_checkpoint",
+      "checkpointName": "before_ai_patch"
+    },
+    {
+      "type": "place_asset",
+      "assetPath": "res://assets/props/chair.png",
+      "parentPath": "Room",
+      "nodeName": "Chair",
+      "placement": {
+        "mode": "position",
+        "position": [100, 200],
+        "space": "global"
+      },
+      "properties": {
+        "z_index": 5
+      }
+    }
+  ],
+  "includePlan": true,
+  "includeCheckpoints": true
+}
+```
+
+Update properties plus alignment example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "steps": [
+    {
+      "type": "update_node_properties",
+      "updates": [
+        {
+          "nodePath": "Room/Chair",
+          "properties": {
+            "scale": [1.2, 1.2],
+            "z_index": 4
+          }
+        }
+      ]
+    },
+    {
+      "type": "align_nodes",
+      "operations": [
+        {
+          "type": "place_relative",
+          "nodePath": "Room/Chair",
+          "referenceNodePath": "Room/Table",
+          "relation": "right_of",
+          "margin": 8
+        }
+      ],
+      "boundsSource": "visual"
+    }
+  ]
+}
+```
+
+Pre-patch validation example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "includeValidationBefore": true,
+  "steps": [
+    {
+      "type": "validate_scene",
+      "includeInfo": true,
+      "checkResources": true,
+      "checkRendering": true
+    }
+  ]
+}
+```
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "valid": true,
+  "severity": "ok",
+  "summary": {
+    "stepCount": 2,
+    "plannedActionCount": 4,
+    "errorCount": 0,
+    "warningCount": 0,
+    "infoCount": 0,
+    "containsWritesIfApplied": true,
+    "cumulativeSimulation": false
+  },
+  "issues": [],
+  "steps": [
+    {
+      "stepIndex": 0,
+      "type": "create_checkpoint",
+      "valid": true,
+      "severity": "ok",
+      "plan": [
+        {
+          "action": "create_checkpoint",
+          "scenePath": "res://scenes/Room.tscn",
+          "checkpointName": "before_ai_patch"
+        }
+      ],
+      "issues": []
+    }
+  ],
+  "plan": [
+    {
+      "stepIndex": 0,
+      "action": "create_checkpoint",
+      "scenePath": "res://scenes/Room.tscn",
+      "checkpointName": "before_ai_patch"
+    }
+  ],
+  "layoutBefore": null,
+  "validationBefore": null,
+  "limits": {
+    "maxStepsRequested": null,
+    "maxStepsApplied": 20,
+    "maxStepsClamped": false,
+    "maxDepthRequested": null,
+    "maxDepthApplied": 100,
+    "maxDepthClamped": false
+  }
+}
+```
+
+**Supported step types:** `place_asset`, `align_nodes`, `update_node_properties`, `validate_scene`, and `create_checkpoint`. These reuse the same dry-run planning paths as `dry_run_place_asset_in_scene`, `dry_run_align_nodes`, and `dry_run_update_node_properties` where applicable. `validate_scene` runs against the current scene and reports `validationScope: "pre_patch_current_scene"`.
+
+**Read-only safety:** `dry_run_scene_patch` does not call writer tools, save scenes, create checkpoints, restore checkpoints, create files, modify files, import/reimport assets, attach scripts, parse script source, or modify resources. `create_checkpoint` steps only produce planned checkpoint actions. Use `create_scene_checkpoint` before running writer tools when you need a real rollback point.
+
+**Cumulative simulation limitation:** this first version does not simulate mutations between steps. If a later `align_nodes` or `update_node_properties` step references a node that a previous `place_asset` step would create, the tool returns `CUMULATIVE_SIMULATION_UNSUPPORTED` instead of pretending the node exists. Apply the placement first, then run a fresh dry-run for dependent edits.
+
+**Difference from future `apply_scene_patch`:** this tool only validates and plans a patch. A future writer should apply only normalized plan entries after checkpointing and validation; this dry-run never writes.
+
+`maxSteps` defaults to `20`, rejects values below `1`, and clamps above `100`. `maxDepth` defaults to `100`, rejects values below `1`, and clamps above `200`.
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Call `dry_run_scene_patch` with checkpoint, placement, alignment, property update, and validation steps. Confirm nested plans are returned, unknown step types return `UNKNOWN_STEP_TYPE`, dependent steps targeting planned-but-not-created nodes return `CUMULATIVE_SIMULATION_UNSUPPORTED`, no checkpoint files are created, and the scene file hash is unchanged.
 
 ### `validate_scene`
 
