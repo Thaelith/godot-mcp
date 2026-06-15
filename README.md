@@ -147,6 +147,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "update_node_properties",
         "create_scene_checkpoint",
         "restore_scene_checkpoint",
+        "list_scene_checkpoints",
         "validate_scene",
         "dry_run_scene_blueprint",
         "create_scene_from_blueprint",
@@ -1545,6 +1546,93 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Create a checkpoint for an existing scene, confirm the copied scene and metadata appear under `.godot_mcp/checkpoints/`, modify the scene with a writer tool, then call `restore_scene_checkpoint`. Verify the target scene content is restored, a pre-restore checkpoint is created when requested, unsafe paths are rejected, and checkpoints outside `.godot_mcp/checkpoints/` are refused.
+
+### `list_scene_checkpoints`
+
+Lists existing project-local scene checkpoints under `res://.godot_mcp/checkpoints/` without creating, restoring, deleting, or modifying files. Use this before `restore_scene_checkpoint` when an assistant needs to choose a valid `checkpointPath`.
+
+List all checkpoints:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "includeMetadata": true,
+  "includeMissingMetadata": true,
+  "maxResults": 100,
+  "sortOrder": "desc"
+}
+```
+
+List checkpoints for one scene:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "sortOrder": "asc"
+}
+```
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "checkpointRoot": "res://.godot_mcp/checkpoints/",
+  "totalFound": 1,
+  "returned": 1,
+  "truncated": false,
+  "checkpoints": [
+    {
+      "checkpointPath": "res://.godot_mcp/checkpoints/scenes__room_tscn/20260615T120000Z_before_alignment.tscn",
+      "metadataPath": "res://.godot_mcp/checkpoints/scenes__room_tscn/20260615T120000Z_before_alignment.json",
+      "scenePath": "res://scenes/Room.tscn",
+      "checkpointName": "before_alignment",
+      "createdAt": "2026-06-15T12:00:00Z",
+      "sizeBytes": 1234,
+      "modifiedTime": "2026-06-15T12:00:00Z",
+      "hasMetadata": true,
+      "metadata": {
+        "scenePath": "res://scenes/Room.tscn",
+        "checkpointPath": "res://.godot_mcp/checkpoints/scenes__room_tscn/20260615T120000Z_before_alignment.tscn",
+        "createdAt": "2026-06-15T12:00:00Z",
+        "checkpointName": "before_alignment",
+        "sceneSizeBytes": 1234,
+        "sceneModifiedTime": "2026-06-15T11:59:30Z"
+      },
+      "metadataError": null
+    }
+  ],
+  "summary": {
+    "sceneFiltered": true,
+    "metadataIncluded": true,
+    "missingMetadataIncluded": true,
+    "maxResultsRequested": null,
+    "maxResultsApplied": 100,
+    "maxResultsClamped": false,
+    "sortOrder": "desc"
+  }
+}
+```
+
+**Read-only safety:** `list_scene_checkpoints` only reads checkpoint directory entries, checkpoint file stats, and optional adjacent metadata JSON. It does not execute Godot, parse scene contents, create checkpoints, restore checkpoints, prune old files, import/reimport assets, or modify any project file.
+
+**Metadata behavior:** when `includeMetadata` is true, the tool reads matching `.json` metadata files next to checkpoint scene files. Metadata files larger than 64 KiB are not parsed. Missing or malformed metadata does not fail the whole request; items include `metadataError` when `includeMissingMetadata` is true. When `includeMissingMetadata` is false, checkpoints without usable metadata are excluded.
+
+**Filtering and sorting:** if `scenePath` is provided, the tool derives the same scene-safe-id used by `create_scene_checkpoint` and lists only that checkpoint directory. If omitted, it scans one directory level under `.godot_mcp/checkpoints/`. `sortOrder` defaults to `desc` for newest first and can be `asc`; sorting prefers metadata `createdAt` and falls back to checkpoint modified time. `maxResults` defaults to `100`, rejects values below `1`, and clamps above `1000`.
+
+**Restore workflow:** copy a returned `checkpointPath` into `restore_scene_checkpoint` with the desired target `scenePath`. `restore_scene_checkpoint` will still enforce its own checkpoint path and symlink checks.
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Call `list_scene_checkpoints` in a project with no `.godot_mcp/checkpoints/` directory and confirm it returns an empty list. Create checkpoints, list all, list by `scenePath`, test `asc` and `desc`, remove or corrupt one metadata file to verify missing/malformed metadata behavior, and confirm the tool does not modify files.
 
 ### `validate_scene`
 

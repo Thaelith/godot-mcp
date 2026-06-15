@@ -9,7 +9,7 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize, resolve, relative, isAbsolute, extname, parse } from 'path';
-import { copyFileSync, existsSync, readdirSync, mkdirSync, statSync, lstatSync, realpathSync, writeFileSync, unlinkSync } from 'fs';
+import { copyFileSync, existsSync, readdirSync, mkdirSync, statSync, lstatSync, realpathSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -139,10 +139,12 @@ class GodotServer {
     'checkpoint_name': 'checkpointName',
     'checkpoint_path': 'checkpointPath',
     'include_metadata': 'includeMetadata',
+    'include_missing_metadata': 'includeMissingMetadata',
     'max_checkpoints_per_scene': 'maxCheckpointsPerScene',
     'create_pre_restore_checkpoint': 'createPreRestoreCheckpoint',
     'pre_restore_checkpoint_name': 'preRestoreCheckpointName',
     'validate_after_restore': 'validateAfterRestore',
+    'sort_order': 'sortOrder',
     'output_path': 'outputPath',
     'mesh_item_names': 'meshItemNames',
     'new_path': 'newPath',
@@ -563,6 +565,31 @@ class GodotServer {
    */
   private restoreSceneCheckpointErrorResponse(error: string, message: string): any {
     console.error(`[SERVER] restore_scene_checkpoint error response: ${error}: ${message}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error,
+              message,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  /**
+   * Create a list_scene_checkpoints-specific JSON error response while preserving MCP text content style.
+   */
+  private listSceneCheckpointsErrorResponse(error: string, message: string): any {
+    console.error(`[SERVER] list_scene_checkpoints error response: ${error}: ${message}`);
 
     return {
       content: [
@@ -1074,6 +1101,193 @@ class GodotServer {
         maxCheckpointsPerSceneClamped: maxCheckpointsClamped,
       },
     };
+  }
+
+  private parseCheckpointFileName(fileName: string): { createdAt: string | null; checkpointName: string | null } {
+    const baseName = basename(fileName, extname(fileName));
+    const match = baseName.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z(?:_(.+))?$/i);
+    if (!match) {
+      return {
+        createdAt: null,
+        checkpointName: baseName || null,
+      };
+    }
+
+    const date = new Date(Date.UTC(
+      Number(match[1]),
+      Number(match[2]) - 1,
+      Number(match[3]),
+      Number(match[4]),
+      Number(match[5]),
+      Number(match[6])
+    ));
+    const createdAt = Number.isNaN(date.getTime()) ? null : date.toISOString().replace('.000Z', 'Z');
+
+    return {
+      createdAt,
+      checkpointName: match[7] || null,
+    };
+  }
+
+  private inferScenePathFromCheckpointId(sceneId: string): string | null {
+    const parts = sceneId.split('__').filter(Boolean);
+    if (parts.length === 0) {
+      return null;
+    }
+
+    const lastPart = parts[parts.length - 1];
+    const extensionMatch = lastPart.match(/^(.+)_(tscn|scn)$/i);
+    if (!extensionMatch) {
+      return null;
+    }
+
+    parts[parts.length - 1] = `${extensionMatch[1]}.${extensionMatch[2].toLowerCase()}`;
+    return `res://${parts.join('/')}`;
+  }
+
+  private listCheckpointDirectory(
+    projectRoot: string,
+    checkpointsRootPath: string,
+    checkpointDirPath: string,
+    checkpointDirRelative: string,
+    scenePathFilter: string | null,
+    includeMetadata: boolean,
+    includeMissingMetadata: boolean
+  ): { items: any[]; error?: string; message?: string } {
+    if (!this.isPathInside(checkpointsRootPath, checkpointDirPath)) {
+      return {
+        items: [],
+        error: 'CHECKPOINT_ROOT_UNSAFE',
+        message: 'Checkpoint directory would escape res://.godot_mcp/checkpoints/.',
+      };
+    }
+
+    if (!existsSync(checkpointDirPath)) {
+      return { items: [] };
+    }
+
+    const checkpointDirStats = lstatSync(checkpointDirPath);
+    if (checkpointDirStats.isSymbolicLink()) {
+      return {
+        items: [],
+        error: 'CHECKPOINT_ROOT_UNSAFE',
+        message: 'Checkpoint directories must not be symbolic links.',
+      };
+    }
+
+    if (!checkpointDirStats.isDirectory()) {
+      return { items: [] };
+    }
+
+    const realCheckpointDirPath = realpathSync(checkpointDirPath);
+    if (!this.isPathInside(checkpointsRootPath, realCheckpointDirPath)) {
+      return {
+        items: [],
+        error: 'CHECKPOINT_ROOT_UNSAFE',
+        message: 'Resolved checkpoint directory would escape res://.godot_mcp/checkpoints/.',
+      };
+    }
+
+    const sceneId = checkpointDirRelative.replace(/\\/g, '/').split('/').pop() || '';
+    const inferredScenePath = scenePathFilter || this.inferScenePathFromCheckpointId(sceneId);
+    const items: any[] = [];
+    const metadataSizeLimitBytes = 64 * 1024;
+
+    for (const entry of readdirSync(checkpointDirPath, { withFileTypes: true })) {
+      const extension = extname(entry.name).toLowerCase();
+      if (!['.tscn', '.scn'].includes(extension)) {
+        continue;
+      }
+
+      const checkpointFilePath = resolve(checkpointDirPath, entry.name);
+      if (!this.isPathInside(checkpointsRootPath, checkpointFilePath)) {
+        return {
+          items: [],
+          error: 'CHECKPOINT_ROOT_UNSAFE',
+          message: 'Checkpoint file would escape res://.godot_mcp/checkpoints/.',
+        };
+      }
+
+      const checkpointFileStats = lstatSync(checkpointFilePath);
+      if (checkpointFileStats.isSymbolicLink() || entry.isSymbolicLink()) {
+        return {
+          items: [],
+          error: 'CHECKPOINT_ROOT_UNSAFE',
+          message: 'Checkpoint files must not be symbolic links.',
+        };
+      }
+
+      if (!checkpointFileStats.isFile()) {
+        continue;
+      }
+
+      const realCheckpointFilePath = realpathSync(checkpointFilePath);
+      if (!this.isPathInside(checkpointsRootPath, realCheckpointFilePath)) {
+        return {
+          items: [],
+          error: 'CHECKPOINT_ROOT_UNSAFE',
+          message: 'Resolved checkpoint file would escape res://.godot_mcp/checkpoints/.',
+        };
+      }
+
+      const metadataFileName = entry.name.replace(/\.(tscn|scn)$/i, '.json');
+      const metadataPath = resolve(checkpointDirPath, metadataFileName);
+      const metadataRelativePath = `${checkpointDirRelative}/${metadataFileName}`;
+      const hasMetadata = existsSync(metadataPath);
+      let metadata: any = null;
+      let metadataError: string | null = null;
+
+      if (hasMetadata) {
+        const metadataStats = lstatSync(metadataPath);
+        if (metadataStats.isSymbolicLink()) {
+          metadataError = 'Metadata file is a symbolic link and was not read.';
+        } else if (!metadataStats.isFile()) {
+          metadataError = 'Metadata path exists but is not a file.';
+        } else if (includeMetadata) {
+          if (metadataStats.size > metadataSizeLimitBytes) {
+            metadataError = `Metadata file is larger than ${metadataSizeLimitBytes} bytes and was not parsed.`;
+          } else {
+            try {
+              const parsedMetadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
+              if (typeof parsedMetadata === 'object' && parsedMetadata !== null && !Array.isArray(parsedMetadata)) {
+                metadata = parsedMetadata;
+              } else {
+                metadataError = 'Metadata JSON must be an object.';
+              }
+            } catch (error: any) {
+              metadataError = `Metadata JSON could not be parsed: ${error?.message || 'Unknown parse error'}`;
+            }
+          }
+        }
+      }
+
+      if ((!hasMetadata || metadataError) && !includeMissingMetadata) {
+        continue;
+      }
+
+      const parsedFileName = this.parseCheckpointFileName(entry.name);
+      const checkpointRelativePath = `${checkpointDirRelative}/${entry.name}`;
+      const metadataScenePath = typeof metadata?.scenePath === 'string' ? metadata.scenePath : null;
+      const metadataCheckpointName = typeof metadata?.checkpointName === 'string' ? metadata.checkpointName : null;
+      const metadataCreatedAt = typeof metadata?.createdAt === 'string' ? metadata.createdAt : null;
+      const createdAt = metadataCreatedAt || parsedFileName.createdAt || checkpointFileStats.mtime.toISOString();
+
+      items.push({
+        checkpointPath: this.checkpointResourcePath(checkpointRelativePath),
+        metadataPath: this.checkpointResourcePath(metadataRelativePath),
+        scenePath: metadataScenePath || inferredScenePath,
+        checkpointName: metadataCheckpointName || parsedFileName.checkpointName,
+        createdAt,
+        sizeBytes: checkpointFileStats.size,
+        modifiedTime: checkpointFileStats.mtime.toISOString(),
+        hasMetadata,
+        metadata: includeMetadata ? metadata : null,
+        metadataError,
+        sortTime: Date.parse(createdAt) || checkpointFileStats.mtimeMs,
+      });
+    }
+
+    return { items };
   }
 
   /**
@@ -2408,6 +2622,41 @@ class GodotServer {
           },
         },
         {
+          name: 'list_scene_checkpoints',
+          description: 'List project-local scene checkpoints under res://.godot_mcp/checkpoints/',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Absolute path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Optional Godot scene path to filter checkpoints, such as res://scenes/Room.tscn',
+              },
+              includeMetadata: {
+                type: 'boolean',
+                description: 'Whether to parse matching JSON metadata files (default: true)',
+              },
+              includeMissingMetadata: {
+                type: 'boolean',
+                description: 'Whether to include checkpoints with missing or malformed metadata (default: true)',
+              },
+              maxResults: {
+                type: 'number',
+                description: 'Maximum checkpoint items to return (default: 100, max: 1000)',
+              },
+              sortOrder: {
+                type: 'string',
+                enum: ['asc', 'desc'],
+                description: 'Sort order by checkpoint creation time or file modified time (default: desc)',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
           name: 'dry_run_scene_blueprint',
           description: 'Validate and simulate a scene blueprint read-only without creating or modifying files',
           inputSchema: {
@@ -2767,6 +3016,8 @@ class GodotServer {
           return await this.handleCreateSceneCheckpoint(request.params.arguments);
         case 'restore_scene_checkpoint':
           return await this.handleRestoreSceneCheckpoint(request.params.arguments);
+        case 'list_scene_checkpoints':
+          return await this.handleListSceneCheckpoints(request.params.arguments);
         case 'dry_run_scene_blueprint':
           return await this.handleDryRunSceneBlueprint(request.params.arguments);
         case 'create_scene_from_blueprint':
@@ -6773,6 +7024,314 @@ class GodotServer {
       return this.restoreSceneCheckpointErrorResponse(
         'RESTORE_SCENE_CHECKPOINT_FAILED',
         `Failed to restore scene checkpoint: ${error?.message || 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * Handle the list_scene_checkpoints tool
+   */
+  private async handleListSceneCheckpoints(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || typeof args.projectPath !== 'string') {
+      return this.listSceneCheckpointsErrorResponse(
+        'MISSING_PROJECT_PATH',
+        'projectPath is required and must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    if (args.projectPath.includes('\0')) {
+      return this.listSceneCheckpointsErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must not contain null bytes.'
+      );
+    }
+
+    if (!isAbsolute(args.projectPath)) {
+      return this.listSceneCheckpointsErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    let scenePathResult: { relativePath: string; resourcePath: string; error?: string } | null = null;
+    if (args.scenePath !== undefined) {
+      if (typeof args.scenePath !== 'string') {
+        return this.listSceneCheckpointsErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must be a string when provided.'
+        );
+      }
+
+      scenePathResult = this.normalizeScenePath(args.scenePath);
+      if (scenePathResult.error) {
+        return this.listSceneCheckpointsErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          scenePathResult.error
+        );
+      }
+
+      const sceneExtension = extname(scenePathResult.relativePath).toLowerCase();
+      if (!['.tscn', '.scn'].includes(sceneExtension)) {
+        return this.listSceneCheckpointsErrorResponse(
+          'SCENE_PATH_NOT_SCENE_FILE',
+          'scenePath must point to a .tscn or .scn scene file.'
+        );
+      }
+    }
+
+    const booleanOptions = ['includeMetadata', 'includeMissingMetadata'];
+    for (const option of booleanOptions) {
+      if (args[option] !== undefined && typeof args[option] !== 'boolean') {
+        return this.listSceneCheckpointsErrorResponse(
+          'LIST_SCENE_CHECKPOINTS_FAILED',
+          `${option} must be a boolean.`
+        );
+      }
+    }
+    const includeMetadata = args.includeMetadata !== undefined ? args.includeMetadata : true;
+    const includeMissingMetadata = args.includeMissingMetadata !== undefined ? args.includeMissingMetadata : true;
+
+    const maxResultsRequested = args.maxResults !== undefined ? args.maxResults : null;
+    let maxResultsApplied = 100;
+    let maxResultsClamped = false;
+    if (args.maxResults !== undefined) {
+      if (typeof args.maxResults !== 'number' || !Number.isFinite(args.maxResults) || args.maxResults < 1) {
+        return this.listSceneCheckpointsErrorResponse(
+          'INVALID_MAX_RESULTS',
+          'maxResults must be a number between 1 and 1000.'
+        );
+      }
+
+      if (args.maxResults > 1000) {
+        maxResultsApplied = 1000;
+        maxResultsClamped = true;
+      } else {
+        maxResultsApplied = Math.floor(args.maxResults);
+      }
+    }
+
+    const sortOrder = args.sortOrder !== undefined ? args.sortOrder : 'desc';
+    if (typeof sortOrder !== 'string' || !['asc', 'desc'].includes(sortOrder)) {
+      return this.listSceneCheckpointsErrorResponse(
+        'INVALID_SORT_ORDER',
+        'sortOrder must be either asc or desc.'
+      );
+    }
+
+    try {
+      const normalizedProjectPath = resolve(args.projectPath);
+      if (!existsSync(normalizedProjectPath)) {
+        return this.listSceneCheckpointsErrorResponse(
+          'PROJECT_PATH_NOT_FOUND',
+          `Project path does not exist: ${args.projectPath}`
+        );
+      }
+
+      const projectStats = statSync(normalizedProjectPath);
+      if (!projectStats.isDirectory()) {
+        return this.listSceneCheckpointsErrorResponse(
+          'PROJECT_PATH_NOT_DIRECTORY',
+          `Project path is not a directory: ${args.projectPath}`
+        );
+      }
+
+      const projectRoot = realpathSync(normalizedProjectPath);
+      const projectFile = join(projectRoot, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.listSceneCheckpointsErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          `Not a valid Godot project: ${args.projectPath}. The directory must contain a project.godot file.`
+        );
+      }
+
+      if (scenePathResult) {
+        const sceneFilePath = resolve(projectRoot, scenePathResult.relativePath);
+        if (!this.isPathInside(projectRoot, sceneFilePath)) {
+          return this.listSceneCheckpointsErrorResponse(
+            'UNSAFE_SCENE_PATH',
+            'scenePath must stay inside the Godot project directory.'
+          );
+        }
+
+        if (existsSync(sceneFilePath)) {
+          const sceneFileStats = lstatSync(sceneFilePath);
+          if (sceneFileStats.isSymbolicLink()) {
+            return this.listSceneCheckpointsErrorResponse(
+              'UNSAFE_SCENE_PATH',
+              'scenePath must not be a symbolic link.'
+            );
+          }
+
+          if (!sceneFileStats.isFile()) {
+            return this.listSceneCheckpointsErrorResponse(
+              'UNSAFE_SCENE_PATH',
+              `scenePath exists but is not a file: ${scenePathResult.resourcePath}`
+            );
+          }
+
+          const realSceneFilePath = realpathSync(sceneFilePath);
+          if (!this.isPathInside(projectRoot, realSceneFilePath)) {
+            return this.listSceneCheckpointsErrorResponse(
+              'UNSAFE_SCENE_PATH',
+              'scenePath must stay inside the Godot project directory.'
+            );
+          }
+        }
+      }
+
+      const checkpointParentPath = resolve(projectRoot, '.godot_mcp');
+      if (existsSync(checkpointParentPath) && lstatSync(checkpointParentPath).isSymbolicLink()) {
+        return this.listSceneCheckpointsErrorResponse(
+          'CHECKPOINT_ROOT_UNSAFE',
+          'res://.godot_mcp/ must not be a symbolic link.'
+        );
+      }
+
+      const checkpointsRootPath = resolve(projectRoot, '.godot_mcp', 'checkpoints');
+      const checkpointRootResourcePath = 'res://.godot_mcp/checkpoints/';
+      const baseResult = {
+        success: true,
+        projectPath: projectRoot.replace(/\\/g, '/'),
+        scenePath: scenePathResult ? scenePathResult.resourcePath : null,
+        checkpointRoot: checkpointRootResourcePath,
+        summary: {
+          sceneFiltered: scenePathResult !== null,
+          metadataIncluded: includeMetadata,
+          missingMetadataIncluded: includeMissingMetadata,
+          maxResultsRequested,
+          maxResultsApplied,
+          maxResultsClamped,
+          sortOrder,
+        },
+      };
+
+      if (!existsSync(checkpointsRootPath)) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  ...baseResult,
+                  totalFound: 0,
+                  returned: 0,
+                  truncated: false,
+                  checkpoints: [],
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      const checkpointRootStats = lstatSync(checkpointsRootPath);
+      if (checkpointRootStats.isSymbolicLink()) {
+        return this.listSceneCheckpointsErrorResponse(
+          'CHECKPOINT_ROOT_UNSAFE',
+          'Checkpoint root must not be a symbolic link.'
+        );
+      }
+
+      if (!checkpointRootStats.isDirectory()) {
+        return this.listSceneCheckpointsErrorResponse(
+          'CHECKPOINT_ROOT_UNSAFE',
+          'Checkpoint root exists but is not a directory.'
+        );
+      }
+
+      const realCheckpointsRootPath = realpathSync(checkpointsRootPath);
+      if (!this.isPathInside(projectRoot, realCheckpointsRootPath)) {
+        return this.listSceneCheckpointsErrorResponse(
+          'CHECKPOINT_ROOT_UNSAFE',
+          'Resolved checkpoint root must stay inside the Godot project directory.'
+        );
+      }
+
+      const checkpointDirs: Array<{ path: string; relative: string }> = [];
+      if (scenePathResult) {
+        const sceneId = this.sceneCheckpointId(scenePathResult.relativePath);
+        checkpointDirs.push({
+          path: resolve(realCheckpointsRootPath, sceneId),
+          relative: `.godot_mcp/checkpoints/${sceneId}`,
+        });
+      } else {
+        for (const entry of readdirSync(realCheckpointsRootPath, { withFileTypes: true })) {
+          if (entry.isSymbolicLink()) {
+            return this.listSceneCheckpointsErrorResponse(
+              'CHECKPOINT_ROOT_UNSAFE',
+              'Checkpoint directories must not be symbolic links.'
+            );
+          }
+
+          if (!entry.isDirectory()) {
+            continue;
+          }
+
+          checkpointDirs.push({
+            path: resolve(realCheckpointsRootPath, entry.name),
+            relative: `.godot_mcp/checkpoints/${entry.name}`,
+          });
+        }
+      }
+
+      const checkpointItems: any[] = [];
+      for (const checkpointDir of checkpointDirs) {
+        const listed = this.listCheckpointDirectory(
+          projectRoot,
+          realCheckpointsRootPath,
+          checkpointDir.path,
+          checkpointDir.relative,
+          scenePathResult ? scenePathResult.resourcePath : null,
+          includeMetadata,
+          includeMissingMetadata
+        );
+
+        if (listed.error) {
+          return this.listSceneCheckpointsErrorResponse(listed.error, listed.message || 'Checkpoint listing failed.');
+        }
+
+        checkpointItems.push(...listed.items);
+      }
+
+      checkpointItems.sort((a, b) => {
+        const timeCompare = sortOrder === 'asc' ? a.sortTime - b.sortTime : b.sortTime - a.sortTime;
+        if (timeCompare !== 0) {
+          return timeCompare;
+        }
+        return sortOrder === 'asc'
+          ? String(a.checkpointPath).localeCompare(String(b.checkpointPath))
+          : String(b.checkpointPath).localeCompare(String(a.checkpointPath));
+      });
+
+      const totalFound = checkpointItems.length;
+      const returnedItems = checkpointItems
+        .slice(0, maxResultsApplied)
+        .map(({ sortTime: _sortTime, ...item }) => item);
+
+      const result = {
+        ...baseResult,
+        totalFound,
+        returned: returnedItems.length,
+        truncated: totalFound > returnedItems.length,
+        checkpoints: returnedItems,
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.listSceneCheckpointsErrorResponse(
+        'LIST_SCENE_CHECKPOINTS_FAILED',
+        `Failed to list scene checkpoints: ${error?.message || 'Unknown error'}`
       );
     }
   }
