@@ -28,7 +28,7 @@ func _init():
     
     var operation = args[operation_index]
     var params_json = args[params_index]
-    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "dry_run_align_nodes" or operation == "align_nodes" or operation == "dry_run_place_asset_in_scene" or operation == "place_asset_in_scene" or operation == "dry_run_update_node_properties" or operation == "update_node_properties" or operation == "dry_run_scene_patch" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
+    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "dry_run_align_nodes" or operation == "align_nodes" or operation == "dry_run_place_asset_in_scene" or operation == "place_asset_in_scene" or operation == "dry_run_update_node_properties" or operation == "update_node_properties" or operation == "dry_run_scene_patch" or operation == "apply_scene_patch" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
 
     if quiet_output:
         debug_mode = false
@@ -81,6 +81,8 @@ func _init():
             update_node_properties(params)
         "dry_run_scene_patch":
             dry_run_scene_patch(params)
+        "apply_scene_patch":
+            apply_scene_patch(params)
         "validate_scene":
             validate_scene(params)
         "get_asset_info":
@@ -3936,6 +3938,10 @@ func scene_patch_place_asset_step(step, project_path, scene_path, simulation_roo
         extra["simulationOnly"] = true
         extra["simulatedNodePath"] = simulation_result["simulatedNodePath"] if simulation_result.has("simulatedNodePath") else planned["proposed_path"]
         extra["simulatedActionCount"] = simulation_result["simulatedActionCount"] if simulation_result.has("simulatedActionCount") else 0
+        extra["simulatedChanges"] = [{
+            "action": "add_node",
+            "path": extra["simulatedNodePath"]
+        }]
     elif not dry_align_has_error_issues(planned["issues"]):
         scene_patch_track_created_nodes(step_plan, planned_node_paths)
 
@@ -3989,6 +3995,13 @@ func scene_patch_align_nodes_step(step, project_path, scene_path, scene_root, ma
         extra["simulated"] = simulation_result["success"]
         extra["simulationOnly"] = true
         extra["simulatedChangeCount"] = simulation_result["simulatedChangeCount"] if simulation_result.has("simulatedChangeCount") else 0
+        var simulated_changes = []
+        var applied_changes = simulation_result["appliedChanges"] if simulation_result.has("appliedChanges") else []
+        for change in applied_changes:
+            var simulated_change = change.duplicate(true)
+            simulated_change["action"] = "set_position"
+            simulated_changes.append(simulated_change)
+        extra["simulatedChanges"] = simulated_changes
     return scene_patch_step_result(step_index, step_type, wrapped_issues, step_plan, include_plan, extra)
 
 func scene_patch_update_properties_step(step, project_path, scene_path, simulation_root, max_depth, max_depth_requested, max_depth_clamped, include_plan, simulate_cumulative, step_index, top_issues, planned_node_paths):
@@ -4041,6 +4054,13 @@ func scene_patch_update_properties_step(step, project_path, scene_path, simulati
         extra["simulated"] = simulation_result["success"]
         extra["simulationOnly"] = true
         extra["simulatedChangeCount"] = simulation_result["simulatedChangeCount"] if simulation_result.has("simulatedChangeCount") else 0
+        var simulated_changes = []
+        var applied_changes = simulation_result["appliedChanges"] if simulation_result.has("appliedChanges") else []
+        for change in applied_changes:
+            var simulated_change = change.duplicate(true)
+            simulated_change["action"] = "set_property"
+            simulated_changes.append(simulated_change)
+        extra["simulatedChanges"] = simulated_changes
 
     var result = scene_patch_step_result(step_index, step_type, wrapped_issues, step_plan, include_plan, extra)
     scene_patch_release_planned_scene_root(planned)
@@ -4080,13 +4100,11 @@ func scene_patch_checkpoint_step(step, scene_path, include_checkpoints, include_
     var wrapped_issues = scene_patch_wrap_step_issues(step_issues, top_issues, step_index, step_type)
     return scene_patch_step_result(step_index, step_type, wrapped_issues, step_plan, include_plan)
 
-func dry_run_scene_patch(params):
+func scene_patch_plan_result(params):
     if not params.has("scene_path"):
-        print(JSON.stringify(scene_patch_error("MISSING_SCENE_PATH", "scene_path is required.")))
-        return
+        return {"fatal": scene_patch_error("MISSING_SCENE_PATH", "scene_path is required.")}
     if not params.has("steps") or typeof(params.steps) != TYPE_ARRAY or params.steps.is_empty():
-        print(JSON.stringify(scene_patch_error("INVALID_STEP", "steps must be a non-empty array.")))
-        return
+        return {"fatal": scene_patch_error("INVALID_STEP", "steps must be a non-empty array.")}
 
     var scene_path = normalize_resource_scene_path(params.scene_path)
     var project_path = params.project_path if params.has("project_path") else ProjectSettings.globalize_path("res://")
@@ -4106,18 +4124,15 @@ func dry_run_scene_patch(params):
     var max_depth_clamped = params.max_depth_clamped if params.has("max_depth_clamped") else false
 
     if not FileAccess.file_exists(scene_path):
-        print(JSON.stringify(scene_patch_error("SCENE_PATH_NOT_FOUND", "Scene file does not exist: " + scene_path)))
-        return
+        return {"fatal": scene_patch_error("SCENE_PATH_NOT_FOUND", "Scene file does not exist: " + scene_path)}
 
     var scene_resource = ResourceLoader.load(scene_path)
     if scene_resource == null or not (scene_resource is PackedScene):
-        print(JSON.stringify(scene_patch_error("SCENE_LOAD_FAILED", "Failed to load scene as PackedScene: " + scene_path)))
-        return
+        return {"fatal": scene_patch_error("SCENE_LOAD_FAILED", "Failed to load scene as PackedScene: " + scene_path)}
 
     var scene_root = scene_resource.instantiate()
     if scene_root == null:
-        print(JSON.stringify(scene_patch_error("SCENE_INSTANTIATE_FAILED", "Failed to instantiate scene: " + scene_path)))
-        return
+        return {"fatal": scene_patch_error("SCENE_INSTANTIATE_FAILED", "Failed to instantiate scene: " + scene_path)}
 
     var issues = []
     var step_results = []
@@ -4234,8 +4249,304 @@ func dry_run_scene_patch(params):
             "maxDepthClamped": max_depth_clamped
         }
     }
-    print(JSON.stringify(result))
+    return {
+        "result": result,
+        "scene_root": scene_root,
+        "owns_scene_root": true
+    }
+
+func dry_run_scene_patch(params):
+    var planned = scene_patch_plan_result(params)
+    if planned.has("fatal"):
+        print(JSON.stringify(planned["fatal"]))
+        return
+
+    print(JSON.stringify(planned["result"]))
+    if planned.has("owns_scene_root") and planned["owns_scene_root"] and planned.has("scene_root") and planned["scene_root"] != null:
+        planned["scene_root"].free()
+
+func apply_scene_patch_error(error_code, message, issues=[], checkpoint={}, write_attempted=false, saved=false):
+    return {
+        "success": false,
+        "error": error_code,
+        "message": message,
+        "checkpoint": checkpoint,
+        "writeAttempted": write_attempted,
+        "saved": saved,
+        "issues": issues
+    }
+
+func scene_patch_collect_simulated_changes(step_results):
+    var changes = []
+    for step in step_results:
+        if typeof(step) != TYPE_DICTIONARY or not step.has("simulatedChanges"):
+            continue
+        var step_changes = step["simulatedChanges"]
+        if typeof(step_changes) != TYPE_ARRAY:
+            continue
+        for change in step_changes:
+            if typeof(change) != TYPE_DICTIONARY:
+                continue
+            var item = change.duplicate(true)
+            item["stepIndex"] = step["stepIndex"] if step.has("stepIndex") else -1
+            item["stepType"] = step["type"] if step.has("type") else null
+            changes.append(item)
+    return changes
+
+func scene_patch_append_post_validation_issues(issues, post_validation):
+    if typeof(post_validation) != TYPE_DICTIONARY or not post_validation.has("issues") or typeof(post_validation["issues"]) != TYPE_ARRAY:
+        return
+    for issue in post_validation["issues"]:
+        if typeof(issue) != TYPE_DICTIONARY:
+            continue
+        var item = issue.duplicate(true)
+        item["validationScope"] = post_validation["validationScope"] if post_validation.has("validationScope") else "saved_scene_after_patch"
+        issues.append(item)
+
+func scene_patch_add_validation_after_errors(issues, validation_after):
+    if typeof(validation_after) != TYPE_DICTIONARY or not validation_after.has("issues") or typeof(validation_after["issues"]) != TYPE_ARRAY:
+        return
+    for issue in validation_after["issues"]:
+        if typeof(issue) != TYPE_DICTIONARY:
+            continue
+        if issue.has("severity") and issue["severity"] == "error":
+            var item = issue.duplicate(true)
+            item["validationScope"] = validation_after["validationScope"] if validation_after.has("validationScope") else "simulated_patch_state"
+            issues.append(item)
+
+func scene_patch_post_validate_saved_scene(scene_path, project_path, source_params, max_depth, max_depth_requested, max_depth_clamped):
+    var post = {
+        "loadable": false,
+        "instantiable": false,
+        "validationScope": "saved_scene_after_patch",
+        "valid": false,
+        "issues": [],
+        "summary": {},
+        "severity": "error"
+    }
+
+    var scene_resource = ResourceLoader.load(scene_path, "", ResourceLoader.CACHE_MODE_IGNORE)
+    if scene_resource == null or not (scene_resource is PackedScene):
+        return {
+            "success": false,
+            "message": "Saved scene could not be loaded as a PackedScene.",
+            "postValidation": post
+        }
+    post["loadable"] = true
+
+    var scene_root = scene_resource.instantiate()
+    if scene_root == null:
+        return {
+            "success": false,
+            "message": "Saved scene could not be instantiated.",
+            "postValidation": post
+        }
+    post["instantiable"] = true
+
+    var validation = scene_patch_validation_result(project_path, scene_path, scene_root, source_params, max_depth, max_depth_requested, max_depth_clamped, "saved_scene_after_patch")
     scene_root.free()
+    post["valid"] = validation["valid"] if validation.has("valid") else false
+    post["issues"] = validation["issues"] if validation.has("issues") else []
+    post["summary"] = validation["summary"] if validation.has("summary") else {}
+    post["severity"] = validation["severity"] if validation.has("severity") else "error"
+    post["limits"] = validation["limits"] if validation.has("limits") else {}
+
+    return {
+        "success": post["valid"],
+        "message": "Saved scene validation failed." if not post["valid"] else "Post-validation passed.",
+        "postValidation": post
+    }
+
+func scene_patch_noop_result(dry_result, issues, checkpoint):
+    scene_patch_add_issue(issues, "info", "NO_CHANGES_PLANNED", "Patch produced no scene changes to save.")
+    var counts = scene_patch_issue_counts(issues)
+    var summary = dry_result["summary"].duplicate(true) if dry_result.has("summary") else {}
+    summary["appliedActionCount"] = 0
+    summary["errorCount"] = counts["errorCount"]
+    summary["warningCount"] = counts["warningCount"]
+    summary["infoCount"] = counts["infoCount"]
+    summary["savedOnce"] = false
+
+    return {
+        "success": true,
+        "projectPath": dry_result["projectPath"] if dry_result.has("projectPath") else ProjectSettings.globalize_path("res://"),
+        "scenePath": dry_result["scenePath"] if dry_result.has("scenePath") else "res://",
+        "applied": false,
+        "saved": false,
+        "valid": counts["errorCount"] == 0,
+        "severity": dry_align_severity_from_counts(counts),
+        "checkpoint": checkpoint,
+        "summary": summary,
+        "issues": issues,
+        "steps": dry_result["steps"] if dry_result.has("steps") else [],
+        "plan": dry_result["plan"] if dry_result.has("plan") else [],
+        "appliedChanges": [],
+        "write": {
+            "saved": false,
+            "resourceSaverCode": null,
+            "bytesWritten": 0
+        },
+        "postValidation": null,
+        "layoutBefore": dry_result["layoutBefore"] if dry_result.has("layoutBefore") else null,
+        "layoutAfter": dry_result["layoutAfter"] if dry_result.has("layoutAfter") else null,
+        "validationBefore": dry_result["validationBefore"] if dry_result.has("validationBefore") else null,
+        "validationAfter": dry_result["validationAfter"] if dry_result.has("validationAfter") else null,
+        "limits": dry_result["limits"] if dry_result.has("limits") else {}
+    }
+
+func apply_scene_patch(params):
+    if not params.has("scene_path"):
+        print(JSON.stringify(apply_scene_patch_error("MISSING_SCENE_PATH", "scene_path is required.")))
+        return
+    if not params.has("steps") or typeof(params.steps) != TYPE_ARRAY or params.steps.is_empty():
+        print(JSON.stringify(apply_scene_patch_error("INVALID_STEP", "steps must be a non-empty array.")))
+        return
+
+    var checkpoint = params.checkpoint if params.has("checkpoint") and typeof(params.checkpoint) == TYPE_DICTIONARY else {
+        "created": false,
+        "checkpointPath": null,
+        "metadataPath": null
+    }
+    var validate_before_write = params.validate_before_write if params.has("validate_before_write") else true
+    var validate_after_write = params.validate_after_write if params.has("validate_after_write") else true
+    var include_plan = params.include_plan if params.has("include_plan") else true
+    var max_depth = int(params.max_depth) if params.has("max_depth") else 100
+    var max_depth_requested = params.max_depth_requested if params.has("max_depth_requested") else null
+    var max_depth_clamped = params.max_depth_clamped if params.has("max_depth_clamped") else false
+    var project_path = params.project_path if params.has("project_path") else ProjectSettings.globalize_path("res://")
+
+    var plan_params = params.duplicate(true)
+    plan_params["simulate_cumulative"] = true
+    plan_params["include_plan"] = true
+    plan_params["include_checkpoints"] = params.create_checkpoint if params.has("create_checkpoint") else true
+
+    var planned = scene_patch_plan_result(plan_params)
+    if planned.has("fatal"):
+        var fatal = planned["fatal"]
+        var fatal_error = apply_scene_patch_error(fatal["error"], fatal["message"], [], checkpoint, false, false)
+        print(JSON.stringify(fatal_error))
+        return
+
+    var scene_root = planned["scene_root"]
+    var dry_result = planned["result"]
+    var issues = dry_result["issues"].duplicate(true) if dry_result.has("issues") else []
+
+    if validate_before_write and dry_result.has("validationAfter") and typeof(dry_result["validationAfter"]) == TYPE_DICTIONARY and dry_result["validationAfter"].has("valid") and not dry_result["validationAfter"]["valid"]:
+        scene_patch_add_validation_after_errors(issues, dry_result["validationAfter"])
+
+    if dry_align_has_error_issues(issues):
+        scene_root.free()
+        var validation_error = apply_scene_patch_error("DRY_RUN_VALIDATION_FAILED", "Scene patch dry-run validation failed; scene was not written.", issues, checkpoint, false, false)
+        validation_error["steps"] = dry_result["steps"] if dry_result.has("steps") else []
+        validation_error["plan"] = dry_result["plan"] if include_plan and dry_result.has("plan") else []
+        validation_error["layoutBefore"] = dry_result["layoutBefore"] if dry_result.has("layoutBefore") else null
+        validation_error["layoutAfter"] = dry_result["layoutAfter"] if dry_result.has("layoutAfter") else null
+        validation_error["validationBefore"] = dry_result["validationBefore"] if dry_result.has("validationBefore") else null
+        validation_error["validationAfter"] = dry_result["validationAfter"] if dry_result.has("validationAfter") else null
+        validation_error["limits"] = dry_result["limits"] if dry_result.has("limits") else {}
+        print(JSON.stringify(validation_error))
+        return
+
+    var applied_action_count = int(dry_result["summary"]["simulatedActionCount"]) if dry_result.has("summary") and dry_result["summary"].has("simulatedActionCount") else 0
+    var applied_changes = scene_patch_collect_simulated_changes(dry_result["steps"] if dry_result.has("steps") else [])
+    if applied_action_count == 0:
+        scene_root.free()
+        print(JSON.stringify(scene_patch_noop_result(dry_result, issues, checkpoint)))
+        return
+
+    var packed_scene = PackedScene.new()
+    var pack_result = packed_scene.pack(scene_root)
+    if pack_result != OK:
+        scene_root.free()
+        var pack_error = apply_scene_patch_error("PACK_SCENE_FAILED", "Failed to pack the patched scene; scene was not saved.", issues, checkpoint, false, false)
+        pack_error["steps"] = dry_result["steps"] if dry_result.has("steps") else []
+        pack_error["plan"] = dry_result["plan"] if include_plan and dry_result.has("plan") else []
+        print(JSON.stringify(pack_error))
+        return
+
+    var scene_path = dry_result["scenePath"] if dry_result.has("scenePath") else normalize_resource_scene_path(params.scene_path)
+    var save_error = ResourceSaver.save(packed_scene, scene_path)
+    if save_error != OK:
+        scene_root.free()
+        var save_result = apply_scene_patch_error("SAVE_SCENE_FAILED", "Failed to save the patched scene.", issues, checkpoint, true, false)
+        save_result["steps"] = dry_result["steps"] if dry_result.has("steps") else []
+        save_result["plan"] = dry_result["plan"] if include_plan and dry_result.has("plan") else []
+        save_result["write"] = {
+            "saved": false,
+            "resourceSaverCode": save_error,
+            "bytesWritten": 0
+        }
+        print(JSON.stringify(save_result))
+        return
+
+    var bytes_written = 0
+    var file = FileAccess.open(scene_path, FileAccess.READ)
+    if file != null:
+        bytes_written = file.get_length()
+        file.close()
+
+    var post_validation = null
+    if validate_after_write:
+        var post_result = scene_patch_post_validate_saved_scene(scene_path, project_path, params, max_depth, max_depth_requested, max_depth_clamped)
+        post_validation = post_result["postValidation"]
+        scene_patch_append_post_validation_issues(issues, post_validation)
+        if not post_result["success"]:
+            scene_root.free()
+            var post_error = apply_scene_patch_error("POST_VALIDATE_FAILED", post_result["message"], issues, checkpoint, true, true)
+            post_error["steps"] = dry_result["steps"] if dry_result.has("steps") else []
+            post_error["plan"] = dry_result["plan"] if include_plan and dry_result.has("plan") else []
+            post_error["appliedChanges"] = applied_changes
+            post_error["write"] = {
+                "saved": true,
+                "resourceSaverCode": save_error,
+                "bytesWritten": bytes_written
+            }
+            post_error["postValidation"] = post_validation
+            post_error["layoutBefore"] = dry_result["layoutBefore"] if dry_result.has("layoutBefore") else null
+            post_error["layoutAfter"] = dry_result["layoutAfter"] if dry_result.has("layoutAfter") else null
+            post_error["validationBefore"] = dry_result["validationBefore"] if dry_result.has("validationBefore") else null
+            post_error["validationAfter"] = dry_result["validationAfter"] if dry_result.has("validationAfter") else null
+            post_error["limits"] = dry_result["limits"] if dry_result.has("limits") else {}
+            print(JSON.stringify(post_error))
+            return
+
+    scene_root.free()
+
+    var counts = scene_patch_issue_counts(issues)
+    var summary = dry_result["summary"].duplicate(true) if dry_result.has("summary") else {}
+    summary["appliedActionCount"] = applied_action_count
+    summary["errorCount"] = counts["errorCount"]
+    summary["warningCount"] = counts["warningCount"]
+    summary["infoCount"] = counts["infoCount"]
+    summary["savedOnce"] = true
+
+    var result = {
+        "success": true,
+        "projectPath": project_path,
+        "scenePath": scene_path,
+        "applied": true,
+        "saved": true,
+        "valid": counts["errorCount"] == 0,
+        "severity": dry_align_severity_from_counts(counts),
+        "checkpoint": checkpoint,
+        "summary": summary,
+        "issues": issues,
+        "steps": dry_result["steps"] if dry_result.has("steps") else [],
+        "plan": dry_result["plan"] if include_plan and dry_result.has("plan") else [],
+        "appliedChanges": applied_changes,
+        "write": {
+            "saved": true,
+            "resourceSaverCode": save_error,
+            "bytesWritten": bytes_written
+        },
+        "postValidation": post_validation,
+        "layoutBefore": dry_result["layoutBefore"] if dry_result.has("layoutBefore") else null,
+        "layoutAfter": dry_result["layoutAfter"] if dry_result.has("layoutAfter") else null,
+        "validationBefore": dry_result["validationBefore"] if dry_result.has("validationBefore") else null,
+        "validationAfter": dry_result["validationAfter"] if dry_result.has("validationAfter") else null,
+        "limits": dry_result["limits"] if dry_result.has("limits") else {}
+    }
+    print(JSON.stringify(result))
 
 func update_node_properties_write_error(error_code, message, issues=[]):
     return {

@@ -138,6 +138,8 @@ class GodotServer {
     'node_path': 'nodePath',
     'checkpoint_name': 'checkpointName',
     'checkpoint_path': 'checkpointPath',
+    'create_checkpoint': 'createCheckpoint',
+    'restore_on_failure': 'restoreOnFailure',
     'include_metadata': 'includeMetadata',
     'include_missing_metadata': 'includeMissingMetadata',
     'max_checkpoints_per_scene': 'maxCheckpointsPerScene',
@@ -620,6 +622,31 @@ class GodotServer {
    */
   private createDryRunScenePatchErrorResponse(error: string, message: string): any {
     console.error(`[SERVER] dry_run_scene_patch error response: ${error}: ${message}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error,
+              message,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  /**
+   * Create an apply_scene_patch-specific JSON error response while preserving MCP text content style.
+   */
+  private createApplyScenePatchErrorResponse(error: string, message: string): any {
+    console.error(`[SERVER] apply_scene_patch error response: ${error}: ${message}`);
 
     return {
       content: [
@@ -2745,6 +2772,76 @@ class GodotServer {
           },
         },
         {
+          name: 'apply_scene_patch',
+          description: 'Apply a validated multi-step scene patch transactionally, saving the target scene once',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Absolute path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Existing Godot scene path such as res://scenes/Room.tscn or scenes/Room.tscn',
+              },
+              steps: {
+                type: 'array',
+                description: 'Non-empty array of high-level patch steps',
+              },
+              createCheckpoint: {
+                type: 'boolean',
+                description: 'Whether to create a project-local checkpoint before writing (default: true)',
+              },
+              checkpointName: {
+                type: 'string',
+                description: 'Optional checkpoint name (default: before_scene_patch)',
+              },
+              restoreOnFailure: {
+                type: 'boolean',
+                description: 'Whether to restore the checkpoint after save/post-validation failure (default: true)',
+              },
+              validateBeforeWrite: {
+                type: 'boolean',
+                description: 'Whether planning errors should block writing (default: true)',
+              },
+              validateAfterWrite: {
+                type: 'boolean',
+                description: 'Whether to reload and validate the saved scene after writing (default: true)',
+              },
+              includePlan: {
+                type: 'boolean',
+                description: 'Whether to include the flattened multi-step plan (default: true)',
+              },
+              includeLayoutBefore: {
+                type: 'boolean',
+                description: 'Whether to include compact scene layout before the patch (default: false)',
+              },
+              includeLayoutAfter: {
+                type: 'boolean',
+                description: 'Whether to include compact scene layout after the patch (default: false)',
+              },
+              includeValidationBefore: {
+                type: 'boolean',
+                description: 'Whether to include validation for the current scene before the patch (default: false)',
+              },
+              includeValidationAfter: {
+                type: 'boolean',
+                description: 'Whether to include validation for the final in-memory patch state before save (default: true)',
+              },
+              maxSteps: {
+                type: 'number',
+                description: 'Maximum patch steps to evaluate (default: 20, max: 100)',
+              },
+              maxDepth: {
+                type: 'number',
+                description: 'Maximum scene tree depth to inspect (default: 100, max: 200)',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'steps'],
+          },
+        },
+        {
           name: 'dry_run_scene_blueprint',
           description: 'Validate and simulate a scene blueprint read-only without creating or modifying files',
           inputSchema: {
@@ -3108,6 +3205,8 @@ class GodotServer {
           return await this.handleListSceneCheckpoints(request.params.arguments);
         case 'dry_run_scene_patch':
           return await this.handleDryRunScenePatch(request.params.arguments);
+        case 'apply_scene_patch':
+          return await this.handleApplyScenePatch(request.params.arguments);
         case 'dry_run_scene_blueprint':
           return await this.handleDryRunSceneBlueprint(request.params.arguments);
         case 'create_scene_from_blueprint':
@@ -7687,6 +7786,369 @@ class GodotServer {
       return this.createDryRunScenePatchErrorResponse(
         'DRY_RUN_SCENE_PATCH_FAILED',
         `Failed to dry-run scene patch: ${error?.message || 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * Handle the apply_scene_patch tool
+   */
+  private async handleApplyScenePatch(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || typeof args.projectPath !== 'string') {
+      return this.createApplyScenePatchErrorResponse(
+        'MISSING_PROJECT_PATH',
+        'projectPath is required and must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    if (!args.scenePath || typeof args.scenePath !== 'string') {
+      return this.createApplyScenePatchErrorResponse(
+        'MISSING_SCENE_PATH',
+        'scenePath is required and must be a Godot scene path such as res://scenes/Room.tscn or scenes/Room.tscn.'
+      );
+    }
+
+    if (args.projectPath.includes('\0')) {
+      return this.createApplyScenePatchErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must not contain null bytes.'
+      );
+    }
+
+    if (!isAbsolute(args.projectPath)) {
+      return this.createApplyScenePatchErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    const scenePathResult = this.normalizeScenePath(args.scenePath);
+    if (scenePathResult.error) {
+      return this.createApplyScenePatchErrorResponse(
+        'UNSAFE_SCENE_PATH',
+        scenePathResult.error
+      );
+    }
+
+    const sceneExtension = extname(scenePathResult.relativePath).toLowerCase();
+    if (!['.tscn', '.scn'].includes(sceneExtension)) {
+      return this.createApplyScenePatchErrorResponse(
+        'SCENE_PATH_NOT_SCENE_FILE',
+        'scenePath must point to a .tscn or .scn scene file.'
+      );
+    }
+
+    if (args.steps === undefined) {
+      return this.createApplyScenePatchErrorResponse(
+        'MISSING_STEPS',
+        'steps is required and must be a non-empty array of scene patch steps.'
+      );
+    }
+
+    if (!Array.isArray(args.steps)) {
+      return this.createApplyScenePatchErrorResponse(
+        'INVALID_STEPS',
+        'steps must be a non-empty array of scene patch steps.'
+      );
+    }
+
+    if (args.steps.length === 0) {
+      return this.createApplyScenePatchErrorResponse(
+        'INVALID_STEPS',
+        'steps must contain at least one scene patch step.'
+      );
+    }
+
+    for (let index = 0; index < args.steps.length; index += 1) {
+      const step = args.steps[index];
+      if (typeof step !== 'object' || step === null || Array.isArray(step)) {
+        return this.createApplyScenePatchErrorResponse(
+          'INVALID_STEPS',
+          `steps[${index}] must be an object.`
+        );
+      }
+
+      if (typeof step.type !== 'string' || step.type.trim() === '') {
+        return this.createApplyScenePatchErrorResponse(
+          'INVALID_STEPS',
+          `steps[${index}].type is required and must be a string.`
+        );
+      }
+    }
+
+    const maxStepsRequested = args.maxSteps !== undefined ? args.maxSteps : null;
+    let maxStepsApplied = 20;
+    let maxStepsClamped = false;
+    if (args.maxSteps !== undefined) {
+      if (typeof args.maxSteps !== 'number' || !Number.isFinite(args.maxSteps) || args.maxSteps < 1) {
+        return this.createApplyScenePatchErrorResponse(
+          'INVALID_MAX_STEPS',
+          'maxSteps must be a number between 1 and 100.'
+        );
+      }
+
+      if (args.maxSteps > 100) {
+        maxStepsApplied = 100;
+        maxStepsClamped = true;
+      } else {
+        maxStepsApplied = Math.floor(args.maxSteps);
+      }
+    }
+
+    const maxDepthRequested = args.maxDepth !== undefined ? args.maxDepth : null;
+    let maxDepthApplied = 100;
+    let maxDepthClamped = false;
+    if (args.maxDepth !== undefined) {
+      if (typeof args.maxDepth !== 'number' || !Number.isFinite(args.maxDepth) || args.maxDepth < 1) {
+        return this.createApplyScenePatchErrorResponse(
+          'INVALID_MAX_DEPTH',
+          'maxDepth must be a number between 1 and 200.'
+        );
+      }
+
+      if (args.maxDepth > 200) {
+        maxDepthApplied = 200;
+        maxDepthClamped = true;
+      } else {
+        maxDepthApplied = Math.floor(args.maxDepth);
+      }
+    }
+
+    const booleanOptions = [
+      'createCheckpoint',
+      'restoreOnFailure',
+      'validateBeforeWrite',
+      'validateAfterWrite',
+      'includePlan',
+      'includeLayoutBefore',
+      'includeLayoutAfter',
+      'includeValidationBefore',
+      'includeValidationAfter',
+    ];
+    for (const option of booleanOptions) {
+      if (args[option] !== undefined && typeof args[option] !== 'boolean') {
+        return this.createApplyScenePatchErrorResponse(
+          'APPLY_SCENE_PATCH_FAILED',
+          `${option} must be a boolean.`
+        );
+      }
+    }
+
+    const createCheckpoint = args.createCheckpoint !== undefined ? args.createCheckpoint : true;
+    const restoreOnFailure = args.restoreOnFailure !== undefined ? args.restoreOnFailure : true;
+    const validateBeforeWrite = args.validateBeforeWrite !== undefined ? args.validateBeforeWrite : true;
+    const validateAfterWrite = args.validateAfterWrite !== undefined ? args.validateAfterWrite : true;
+    const includePlan = args.includePlan !== undefined ? args.includePlan : true;
+    const includeLayoutBefore = args.includeLayoutBefore !== undefined ? args.includeLayoutBefore : false;
+    const includeLayoutAfter = args.includeLayoutAfter !== undefined ? args.includeLayoutAfter : false;
+    const includeValidationBefore = args.includeValidationBefore !== undefined ? args.includeValidationBefore : false;
+    const includeValidationAfter = args.includeValidationAfter !== undefined ? args.includeValidationAfter : true;
+
+    let checkpointNameSource: unknown = args.checkpointName !== undefined ? args.checkpointName : undefined;
+    if (checkpointNameSource === undefined) {
+      for (const step of args.steps) {
+        if (step.type === 'create_checkpoint') {
+          checkpointNameSource = step.checkpointName !== undefined ? step.checkpointName : step.checkpoint_name;
+          if (checkpointNameSource !== undefined) {
+            break;
+          }
+        }
+      }
+    }
+    if (checkpointNameSource === undefined) {
+      checkpointNameSource = 'before_scene_patch';
+    }
+
+    const checkpointName = this.sanitizeCheckpointName(checkpointNameSource);
+    if (checkpointName.error) {
+      return this.createApplyScenePatchErrorResponse(
+        'INVALID_CHECKPOINT_NAME',
+        checkpointName.error
+      );
+    }
+
+    try {
+      const normalizedProjectPath = resolve(args.projectPath);
+      if (!existsSync(normalizedProjectPath)) {
+        return this.createApplyScenePatchErrorResponse(
+          'PROJECT_PATH_NOT_FOUND',
+          `Project path does not exist: ${args.projectPath}`
+        );
+      }
+
+      const projectStats = statSync(normalizedProjectPath);
+      if (!projectStats.isDirectory()) {
+        return this.createApplyScenePatchErrorResponse(
+          'PROJECT_PATH_NOT_DIRECTORY',
+          `Project path is not a directory: ${args.projectPath}`
+        );
+      }
+
+      const projectRoot = realpathSync(normalizedProjectPath);
+      const projectFile = join(projectRoot, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createApplyScenePatchErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          `Not a valid Godot project: ${args.projectPath}. The directory must contain a project.godot file.`
+        );
+      }
+
+      const sceneFilePath = resolve(projectRoot, scenePathResult.relativePath);
+      if (!this.isPathInside(projectRoot, sceneFilePath)) {
+        return this.createApplyScenePatchErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must stay inside the Godot project directory.'
+        );
+      }
+
+      if (!existsSync(sceneFilePath)) {
+        return this.createApplyScenePatchErrorResponse(
+          'SCENE_PATH_NOT_FOUND',
+          `Scene file does not exist: ${scenePathResult.resourcePath}`
+        );
+      }
+
+      const sceneFileStats = lstatSync(sceneFilePath);
+      if (sceneFileStats.isSymbolicLink()) {
+        return this.createApplyScenePatchErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must not be a symbolic link.'
+        );
+      }
+
+      if (!sceneFileStats.isFile()) {
+        return this.createApplyScenePatchErrorResponse(
+          'SCENE_PATH_NOT_FOUND',
+          `Scene path is not a file: ${scenePathResult.resourcePath}`
+        );
+      }
+
+      const realSceneFilePath = realpathSync(sceneFilePath);
+      if (!this.isPathInside(projectRoot, realSceneFilePath)) {
+        return this.createApplyScenePatchErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must stay inside the Godot project directory.'
+        );
+      }
+
+      let checkpointFilePath: string | null = null;
+      let checkpointInfo: any = {
+        created: false,
+        checkpointPath: null,
+        metadataPath: null,
+      };
+
+      if (createCheckpoint) {
+        const checkpoint = this.createSceneCheckpointCopy(
+          projectRoot,
+          scenePathResult,
+          realSceneFilePath,
+          checkpointName.name,
+          true,
+          20,
+          false
+        );
+
+        if (checkpoint.error) {
+          return this.createApplyScenePatchErrorResponse(
+            'CREATE_SCENE_CHECKPOINT_FAILED',
+            checkpoint.message || 'Failed to create checkpoint.'
+          );
+        }
+
+        checkpointFilePath = checkpoint.checkpointFilePath;
+        checkpointInfo = {
+          created: true,
+          checkpointPath: checkpoint.checkpointPath,
+          metadataPath: checkpoint.metadataPath,
+          pruned: checkpoint.pruned,
+          summary: checkpoint.summary,
+        };
+      }
+
+      const restoreFromCheckpoint = (result: any) => {
+        if (!restoreOnFailure || !checkpointFilePath || !checkpointInfo.created) {
+          return result;
+        }
+
+        try {
+          copyFileSync(checkpointFilePath, realSceneFilePath);
+          return {
+            ...result,
+            restored: true,
+          };
+        } catch (restoreError: any) {
+          return {
+            ...result,
+            restored: false,
+            restoreError: restoreError?.message || 'Failed to restore checkpoint.',
+          };
+        }
+      };
+
+      const params = {
+        projectPath: projectRoot.replace(/\\/g, '/'),
+        scenePath: scenePathResult.resourcePath,
+        steps: args.steps,
+        checkpoint: checkpointInfo,
+        createCheckpoint,
+        restoreOnFailure,
+        validateBeforeWrite,
+        validateAfterWrite,
+        includePlan,
+        includeLayoutBefore,
+        includeLayoutAfter,
+        includeValidationBefore,
+        includeValidationAfter,
+        simulateCumulative: true,
+        includeCheckpoints: createCheckpoint,
+        maxSteps: maxStepsApplied,
+        maxStepsRequested,
+        maxStepsClamped,
+        maxDepth: maxDepthApplied,
+        maxDepthRequested,
+        maxDepthClamped,
+      };
+
+      const { stdout, stderr } = await this.executeOperation('apply_scene_patch', params, projectRoot);
+      let parsedResult = this.extractLastJsonObject(stdout);
+
+      if (!parsedResult) {
+        const stderrText = stderr?.trim();
+        parsedResult = restoreFromCheckpoint({
+          success: false,
+          error: 'APPLY_SCENE_PATCH_FAILED',
+          message: stderrText
+            ? `Godot did not return valid JSON for apply_scene_patch. Stderr: ${stderrText}`
+            : 'Godot did not return valid JSON for apply_scene_patch.',
+          checkpoint: checkpointInfo,
+          writeAttempted: null,
+          saved: null,
+          issues: [],
+        });
+      } else {
+        parsedResult.checkpoint = parsedResult.checkpoint || checkpointInfo;
+        const writeAttempted = parsedResult.writeAttempted === true || parsedResult.saved === true || parsedResult.write?.saved === true;
+        if (parsedResult.success === false && writeAttempted) {
+          parsedResult = restoreFromCheckpoint(parsedResult);
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(parsedResult, null, 2),
+          },
+        ],
+        ...(parsedResult.success === false ? { isError: true } : {}),
+      };
+    } catch (error: any) {
+      return this.createApplyScenePatchErrorResponse(
+        'APPLY_SCENE_PATCH_FAILED',
+        `Failed to apply scene patch: ${error?.message || 'Unknown error'}`
       );
     }
   }

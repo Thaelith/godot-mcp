@@ -149,6 +149,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "restore_scene_checkpoint",
         "list_scene_checkpoints",
         "dry_run_scene_patch",
+        "apply_scene_patch",
         "validate_scene",
         "dry_run_scene_blueprint",
         "create_scene_from_blueprint",
@@ -1874,7 +1875,7 @@ Output example:
 
 **Validation and layout scopes:** `includeValidationBefore` validates the original scene as `pre_patch_current_scene`. `validate_scene` steps and `includeValidationAfter` validate the simulated state as `simulated_patch_state` when cumulative simulation is enabled. `includeLayoutBefore` returns the original compact layout; `includeLayoutAfter` returns the final simulated compact layout when cumulative simulation is enabled. If final layout or final validation is requested with `simulateCumulative: false`, the tool adds an info issue instead of pretending to validate a final patch.
 
-**Difference from future `apply_scene_patch`:** this tool only validates and plans a patch. A future writer should apply only normalized plan entries after checkpointing and validation; this dry-run never writes.
+**Difference from `apply_scene_patch`:** this tool only validates and plans a patch. `apply_scene_patch` is the writer counterpart: it creates an optional checkpoint, applies the same cumulative plan in memory, validates, and saves the target scene once.
 
 `simulateCumulative` defaults to `true`. `includeLayoutAfter` and `includeValidationAfter` default to `false`. `maxSteps` defaults to `20`, rejects values below `1`, and clamps above `100`. `maxDepth` defaults to `100`, rejects values below `1`, and clamps above `200`.
 
@@ -1886,6 +1887,142 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Call `dry_run_scene_patch` with checkpoint, placement, alignment, property update, and validation steps. Confirm nested plans are returned, cumulative mode can place a node and later align/update that same simulated node, `simulateCumulative: false` still returns `CUMULATIVE_SIMULATION_UNSUPPORTED` for dependent steps, unknown step types return `UNKNOWN_STEP_TYPE`, no checkpoint files are created, and scene/asset file hashes are unchanged.
+
+### `apply_scene_patch`
+
+Applies a supported multi-step scene patch transactionally to one existing scene. It reuses the same cumulative planning and in-memory simulation path as `dry_run_scene_patch`, applies only normalized plan actions, optionally creates one checkpoint before writing, saves the target scene once, and optionally restores the checkpoint if save/post-validation fails.
+
+Example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "createCheckpoint": true,
+  "checkpointName": "before_scene_patch",
+  "restoreOnFailure": true,
+  "validateBeforeWrite": true,
+  "validateAfterWrite": true,
+  "includeLayoutAfter": true,
+  "steps": [
+    {
+      "type": "create_checkpoint",
+      "checkpointName": "before_ai_patch"
+    },
+    {
+      "type": "place_asset",
+      "assetPath": "res://assets/props/chair.tscn",
+      "parentPath": "Room",
+      "nodeName": "Chair",
+      "placement": {
+        "mode": "position",
+        "position": [100, 200],
+        "space": "global"
+      }
+    },
+    {
+      "type": "align_nodes",
+      "operations": [
+        {
+          "type": "place_relative",
+          "nodePath": "Room/Chair",
+          "referenceNodePath": "Room/Table",
+          "relation": "right_of",
+          "margin": 8
+        }
+      ],
+      "boundsSource": "visual"
+    },
+    {
+      "type": "update_node_properties",
+      "updates": [
+        {
+          "nodePath": "Room/Chair",
+          "properties": {
+            "z_index": 5,
+            "scale": [1.2, 1.2]
+          }
+        }
+      ]
+    },
+    {
+      "type": "validate_scene",
+      "includeInfo": true
+    }
+  ]
+}
+```
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "applied": true,
+  "saved": true,
+  "valid": true,
+  "severity": "ok",
+  "checkpoint": {
+    "created": true,
+    "checkpointPath": "res://.godot_mcp/checkpoints/scenes__room_tscn/20260615T120000Z_before_scene_patch.tscn",
+    "metadataPath": "res://.godot_mcp/checkpoints/scenes__room_tscn/20260615T120000Z_before_scene_patch.json"
+  },
+  "summary": {
+    "stepCount": 5,
+    "plannedActionCount": 7,
+    "simulatedActionCount": 6,
+    "appliedActionCount": 6,
+    "errorCount": 0,
+    "warningCount": 0,
+    "infoCount": 0,
+    "savedOnce": true
+  },
+  "issues": [],
+  "appliedChanges": [
+    {
+      "stepIndex": 1,
+      "stepType": "place_asset",
+      "action": "add_node",
+      "path": "Room/Chair"
+    }
+  ],
+  "write": {
+    "saved": true,
+    "resourceSaverCode": 0,
+    "bytesWritten": 1234
+  },
+  "postValidation": {
+    "loadable": true,
+    "instantiable": true,
+    "validationScope": "saved_scene_after_patch",
+    "valid": true,
+    "issues": []
+  }
+}
+```
+
+**Safety model:** `apply_scene_patch` does not call individual writer tools internally and does not save after each step. It creates or receives a cumulative in-memory patch plan, applies only normalized placement/alignment/property plan actions, packs the scene, and writes only the requested `scenePath`. It does not create new scene files, modify assets, import/reimport assets, attach scripts, edit resources directly, delete nodes, rename existing nodes, reparent existing nodes, or set dangerous properties.
+
+**Checkpoint behavior:** `createCheckpoint` defaults to `true`. The TypeScript server creates exactly one project-local checkpoint before running the Godot writer. A `create_checkpoint` step can provide the checkpoint name when the top-level `checkpointName` is omitted, but it does not create an additional checkpoint. Set `createCheckpoint: false` to skip real checkpoint creation; checkpoint steps then behave as planned/no-op entries.
+
+**Restore on failure:** `restoreOnFailure` defaults to `true`. If a checkpoint was created and Godot reports a save or post-validation failure after a write attempt, the server copies the checkpoint back to the target scene and returns `restored: true` when that succeeds.
+
+**Validation behavior:** `validateBeforeWrite` blocks writing when the cumulative plan has errors. `includeValidationAfter` validates the final in-memory patch state before saving. `validateAfterWrite` reloads the saved scene with cache ignored and validates it as `saved_scene_after_patch`; post-validation issues are surfaced in the response.
+
+**Supported step types:** `place_asset`, `align_nodes`, `update_node_properties`, `validate_scene`, and `create_checkpoint`. Placement uses the existing safe asset placement behavior, alignment applies only local `position` changes, and property updates use the same safe allowlist as `update_node_properties`.
+
+**Current limitations:** no arbitrary script attachment, arbitrary resource assignment, node deletion, existing-node renaming, existing-node reparenting, group/signal/metadata editing, or per-step saves. The tool saves at most once and only to the requested scene path.
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Call `apply_scene_patch` with placement, alignment, property update, and validation steps. Confirm it creates one checkpoint when enabled, saves the target scene once, `read_scene_tree` can see the new node, `get_scene_layout` reflects final positions, invalid plans abort before writing, no-op patches do not save, and post-validation failure restores the checkpoint when `restoreOnFailure` is true.
 
 ### `validate_scene`
 
