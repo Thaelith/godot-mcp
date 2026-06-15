@@ -144,6 +144,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "dry_run_place_asset_in_scene",
         "place_asset_in_scene",
         "dry_run_update_node_properties",
+        "update_node_properties",
         "validate_scene",
         "dry_run_scene_blueprint",
         "create_scene_from_blueprint",
@@ -1309,7 +1310,7 @@ Output example:
 
 **Limits:** `maxUpdates` defaults to `100`, rejects values below `1`, and clamps above `1000`. `maxDepth` defaults to `100`, rejects values below `1`, and clamps above `200`.
 
-**Difference from future `update_node_properties`:** this tool only returns a normalized plan and structured issues. A future writer should refuse plans with errors and apply only planned safe property changes, not raw user input.
+**Difference from `update_node_properties`:** this tool only returns a normalized plan and structured issues. The writer refuses plans with errors and applies only planned safe property changes, not raw user input.
 
 Manual test:
 
@@ -1319,6 +1320,134 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Then call `dry_run_update_node_properties` against an existing scene. Confirm safe updates produce a plan, dangerous fields such as `script` or `texture` produce `UNSUPPORTED_PROPERTY`, missing nodes produce `NODE_NOT_FOUND`, duplicate properties produce `DUPLICATE_PROPERTY_UPDATE`, and the scene file hash is unchanged.
+
+### `update_node_properties`
+
+Safely applies allowlisted property updates to existing nodes in an existing scene and saves the scene. This is the writing counterpart to `dry_run_update_node_properties`: it runs the same planner first, refuses to write if planning produced any error issue, and applies only normalized plan entries. Raw update objects are never written directly.
+
+Input example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "updates": [
+    {
+      "nodePath": "Room/Chair",
+      "properties": {
+        "scale": [1.5, 1.5],
+        "z_index": 5,
+        "visible": true,
+        "modulate": [1, 0.9, 0.8, 1]
+      }
+    },
+    {
+      "nodePath": "Room/Label",
+      "properties": {
+        "text": "Ready"
+      }
+    }
+  ],
+  "validateBeforeWrite": true,
+  "validateAfterWrite": true,
+  "includePlan": true,
+  "includeCurrentValues": true
+}
+```
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "applied": true,
+  "saved": true,
+  "valid": true,
+  "severity": "ok",
+  "summary": {
+    "updateCount": 2,
+    "plannedChangeCount": 4,
+    "appliedChangeCount": 4,
+    "errorCount": 0,
+    "warningCount": 0,
+    "infoCount": 0
+  },
+  "issues": [],
+  "plan": [
+    {
+      "updateIndex": 0,
+      "nodePath": "Room/Chair",
+      "nodeType": "Sprite2D",
+      "property": "scale",
+      "currentValue": [1, 1],
+      "proposedValue": [1.5, 1.5],
+      "valueType": "Vector2",
+      "reason": "Safe property update planned."
+    }
+  ],
+  "appliedChanges": [
+    {
+      "nodePath": "Room/Chair",
+      "nodeType": "Sprite2D",
+      "property": "scale",
+      "oldValue": [1, 1],
+      "newValue": [1.5, 1.5],
+      "valueType": "Vector2"
+    }
+  ],
+  "write": { "saved": true, "resourceSaverCode": 0, "bytesWritten": 1234 },
+  "postValidation": {
+    "loadable": true,
+    "instantiable": true,
+    "propertyChecksPassed": true,
+    "checkedProperties": 4,
+    "failedProperties": [],
+    "details": [
+      {
+        "nodePath": "Room/Chair",
+        "property": "scale",
+        "matches": true,
+        "message": "Property matched the planned value within epsilon."
+      }
+    ]
+  },
+  "layoutBefore": null,
+  "layoutAfter": null,
+  "limits": {
+    "maxUpdatesRequested": null,
+    "maxUpdatesApplied": 100,
+    "maxUpdatesClamped": false,
+    "maxDepthRequested": null,
+    "maxDepthApplied": 100,
+    "maxDepthClamped": false
+  }
+}
+```
+
+**Safety model:** `update_node_properties` only modifies the requested scene file. It does not create new scenes, create backups, edit assets, import/reimport resources, attach scripts, parse script source, change owners, rename/reparent/delete/create nodes, edit groups/signals/metadata, or write arbitrary properties.
+
+**Supported property allowlist:** `position`, `scale`, `rotation`, `rotation_degrees`, `z_index`, `visible`, `size`, `text`, `disabled`, `enabled`, `centered`, `flip_h`, `flip_v`, `offset`, `zoom`, `volume_db`, `autoplay`, `modulate`, `self_modulate`.
+
+**Always refused properties:** `script`, `owner`, `name`, `groups`, `signals`, `metadata`, `process_mode`, `pause_mode`, `texture`, `stream`, `mesh`, and `font`. Resource assignment properties are intentionally not supported; use asset placement tools for assets.
+
+**`validateBeforeWrite`** (default `true`): the writer always runs the dry-run planner first and refuses to save when planning has error issues. The flag is accepted for API symmetry, but planning errors are still treated as write blockers.
+
+**`validateAfterWrite`** (default `true`): reloads the saved scene with cache ignored, instantiates it, finds every changed node, reads every changed property, converts values to JSON-compatible shapes, and compares them against the planned values. Numbers, vectors, and colors use an epsilon of `0.001`; strings and booleans require exact matches. Failures return `POST_VALIDATE_FAILED` with per-property `postValidation.details`.
+
+**No-op behavior:** if the plan contains no changes, the tool returns `success: true`, `applied: false`, `saved: false`, adds `NO_CHANGES_PLANNED`, and does not save the scene.
+
+**Current limitations:** no arbitrary resource assignment, no script attachment, no custom script properties, no arbitrary dictionaries, no group/signal/metadata edits, no owner/name/process setting edits, and no live editor plugin.
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Then call `update_node_properties` against an existing scene. Verify safe updates save, `read_scene_tree`/`get_scene_layout` reflect the changes, `validate_scene` still runs, dangerous fields such as `script` or `texture` abort before writing, no-op updates do not save, and no files other than the requested scene file are modified.
 
 ### `validate_scene`
 

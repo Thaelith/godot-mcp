@@ -28,7 +28,7 @@ func _init():
     
     var operation = args[operation_index]
     var params_json = args[params_index]
-    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "dry_run_align_nodes" or operation == "align_nodes" or operation == "dry_run_place_asset_in_scene" or operation == "place_asset_in_scene" or operation == "dry_run_update_node_properties" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
+    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "dry_run_align_nodes" or operation == "align_nodes" or operation == "dry_run_place_asset_in_scene" or operation == "place_asset_in_scene" or operation == "dry_run_update_node_properties" or operation == "update_node_properties" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
 
     if quiet_output:
         debug_mode = false
@@ -77,6 +77,8 @@ func _init():
             place_asset_in_scene(params)
         "dry_run_update_node_properties":
             dry_run_update_node_properties(params)
+        "update_node_properties":
+            update_node_properties(params)
         "validate_scene":
             validate_scene(params)
         "get_asset_info":
@@ -3327,13 +3329,11 @@ func update_node_properties_finish_result(project_path, scene_path, update_count
         "limits": limits
     }
 
-func dry_run_update_node_properties(params):
+func update_node_properties_plan(params):
     if not params.has("scene_path"):
-        print(JSON.stringify(update_node_properties_error("MISSING_SCENE_PATH", "scene_path is required.")))
-        return
+        return {"fatal": {"error": "MISSING_SCENE_PATH", "message": "scene_path is required."}}
     if not params.has("updates") or typeof(params.updates) != TYPE_ARRAY or params.updates.is_empty():
-        print(JSON.stringify(update_node_properties_error("INVALID_UPDATE", "updates must be a non-empty array.")))
-        return
+        return {"fatal": {"error": "INVALID_UPDATE", "message": "updates must be a non-empty array."}}
 
     var scene_path = normalize_resource_scene_path(params.scene_path)
     var project_path = params.project_path if params.has("project_path") else ProjectSettings.globalize_path("res://")
@@ -3350,11 +3350,9 @@ func dry_run_update_node_properties(params):
     var max_depth_clamped = params.max_depth_clamped if params.has("max_depth_clamped") else false
 
     if max_updates < 1:
-        print(JSON.stringify(update_node_properties_error("INVALID_MAX_UPDATES", "maxUpdates must be a number between 1 and 1000.")))
-        return
+        return {"fatal": {"error": "INVALID_MAX_UPDATES", "message": "maxUpdates must be a number between 1 and 1000."}}
     if max_depth < 1:
-        print(JSON.stringify(update_node_properties_error("INVALID_MAX_DEPTH", "maxDepth must be a number between 1 and 200.")))
-        return
+        return {"fatal": {"error": "INVALID_MAX_DEPTH", "message": "maxDepth must be a number between 1 and 200."}}
     if max_updates > 1000:
         max_updates = 1000
         max_updates_clamped = true
@@ -3372,18 +3370,15 @@ func dry_run_update_node_properties(params):
     }
 
     if not FileAccess.file_exists(scene_path):
-        print(JSON.stringify(update_node_properties_error("SCENE_PATH_NOT_FOUND", "Scene file does not exist: " + scene_path)))
-        return
+        return {"fatal": {"error": "SCENE_PATH_NOT_FOUND", "message": "Scene file does not exist: " + scene_path}}
 
     var scene_resource = ResourceLoader.load(scene_path)
     if scene_resource == null or not (scene_resource is PackedScene):
-        print(JSON.stringify(update_node_properties_error("SCENE_LOAD_FAILED", "Failed to load scene as PackedScene: " + scene_path)))
-        return
+        return {"fatal": {"error": "SCENE_LOAD_FAILED", "message": "Failed to load scene as PackedScene: " + scene_path}}
 
     var scene_root = scene_resource.instantiate()
     if scene_root == null:
-        print(JSON.stringify(update_node_properties_error("SCENE_INSTANTIATE_FAILED", "Failed to instantiate scene: " + scene_path)))
-        return
+        return {"fatal": {"error": "SCENE_INSTANTIATE_FAILED", "message": "Failed to instantiate scene: " + scene_path}}
 
     var issues = []
     var plan = []
@@ -3500,9 +3495,378 @@ func dry_run_update_node_properties(params):
                 plan_index_by_key[key] = plan.size()
                 plan.append(plan_entry)
 
-    var result = update_node_properties_finish_result(project_path, scene_path, updates.size(), issues, plan, include_plan, include_layout_before, layout_data, limits)
+    return {
+        "scene_root": scene_root,
+        "project_path": project_path,
+        "scene_path": scene_path,
+        "updates": updates,
+        "update_count": updates.size(),
+        "issues": issues,
+        "plan": plan,
+        "include_plan": include_plan,
+        "include_current_values": include_current_values,
+        "include_layout_before": include_layout_before,
+        "validate_properties": validate_properties,
+        "max_updates": max_updates,
+        "max_depth": max_depth,
+        "layout_data": layout_data,
+        "limits": limits
+    }
+
+func dry_run_update_node_properties(params):
+    var planned = update_node_properties_plan(params)
+    if planned.has("fatal"):
+        print(JSON.stringify(update_node_properties_error(planned["fatal"]["error"], planned["fatal"]["message"])))
+        return
+
+    var result = update_node_properties_finish_result(planned["project_path"], planned["scene_path"], planned["update_count"], planned["issues"], planned["plan"], planned["include_plan"], planned["include_layout_before"], planned["layout_data"], planned["limits"])
     print(JSON.stringify(result))
+    planned["scene_root"].free()
+
+func update_node_properties_write_error(error_code, message, issues=[]):
+    return {
+        "success": false,
+        "error": error_code,
+        "message": message,
+        "issues": issues
+    }
+
+func update_node_properties_empty_post_validation():
+    return {
+        "loadable": null,
+        "instantiable": null,
+        "propertyChecksPassed": null,
+        "checkedProperties": 0,
+        "failedProperties": [],
+        "details": []
+    }
+
+func update_node_properties_scene_path_to_relative(node_path):
+    var slash = node_path.find("/")
+    if slash >= 0:
+        return node_path.substr(slash + 1)
+    return ""
+
+func update_node_properties_find_node(root, node_path):
+    var relative_path = update_node_properties_scene_path_to_relative(node_path)
+    if relative_path.is_empty():
+        return root
+    return root.get_node_or_null(NodePath(relative_path))
+
+func update_node_properties_convert_plan_value(plan_entry):
+    if not plan_entry.has("property") or not plan_entry.has("proposedValue") or not plan_entry.has("valueType"):
+        return {"success": false, "message": "Planned change is missing property, proposedValue, or valueType."}
+
+    var property_name = plan_entry["property"]
+    var proposed_value = plan_entry["proposedValue"]
+    var value_type = plan_entry["valueType"]
+
+    if not update_node_properties_safe_properties().has(property_name) or update_node_properties_dangerous_properties().has(property_name):
+        return {"success": false, "message": "Planned property is not in the safe allowlist."}
+
+    if value_type == "Vector2":
+        if dry_run_is_number_array(proposed_value, 2):
+            return {"success": true, "value": Vector2(proposed_value[0], proposed_value[1])}
+        return {"success": false, "message": "Planned Vector2 value must be [x, y]."}
+
+    if value_type == "Vector3":
+        if dry_run_is_number_array(proposed_value, 3):
+            return {"success": true, "value": Vector3(proposed_value[0], proposed_value[1], proposed_value[2])}
+        return {"success": false, "message": "Planned Vector3 value must be [x, y, z]."}
+
+    if value_type == "Color":
+        var color_value = update_node_properties_color_array(proposed_value)
+        if color_value != null:
+            return {"success": true, "value": Color(color_value[0], color_value[1], color_value[2], color_value[3])}
+        return {"success": false, "message": "Planned Color value must be [r, g, b] or [r, g, b, a]."}
+
+    if value_type == "number":
+        if dry_run_is_number_value(proposed_value):
+            return {"success": true, "value": proposed_value}
+        return {"success": false, "message": "Planned number value must be numeric."}
+
+    if value_type == "boolean":
+        if typeof(proposed_value) == TYPE_BOOL:
+            return {"success": true, "value": proposed_value}
+        return {"success": false, "message": "Planned boolean value must be true or false."}
+
+    if value_type == "string":
+        if typeof(proposed_value) == TYPE_STRING:
+            return {"success": true, "value": proposed_value}
+        return {"success": false, "message": "Planned string value must be a string."}
+
+    return {"success": false, "message": "Unsupported planned value type: " + str(value_type)}
+
+func update_node_properties_values_match_post(actual_value, expected_value):
+    if typeof(actual_value) == TYPE_ARRAY and typeof(expected_value) == TYPE_ARRAY:
+        if actual_value.size() != expected_value.size():
+            return false
+        for index in range(actual_value.size()):
+            if not update_node_properties_values_match_post(actual_value[index], expected_value[index]):
+                return false
+        return true
+    if dry_run_is_number_value(actual_value) and dry_run_is_number_value(expected_value):
+        return abs(float(actual_value) - float(expected_value)) <= 0.001
+    return actual_value == expected_value
+
+func update_node_properties_post_validate(scene_path, applied_changes):
+    var post = update_node_properties_empty_post_validation()
+    post["loadable"] = false
+    post["instantiable"] = false
+    post["propertyChecksPassed"] = false
+    var warnings = []
+
+    var scene_resource = ResourceLoader.load(scene_path, "", ResourceLoader.CACHE_MODE_IGNORE)
+    if scene_resource == null or not (scene_resource is PackedScene):
+        return {"success": false, "message": "Saved scene could not be loaded as a PackedScene.", "postValidation": post, "warnings": warnings}
+    post["loadable"] = true
+
+    var root = scene_resource.instantiate()
+    if root == null:
+        return {"success": false, "message": "Saved scene could not be instantiated.", "postValidation": post, "warnings": warnings}
+    post["instantiable"] = true
+
+    for change in applied_changes:
+        var detail = {
+            "nodePath": change["nodePath"] if change.has("nodePath") else null,
+            "property": change["property"] if change.has("property") else null,
+            "matches": false,
+            "message": ""
+        }
+
+        if not change.has("nodePath") or not change.has("property") or not change.has("newValue"):
+            detail["message"] = "Applied change is missing nodePath, property, or newValue."
+            post["failedProperties"].append(detail)
+            post["details"].append(detail)
+            continue
+
+        var node = update_node_properties_find_node(root, change["nodePath"])
+        if node == null:
+            detail["message"] = "Target node was not found in the saved scene."
+            post["failedProperties"].append(detail)
+            post["details"].append(detail)
+            continue
+
+        if not create_scene_blueprint_node_has_property(node, change["property"]):
+            detail["message"] = "Property is not available on the saved node."
+            post["failedProperties"].append(detail)
+            post["details"].append(detail)
+            continue
+
+        var converted_current = update_node_properties_convert_current_value(node.get(change["property"]))
+        if not converted_current["success"]:
+            detail["message"] = "Saved property value could not be converted safely."
+            post["failedProperties"].append(detail)
+            post["details"].append(detail)
+            continue
+
+        if update_node_properties_values_match_post(converted_current["value"], change["newValue"]):
+            detail["matches"] = true
+            detail["message"] = "Property matched the planned value within epsilon."
+        else:
+            detail["message"] = "Property did not match the planned value."
+            detail["actualValue"] = converted_current["value"]
+            detail["expectedValue"] = change["newValue"]
+            post["failedProperties"].append(detail)
+        post["details"].append(detail)
+
+    root.free()
+    post["checkedProperties"] = applied_changes.size()
+    post["propertyChecksPassed"] = post["failedProperties"].is_empty()
+
+    if not post["propertyChecksPassed"]:
+        return {"success": false, "message": "One or more saved properties did not match the planned values.", "postValidation": post, "warnings": warnings}
+    return {"success": true, "message": "", "postValidation": post, "warnings": warnings}
+
+func update_node_properties_noop_result(planned, issues, post_validation=null):
+    update_node_properties_add_issue(issues, "info", "NO_CHANGES_PLANNED", "No property changes were planned; scene was not saved.")
+    var counts = dry_align_issue_counts(issues)
+    var severity = dry_align_severity_from_counts(counts)
+    return {
+        "success": true,
+        "projectPath": planned["project_path"],
+        "scenePath": planned["scene_path"],
+        "applied": false,
+        "saved": false,
+        "valid": counts["errorCount"] == 0,
+        "severity": severity,
+        "summary": {
+            "updateCount": planned["update_count"],
+            "plannedChangeCount": planned["plan"].size(),
+            "appliedChangeCount": 0,
+            "errorCount": counts["errorCount"],
+            "warningCount": counts["warningCount"],
+            "infoCount": counts["infoCount"]
+        },
+        "issues": issues,
+        "plan": planned["plan"] if planned["include_plan"] else [],
+        "appliedChanges": [],
+        "write": {
+            "saved": false,
+            "resourceSaverCode": null,
+            "bytesWritten": 0
+        },
+        "postValidation": post_validation if post_validation != null else update_node_properties_empty_post_validation(),
+        "layoutBefore": dry_align_compact_layout_before(planned["layout_data"]["nodes"], planned["layout_data"]["sceneBounds"], "visual") if planned["include_layout_before"] else null,
+        "layoutAfter": null,
+        "limits": planned["limits"]
+    }
+
+func update_node_properties(params):
+    var validate_before_write = params.validate_before_write if params.has("validate_before_write") else true
+    var validate_after_write = params.validate_after_write if params.has("validate_after_write") else true
+    var include_layout_after = params.include_layout_after if params.has("include_layout_after") else false
+
+    var planned = update_node_properties_plan(params)
+    if planned.has("fatal"):
+        print(JSON.stringify(update_node_properties_write_error(planned["fatal"]["error"], planned["fatal"]["message"])))
+        return
+
+    var scene_root = planned["scene_root"]
+    var issues = planned["issues"]
+    var plan = planned["plan"]
+
+    if dry_align_has_error_issues(issues):
+        scene_root.free()
+        print(JSON.stringify(update_node_properties_write_error("DRY_RUN_VALIDATION_FAILED", "Property update dry-run validation failed; scene was not modified.", issues)))
+        return
+
+    if plan.is_empty():
+        var noop_result = update_node_properties_noop_result(planned, issues)
+        scene_root.free()
+        print(JSON.stringify(noop_result))
+        return
+
+    var node_by_path = planned["layout_data"]["nodeByPath"]
+    var applied_changes = []
+    for entry in plan:
+        if typeof(entry) != TYPE_DICTIONARY or not entry.has("nodePath") or not entry.has("property") or not entry.has("proposedValue") or not entry.has("valueType"):
+            update_node_properties_add_issue(issues, "warning", "UNSUPPORTED_PLANNED_CHANGE", "Planned change was skipped because it was missing required fields.")
+            continue
+
+        var node_path = entry["nodePath"]
+        var property_name = entry["property"]
+        if not node_by_path.has(node_path):
+            scene_root.free()
+            update_node_properties_add_issue(issues, "error", "NODE_NOT_FOUND", "Target node was not found while applying the normalized plan.", entry["updateIndex"] if entry.has("updateIndex") else -1, node_path, entry["nodeType"] if entry.has("nodeType") else null, property_name)
+            print(JSON.stringify(update_node_properties_write_error("NODE_NOT_FOUND", "Target node was not found while applying the normalized plan; scene was not saved.", issues)))
+            return
+
+        var node = node_by_path[node_path]
+        var node_type = node.get_class()
+        if not update_node_properties_safe_properties().has(property_name) or update_node_properties_dangerous_properties().has(property_name):
+            update_node_properties_add_issue(issues, "warning", "UNSUPPORTED_PLANNED_CHANGE", "Planned property is not in the safe allowlist and was skipped.", entry["updateIndex"] if entry.has("updateIndex") else -1, node_path, node_type, property_name)
+            continue
+
+        if not create_scene_blueprint_node_has_property(node, property_name):
+            scene_root.free()
+            update_node_properties_add_issue(issues, "error", "SET_PROPERTY_FAILED", "Property is no longer available on the target node.", entry["updateIndex"] if entry.has("updateIndex") else -1, node_path, node_type, property_name)
+            print(JSON.stringify(update_node_properties_write_error("SET_PROPERTY_FAILED", "Property is no longer available on the target node; scene was not saved.", issues)))
+            return
+
+        var converted = update_node_properties_convert_plan_value(entry)
+        if not converted["success"]:
+            scene_root.free()
+            update_node_properties_add_issue(issues, "error", "UNSUPPORTED_PLANNED_CHANGE", converted["message"], entry["updateIndex"] if entry.has("updateIndex") else -1, node_path, node_type, property_name)
+            print(JSON.stringify(update_node_properties_write_error("UNSUPPORTED_PLANNED_CHANGE", "A planned change could not be converted safely; scene was not saved.", issues)))
+            return
+
+        var old_value = null
+        var converted_old = update_node_properties_convert_current_value(node.get(property_name))
+        if converted_old["success"]:
+            old_value = converted_old["value"]
+        node.set(property_name, converted["value"])
+        applied_changes.append({
+            "nodePath": node_path,
+            "nodeType": node_type,
+            "property": property_name,
+            "oldValue": old_value,
+            "newValue": entry["proposedValue"],
+            "valueType": entry["valueType"]
+        })
+
+    if applied_changes.is_empty():
+        var no_apply_result = update_node_properties_noop_result(planned, issues)
+        scene_root.free()
+        print(JSON.stringify(no_apply_result))
+        return
+
+    var layout_after = null
+    if include_layout_after:
+        var layout_after_data = dry_align_build_layout(scene_root, planned["max_depth"])
+        layout_after = dry_align_compact_layout_before(layout_after_data["nodes"], layout_after_data["sceneBounds"], "visual")
+
+    var packed_scene = PackedScene.new()
+    var pack_result = packed_scene.pack(scene_root)
+    if pack_result != OK:
+        scene_root.free()
+        print(JSON.stringify(update_node_properties_write_error("PACK_SCENE_FAILED", "Failed to pack the modified scene; scene was not saved.", issues)))
+        return
+
+    var save_error = ResourceSaver.save(packed_scene, planned["scene_path"])
+    if save_error != OK:
+        scene_root.free()
+        print(JSON.stringify(update_node_properties_write_error("SAVE_SCENE_FAILED", "Failed to save the modified scene.", issues)))
+        return
+
+    var bytes_written = 0
+    var file = FileAccess.open(planned["scene_path"], FileAccess.READ)
+    if file != null:
+        bytes_written = file.get_length()
+        file.close()
+
+    var post_validation = update_node_properties_empty_post_validation()
+    if validate_after_write:
+        var post_result = update_node_properties_post_validate(planned["scene_path"], applied_changes)
+        post_validation = post_result["postValidation"]
+        if post_result.has("warnings"):
+            for warning in post_result["warnings"]:
+                update_node_properties_add_issue(issues, "warning", warning["code"], warning["message"])
+        if not post_result["success"]:
+            scene_root.free()
+            var post_error = update_node_properties_write_error("POST_VALIDATE_FAILED", post_result["message"], issues)
+            post_error["postValidation"] = post_validation
+            print(JSON.stringify(post_error))
+            return
+
     scene_root.free()
+
+    var counts = dry_align_issue_counts(issues)
+    var severity = dry_align_severity_from_counts(counts)
+    var layout_before = null
+    if planned["include_layout_before"]:
+        layout_before = dry_align_compact_layout_before(planned["layout_data"]["nodes"], planned["layout_data"]["sceneBounds"], "visual")
+
+    var result = {
+        "success": true,
+        "projectPath": planned["project_path"],
+        "scenePath": planned["scene_path"],
+        "applied": true,
+        "saved": true,
+        "valid": counts["errorCount"] == 0,
+        "severity": severity,
+        "summary": {
+            "updateCount": planned["update_count"],
+            "plannedChangeCount": plan.size(),
+            "appliedChangeCount": applied_changes.size(),
+            "errorCount": counts["errorCount"],
+            "warningCount": counts["warningCount"],
+            "infoCount": counts["infoCount"]
+        },
+        "issues": issues,
+        "plan": plan if planned["include_plan"] else [],
+        "appliedChanges": applied_changes,
+        "write": {
+            "saved": true,
+            "resourceSaverCode": save_error,
+            "bytesWritten": bytes_written
+        },
+        "postValidation": post_validation,
+        "layoutBefore": layout_before,
+        "layoutAfter": layout_after,
+        "limits": planned["limits"]
+    }
+    print(JSON.stringify(result))
 
 func is_nearly_zero(value):
     return abs(value) <= 0.0001
