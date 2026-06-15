@@ -145,6 +145,8 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "place_asset_in_scene",
         "dry_run_update_node_properties",
         "update_node_properties",
+        "create_scene_checkpoint",
+        "restore_scene_checkpoint",
         "validate_scene",
         "dry_run_scene_blueprint",
         "create_scene_from_blueprint",
@@ -1448,6 +1450,101 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Then call `update_node_properties` against an existing scene. Verify safe updates save, `read_scene_tree`/`get_scene_layout` reflect the changes, `validate_scene` still runs, dangerous fields such as `script` or `texture` abort before writing, no-op updates do not save, and no files other than the requested scene file are modified.
+
+### `create_scene_checkpoint`
+
+Creates a timestamped backup copy of one existing scene file inside the Godot project. This is a scene-file safety tool for writing operations such as `create_scene_from_blueprint`, `align_nodes`, `place_asset_in_scene`, and `update_node_properties`.
+
+Input example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "checkpointName": "before_alignment",
+  "includeMetadata": true,
+  "maxCheckpointsPerScene": 20
+}
+```
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "checkpointPath": "res://.godot_mcp/checkpoints/scenes__room_tscn/20260615T120000Z_before_alignment.tscn",
+  "metadataPath": "res://.godot_mcp/checkpoints/scenes__room_tscn/20260615T120000Z_before_alignment.json",
+  "created": true,
+  "pruned": [],
+  "summary": {
+    "sceneSizeBytes": 1234,
+    "checkpointSizeBytes": 1234,
+    "maxCheckpointsPerSceneApplied": 20,
+    "maxCheckpointsPerSceneClamped": false,
+    "maxCheckpointsPerSceneRequested": null
+  }
+}
+```
+
+**Storage path:** checkpoints are stored under `res://.godot_mcp/checkpoints/<scene-safe-id>/`. The repository `.gitignore` excludes `.godot_mcp/` by default; remove that ignore rule only if you intentionally want checkpoints committed.
+
+**Safety model:** the tool only copies an existing `.tscn` or `.scn` scene file into `.godot_mcp/checkpoints/`. It rejects paths outside the project, traversal paths, absolute scene paths, non-scene files, and symlinks. It does not execute scripts, parse scene contents, import/reimport assets, or modify the source scene.
+
+**Checkpoint naming:** `checkpointName` is sanitized into a short lowercase filename segment. If omitted or empty after sanitization, `checkpoint` is used. A UTC timestamp is included, and a numeric suffix is added if a file already exists for the same second.
+
+**Pruning:** `maxCheckpointsPerScene` defaults to `20`, rejects values below `1`, and clamps above `200`. After a checkpoint is created, older `.tscn`/`.scn` checkpoints and their matching `.json` metadata files are pruned only inside that scene's checkpoint directory.
+
+### `restore_scene_checkpoint`
+
+Restores a target scene file from a checkpoint created under `res://.godot_mcp/checkpoints/`.
+
+Input example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "checkpointPath": "res://.godot_mcp/checkpoints/scenes__room_tscn/20260615T120000Z_before_alignment.tscn",
+  "createPreRestoreCheckpoint": true,
+  "preRestoreCheckpointName": "before_restore",
+  "validateAfterRestore": true
+}
+```
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "checkpointPath": "res://.godot_mcp/checkpoints/scenes__room_tscn/20260615T120000Z_before_alignment.tscn",
+  "restored": true,
+  "preRestoreCheckpointPath": "res://.godot_mcp/checkpoints/scenes__room_tscn/20260615T121000Z_before_restore.tscn",
+  "postValidation": {
+    "loadable": true,
+    "instantiable": true
+  },
+  "summary": {
+    "restoredSizeBytes": 1234
+  }
+}
+```
+
+**Restore behavior:** `restore_scene_checkpoint` overwrites only the requested `scenePath` with the checkpoint scene file. `checkpointPath` must be under `res://.godot_mcp/checkpoints/`; checkpoints outside that directory are refused. If `createPreRestoreCheckpoint` is true, the current target scene is checkpointed before restore.
+
+**Post-restore validation:** when `validateAfterRestore` is true, the restored scene is loaded and instantiated through the existing `read_scene_tree` Godot operation. If loading or instantiation fails, the tool returns `POST_VALIDATE_FAILED`.
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Create a checkpoint for an existing scene, confirm the copied scene and metadata appear under `.godot_mcp/checkpoints/`, modify the scene with a writer tool, then call `restore_scene_checkpoint`. Verify the target scene content is restored, a pre-restore checkpoint is created when requested, unsafe paths are rejected, and checkpoints outside `.godot_mcp/checkpoints/` are refused.
 
 ### `validate_scene`
 

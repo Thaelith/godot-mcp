@@ -26,3 +26,6 @@ Thumbs.db
 
 # Coverage directory
 coverage/
+
+# Godot MCP project-local checkpoints
+.godot_mcp/
