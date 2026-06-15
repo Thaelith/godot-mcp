@@ -135,6 +135,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "get_godot_version",
         "list_projects",
         "get_project_info",
+        "inspect_project_capabilities",
         "scan_assets",
         "get_asset_info",
         "read_scene_tree",
@@ -254,6 +255,124 @@ The Godot MCP server uses a bundled GDScript approach for complex operations:
 2. **Bundled Operations Script**: Complex operations like creating scenes or adding nodes use a single, comprehensive GDScript file (`godot_operations.gd`) that handles all operations.
 
 The bundled script accepts operation type and parameters as JSON, allowing for flexible and dynamic operation execution without generating temporary files for each operation.
+
+## Project Capability Inspection
+
+### `inspect_project_capabilities`
+
+Inspects a Godot project read-only and returns a compact summary an AI assistant can use before choosing the next scene-editing workflow. It does not execute Godot, load scenes, create checkpoints, parse scripts, import/reimport assets, or modify files.
+
+Input example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "includeScenes": true,
+  "includeAssetSummary": true,
+  "includeCheckpointSummary": true,
+  "includeToolCapabilities": true,
+  "includeRecommendations": true,
+  "maxScenes": 50,
+  "maxAssetFolders": 20
+}
+```
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "project": {
+    "name": "My Game",
+    "configVersion": 5,
+    "mainScene": "res://scenes/Main.tscn",
+    "features": ["4.3", "Forward Plus"],
+    "applicationRunMainScene": "res://scenes/Main.tscn"
+  },
+  "scenes": {
+    "totalFound": 2,
+    "returned": 2,
+    "truncated": false,
+    "items": [
+      {
+        "scenePath": "res://scenes/Main.tscn",
+        "name": "Main",
+        "isMainScene": true,
+        "sizeBytes": 1234,
+        "modifiedTime": "2026-06-15T12:00:00.000Z"
+      }
+    ]
+  },
+  "assetSummary": {
+    "totalFilesScanned": 42,
+    "byType": {
+      "textures": 12,
+      "scenes": 2,
+      "models": 1,
+      "audio": 5,
+      "fonts": 1,
+      "resources": 3,
+      "scripts": 6,
+      "data": 2,
+      "other": 10
+    },
+    "likelyAssetFolders": [
+      {
+        "path": "res://assets",
+        "fileCount": 25,
+        "dominantTypes": ["textures", "audio"]
+      }
+    ],
+    "scanTruncated": false
+  },
+  "checkpointSummary": {
+    "checkpointRootExists": true,
+    "sceneGroups": 1,
+    "checkpointCount": 3,
+    "latestCheckpointPath": "res://.godot_mcp/checkpoints/scenes__main_tscn/20260615T120000Z_before_patch.tscn",
+    "latestCreatedAt": "2026-06-15T12:00:00Z"
+  },
+  "toolCapabilities": {
+    "readOnlyInspection": ["scan_assets", "get_asset_info", "read_scene_tree", "validate_scene", "get_scene_layout", "list_scene_checkpoints", "inspect_project_capabilities"],
+    "dryRunPlanning": ["dry_run_scene_blueprint", "dry_run_align_nodes", "dry_run_place_asset_in_scene", "dry_run_update_node_properties", "dry_run_scene_patch"],
+    "writers": ["create_scene_from_blueprint", "align_nodes", "place_asset_in_scene", "update_node_properties", "apply_scene_patch"],
+    "safety": ["create_scene_checkpoint", "restore_scene_checkpoint"],
+    "recommendedTransactionFlow": ["inspect_project_capabilities", "scan_assets", "get_asset_info", "read_scene_tree", "get_scene_layout", "dry_run_scene_patch", "apply_scene_patch", "validate_scene"]
+  },
+  "recommendations": [
+    "Start with read_scene_tree and get_scene_layout for the main scene (res://scenes/Main.tscn).",
+    "Create a scene checkpoint before applying writer tools."
+  ],
+  "limits": {
+    "maxScenesRequested": null,
+    "maxScenesApplied": 50,
+    "maxScenesClamped": false,
+    "maxAssetFoldersRequested": null,
+    "maxAssetFoldersApplied": 20,
+    "maxAssetFoldersClamped": false
+  }
+}
+```
+
+**Project metadata:** `project.godot` is read conservatively and only up to a small byte limit. The tool attempts to extract the project name, config version, main scene, application run main scene, and feature list. Missing or unfamiliar values are returned as `null` instead of failing the request.
+
+**Scene discovery:** when `includeScenes` is true, the tool finds `.tscn` and `.scn` files under the project while skipping `.git`, `.godot`, `.godot_mcp`, `node_modules`, build/cache folders, and symlinks. The main scene from `project.godot` is ranked first, followed by scenes under `res://scenes`, shorter paths, and alphabetical order. `maxScenes` defaults to `50`, rejects values below `1`, and clamps above `500`.
+
+**Asset summary:** when `includeAssetSummary` is true, the tool counts likely assets by broad type and reports top likely asset folders such as `res://assets`, `res://art`, `res://sprites`, `res://models`, `res://audio`, `res://fonts`, and `res://scenes`. It does not read binary contents or return every file. `maxAssetFolders` defaults to `20`, rejects values below `1`, and clamps above `100`.
+
+**Checkpoint summary:** when `includeCheckpointSummary` is true, the tool inspects `res://.godot_mcp/checkpoints/` read-only, counts checkpoint scene files and scene checkpoint groups, and reports the newest checkpoint path when available. Symlinked checkpoint directories or files are skipped.
+
+**Recommended workflow:** when recommendations are enabled, the response suggests project-specific next steps, such as reading the main scene tree/layout, scanning an asset folder before placement, listing checkpoints before restore, creating a checkpoint before writer tools, or using `dry_run_scene_patch` before `apply_scene_patch`.
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Call `inspect_project_capabilities` with a valid Godot project path. Confirm metadata is detected best-effort, scenes and asset summaries are returned without modifying files, checkpoint counts reflect `.godot_mcp/checkpoints/`, large limits clamp, invalid or symlink project paths are rejected, and existing writer/checkpoint tools still register.
 
 ## Asset Catalog
 
