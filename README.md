@@ -282,6 +282,8 @@ npm run smoke
 
 If Godot is not available, the suite still verifies the server starts, required tools are registered, and TypeScript-side safety errors are returned for invalid project and unsafe scene paths. It prints `Godot not found; skipped integration tests` in that mode. When Godot is found, it runs the full integration flow.
 
+GitHub Actions runs `npm run smoke` on Ubuntu with Node.js 20 without installing Godot, so CI covers the build and no-Godot MCP smoke checks. Run the full Godot integration smoke tests locally with Godot installed or `GODOT_PATH` set before changing writer, layout, checkpoint, or patch behavior.
+
 Current coverage includes:
 
 - tool registration for the expanded toolchain
