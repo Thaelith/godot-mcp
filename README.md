@@ -288,7 +288,7 @@ Current coverage includes:
 
 - tool registration for the expanded toolchain
 - `inspect_project_capabilities` and `inspect_scene_edit_context`
-- `scan_assets`, `get_asset_info`, `read_scene_tree`, `get_scene_layout`, `capture_scene_preview`, and `validate_scene`
+- `scan_assets`, `get_asset_info`, `read_scene_tree`, `get_scene_layout`, `capture_scene_preview`, `capture_asset_preview`, and `validate_scene`
 - `dry_run_place_asset_in_scene`, `dry_run_align_nodes`, `dry_run_update_node_properties`, and `dry_run_scene_patch`
 - `place_asset_in_scene`, `align_nodes`, `update_node_properties`, and `apply_scene_patch`
 - `create_scene_checkpoint`, `list_scene_checkpoints`, and `restore_scene_checkpoint`
@@ -643,6 +643,74 @@ The MCP response always includes the JSON text response first. When `includeImag
 **Rendering limitations:** the tool uses Godot with an offscreen `SubViewport`. It requires a working rendering backend; on Linux CI the optional Godot Integration workflow runs it through `xvfb-run`. Scenes with an active `Camera2D` or `Camera3D` generally preview more predictably. If no camera is found, the tool still attempts a simple viewport capture and returns `NO_CAMERA_FOUND` / `PREVIEW_MAY_BE_EMPTY` warnings. Some shader, viewport, editor-only, or environment-dependent rendering may differ from the editor.
 
 **Workflow fit:** use `inspect_scene_edit_context` and `get_scene_layout` to understand a scene, use `dry_run_scene_patch` before edits, apply changes with `apply_scene_patch`, then call `capture_scene_preview` and `validate_scene` to inspect the visual result.
+
+### `capture_asset_preview`
+
+Renders a read-only preview PNG for an existing asset and optionally appends MCP image content. The tool may write a preview PNG and optional metadata JSON under `res://.godot_mcp/previews/assets`, but it does not modify the asset, save scenes, create checkpoints, restore checkpoints, attach scripts, or call writer tools.
+
+Input example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "assetPath": "res://assets/props/chair.png",
+  "outputDir": "res://.godot_mcp/previews/assets",
+  "fileName": "chair_preview",
+  "width": 512,
+  "height": 512,
+  "transparent": true,
+  "includeMetadata": true,
+  "includeImageContent": true,
+  "maxImageBytes": 1500000,
+  "overwrite": false,
+  "maxWaitFrames": 3,
+  "sampleText": "AaBbCc 123"
+}
+```
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "assetPath": "res://assets/props/chair.png",
+  "assetType": "texture",
+  "previewPath": "res://.godot_mcp/previews/assets/chair_preview.png",
+  "metadataPath": "res://.godot_mcp/previews/assets/chair_preview.json",
+  "created": true,
+  "width": 512,
+  "height": 512,
+  "transparent": true,
+  "imageContent": {
+    "included": true,
+    "mimeType": "image/png",
+    "sizeBytes": 12345
+  },
+  "warnings": [],
+  "summary": {
+    "assetSizeBytes": 2345,
+    "outputSizeBytes": 12345,
+    "metadataWritten": true,
+    "maxWaitFramesApplied": 3,
+    "maxWaitFramesClamped": false,
+    "maxImageBytesApplied": 1500000,
+    "maxImageBytesClamped": false
+  }
+}
+```
+
+The MCP response always returns JSON text first. When `includeImageContent` is true and the preview PNG fits within `maxImageBytes`, a second MCP image content item is appended with `mimeType: "image/png"`. If the image is too large or cannot be read safely, capture still succeeds and the JSON includes `IMAGE_CONTENT_TOO_LARGE` or `IMAGE_CONTENT_READ_FAILED`.
+
+**Supported asset previews:** texture assets (`.png`, `.jpg`, `.jpeg`, `.webp`, `.svg`, `.tga`, `.bmp`), scene assets (`.tscn`, `.scn`), model assets (`.glb`, `.gltf`, `.obj`, `.fbx`) when Godot can load them as a `PackedScene` or `Mesh`, and font assets (`.ttf`, `.otf`) using `sampleText`.
+
+**Unsupported asset previews:** audio (`.wav`, `.ogg`, `.mp3`), scripts (`.gd`), data files (`.json`, `.cfg`), and generic resources (`.tres`, `.res`) are rejected with `UNSUPPORTED_ASSET_PREVIEW_TYPE` in this first version.
+
+**Safety model:** `assetPath` and `outputDir` must stay inside the project. Symlink project, asset, and output paths are rejected. The tool writes only the preview PNG and optional metadata JSON under the validated output directory. Optional image content is read only from the exact generated preview PNG after checking it is a regular `.png` file inside the project and output directory and within `maxImageBytes`.
+
+**Rendering and import limitations:** asset previews use Godot with an offscreen `SubViewport`, so they require a working rendering backend. Model previews use an approximate default camera/light. Scene previews depend on the asset's own setup or default viewport transform. Fresh texture files may not be importable by `ResourceLoader`; for safe local PNGs under the size cap, the TypeScript side can fall back to copying the original PNG into the preview directory and returns `TEXTURE_IMPORT_UNAVAILABLE`.
+
+**Workflow fit:** use `scan_assets` to find candidates, `get_asset_info` for dimensions/type/dependencies, `capture_asset_preview` to inspect the visual asset, then `dry_run_place_asset_in_scene` or `dry_run_scene_patch` before applying placement.
 
 ## Asset Catalog
 

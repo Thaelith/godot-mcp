@@ -28,6 +28,7 @@ const expectedTools = [
   'read_scene_tree',
   'get_scene_layout',
   'capture_scene_preview',
+  'capture_asset_preview',
   'validate_scene',
   'dry_run_place_asset_in_scene',
   'place_asset_in_scene',
@@ -433,6 +434,22 @@ async function runAlwaysSmoke({ godotPathForServer }) {
       'INVALID_MAX_IMAGE_BYTES'
     );
     logPass('capture_scene_preview invalid maxImageBytes');
+
+    await expectStructuredError(
+      client,
+      'capture_asset_preview',
+      { projectPath: process.cwd(), assetPath: '../outside.png' },
+      'UNSAFE_ASSET_PATH'
+    );
+    logPass('capture_asset_preview unsafe assetPath');
+
+    await expectStructuredError(
+      client,
+      'capture_asset_preview',
+      { projectPath: process.cwd(), assetPath: 'assets/prefabs/Table.tscn', includeImageContent: true, maxImageBytes: 0 },
+      'INVALID_MAX_IMAGE_BYTES'
+    );
+    logPass('capture_asset_preview invalid maxImageBytes');
   } finally {
     await client.close();
   }
@@ -541,6 +558,32 @@ async function runIntegrationSmoke({ godotPath }) {
     assert.equal(sha256File(scenePath), originalSceneHash, 'capture_scene_preview should not modify the scene file');
     assertOnlyAllowedDiff(diffSnapshots(previewBefore, snapshotProjectFiles(projectRoot)), ['.godot_mcp/previews'], 'capture_scene_preview');
     logPass('capture_scene_preview');
+
+    const assetPreviewBefore = snapshotProjectFiles(projectRoot);
+    const assetPreview = await client.callTool('capture_asset_preview', {
+      projectPath: projectRoot,
+      assetPath: 'assets/prefabs/Table.tscn',
+      fileName: 'table_asset_smoke_preview',
+      width: 320,
+      height: 180,
+      includeMetadata: true,
+      includeImageContent: true,
+      maxWaitFrames: 2,
+    });
+    assert.equal(assetPreview.parsed?.success, true, JSON.stringify(assetPreview.parsed, null, 2));
+    assert.equal(assetPreview.parsed?.assetType, 'scene');
+    assert.ok(assetPreview.parsed?.previewPath);
+    assert.ok(existsSync(godotResourceToFilePath(projectRoot, assetPreview.parsed.previewPath)), 'asset preview PNG should exist');
+    assert.ok(assetPreview.parsed?.metadataPath);
+    assert.ok(existsSync(godotResourceToFilePath(projectRoot, assetPreview.parsed.metadataPath)), 'asset preview metadata JSON should exist');
+    assert.equal(assetPreview.parsed?.imageContent?.included, true, JSON.stringify(assetPreview.parsed?.imageContent, null, 2));
+    assert.equal(assetPreview.parsed?.imageContent?.mimeType, 'image/png');
+    const assetPreviewImageContent = assetPreview.raw?.content?.find((item) => item.type === 'image');
+    assert.equal(assetPreviewImageContent?.mimeType, 'image/png');
+    assert.ok(assetPreviewImageContent?.data?.length > 0, 'embedded asset preview image data should be non-empty');
+    assert.equal(sha256File(sceneAssetPath), originalSceneAssetHash, 'capture_asset_preview should not modify the asset file');
+    assertOnlyAllowedDiff(diffSnapshots(assetPreviewBefore, snapshotProjectFiles(projectRoot)), ['.godot_mcp/previews'], 'capture_asset_preview');
+    logPass('capture_asset_preview');
 
     const beforeCheckpointSnapshot = snapshotProjectFiles(projectRoot);
     const checkpoint = await client.callTool('create_scene_checkpoint', {

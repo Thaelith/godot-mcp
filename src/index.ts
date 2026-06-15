@@ -162,6 +162,7 @@ class GodotServer {
     'output_path': 'outputPath',
     'output_dir': 'outputDir',
     'file_name': 'fileName',
+    'sample_text': 'sampleText',
     'mesh_item_names': 'meshItemNames',
     'new_path': 'newPath',
     'file_path': 'filePath',
@@ -709,6 +710,31 @@ class GodotServer {
   }
 
   /**
+   * Create a capture_asset_preview-specific JSON error response while preserving MCP text content style.
+   */
+  private captureAssetPreviewErrorResponse(error: string, message: string): any {
+    console.error(`[SERVER] capture_asset_preview error response: ${error}: ${message}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error,
+              message,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  /**
    * Create a dry_run_scene_patch-specific JSON error response while preserving MCP text content style.
    */
   private createDryRunScenePatchErrorResponse(error: string, message: string): any {
@@ -1085,13 +1111,16 @@ class GodotServer {
    * Convert a preview output directory such as res://.godot_mcp/previews
    * into a safe project-relative directory.
    */
-  private normalizePreviewOutputDir(outputDir: unknown): { relativePath: string; resourcePath: string; error?: string } {
+  private normalizePreviewOutputDir(
+    outputDir: unknown,
+    defaultOutputDir = 'res://.godot_mcp/previews'
+  ): { relativePath: string; resourcePath: string; error?: string } {
     if (outputDir !== undefined && outputDir !== null && typeof outputDir !== 'string') {
       return { relativePath: '', resourcePath: '', error: 'outputDir must be a string when provided.' };
     }
 
     const rawOutputDir = outputDir === undefined || outputDir === null
-      ? 'res://.godot_mcp/previews'
+      ? defaultOutputDir
       : outputDir.trim();
 
     if (!rawOutputDir) {
@@ -1157,6 +1186,118 @@ class GodotServer {
     }
 
     return {};
+  }
+
+  private previewAssetType(relativeAssetPath: string): 'texture' | 'scene' | 'model' | 'font' | 'unsupported' {
+    const extension = extname(relativeAssetPath).toLowerCase();
+    if (['.png', '.jpg', '.jpeg', '.webp', '.svg', '.tga', '.bmp'].includes(extension)) {
+      return 'texture';
+    }
+    if (['.tscn', '.scn'].includes(extension)) {
+      return 'scene';
+    }
+    if (['.glb', '.gltf', '.obj', '.fbx'].includes(extension)) {
+      return 'model';
+    }
+    if (['.ttf', '.otf'].includes(extension)) {
+      return 'font';
+    }
+    return 'unsupported';
+  }
+
+  private appendPreviewImageContent(
+    parsedResult: any,
+    content: any[],
+    projectRoot: string,
+    realOutputDirPath: string,
+    maxImageBytesApplied: number
+  ): void {
+    parsedResult.imageContent = {
+      included: false,
+      reason: null,
+      sizeBytes: null,
+      maxImageBytesApplied,
+    };
+
+    const addImageWarning = (code: string, message: string) => {
+      if (!Array.isArray(parsedResult.warnings)) {
+        parsedResult.warnings = [];
+      }
+      parsedResult.warnings.push({
+        severity: 'warning',
+        code,
+        message,
+      });
+      parsedResult.imageContent = {
+        included: false,
+        reason: code,
+        sizeBytes: parsedResult.imageContent?.sizeBytes ?? null,
+        maxImageBytesApplied,
+      };
+    };
+
+    try {
+      if (typeof parsedResult.previewPath !== 'string' || !parsedResult.previewPath.startsWith('res://')) {
+        addImageWarning('IMAGE_CONTENT_UNSAFE_PATH', 'Preview was captured but not embedded because the returned preview path was unsafe.');
+        return;
+      }
+
+      if (extname(parsedResult.previewPath).toLowerCase() !== '.png') {
+        addImageWarning('IMAGE_CONTENT_NOT_PNG', 'Preview was captured but not embedded because the returned preview path was not a PNG.');
+        return;
+      }
+
+      const previewRelativeFromResult = parsedResult.previewPath.slice('res://'.length).replace(/\\/g, '/');
+      const previewPathFromResult = resolve(projectRoot, previewRelativeFromResult);
+      if (
+        !this.isPathInside(projectRoot, previewPathFromResult) ||
+        !this.isPathInside(realOutputDirPath, previewPathFromResult)
+      ) {
+        addImageWarning('IMAGE_CONTENT_UNSAFE_PATH', 'Preview was captured but not embedded because the PNG path was outside the allowed output directory.');
+        return;
+      }
+
+      if (!existsSync(previewPathFromResult)) {
+        addImageWarning('IMAGE_CONTENT_READ_FAILED', 'Preview was captured but not embedded because the PNG file could not be found.');
+        return;
+      }
+
+      const previewImageStats = lstatSync(previewPathFromResult);
+      if (previewImageStats.isSymbolicLink()) {
+        addImageWarning('IMAGE_CONTENT_UNSAFE_PATH', 'Preview was captured but not embedded because the PNG file was a symbolic link.');
+        return;
+      }
+
+      if (!previewImageStats.isFile()) {
+        addImageWarning('IMAGE_CONTENT_READ_FAILED', 'Preview was captured but not embedded because the PNG path was not a regular file.');
+        return;
+      }
+
+      if (previewImageStats.size > maxImageBytesApplied) {
+        parsedResult.imageContent = {
+          included: false,
+          reason: 'IMAGE_CONTENT_TOO_LARGE',
+          sizeBytes: previewImageStats.size,
+          maxImageBytesApplied,
+        };
+        addImageWarning('IMAGE_CONTENT_TOO_LARGE', 'Preview was captured but not embedded because it exceeds maxImageBytes.');
+        return;
+      }
+
+      const imageBuffer = readFileSync(previewPathFromResult);
+      parsedResult.imageContent = {
+        included: true,
+        mimeType: 'image/png',
+        sizeBytes: imageBuffer.length,
+      };
+      content.push({
+        type: 'image',
+        data: imageBuffer.toString('base64'),
+        mimeType: 'image/png',
+      });
+    } catch {
+      addImageWarning('IMAGE_CONTENT_READ_FAILED', 'Preview was captured but not embedded because the PNG file could not be read.');
+    }
   }
 
   private createCheckpointPaths(
@@ -2289,6 +2430,8 @@ class GodotServer {
         'read_scene_tree',
         'validate_scene',
         'get_scene_layout',
+        'capture_scene_preview',
+        'capture_asset_preview',
         'list_scene_checkpoints',
         'inspect_project_capabilities',
       ],
@@ -2314,8 +2457,10 @@ class GodotServer {
         'inspect_project_capabilities',
         'scan_assets',
         'get_asset_info',
+        'capture_asset_preview',
         'read_scene_tree',
         'get_scene_layout',
+        'capture_scene_preview',
         'dry_run_scene_patch',
         'apply_scene_patch',
         'validate_scene',
@@ -2868,8 +3013,10 @@ class GodotServer {
       safeEditFlow: [
         'inspect_scene_edit_context',
         'get_asset_info',
+        'capture_asset_preview',
         'dry_run_scene_patch',
         'apply_scene_patch',
+        'capture_scene_preview',
         'validate_scene',
       ],
       rollbackFlow: [
@@ -3164,7 +3311,7 @@ class GodotServer {
       // Build argument array for execFile to prevent command injection
       // Using execFile with argument arrays avoids shell interpretation entirely
       const args = [
-        ...(operation === 'capture_scene_preview' ? ['--rendering-driver', 'opengl3'] : ['--headless']),
+        ...(['capture_scene_preview', 'capture_asset_preview'].includes(operation) ? ['--rendering-driver', 'opengl3'] : ['--headless']),
         '--path',
         projectPath,  // Safe: passed as argument, not interpolated into shell command
         '--script',
@@ -3569,6 +3716,68 @@ class GodotServer {
               },
             },
             required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'capture_asset_preview',
+          description: 'Render a read-only preview PNG for a Godot asset and optionally return MCP image content',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Absolute path to the Godot project directory',
+              },
+              assetPath: {
+                type: 'string',
+                description: 'Existing Godot asset path such as res://assets/props/chair.png or assets/props/chair.png',
+              },
+              outputDir: {
+                type: 'string',
+                description: 'Project-relative output folder for asset previews (default: res://.godot_mcp/previews/assets)',
+              },
+              fileName: {
+                type: 'string',
+                description: 'Optional preview filename; sanitized and saved as .png',
+              },
+              width: {
+                type: 'number',
+                description: 'Preview width in pixels (default: 512, min: 64, max: 4096)',
+              },
+              height: {
+                type: 'number',
+                description: 'Preview height in pixels (default: 512, min: 64, max: 4096)',
+              },
+              transparent: {
+                type: 'boolean',
+                description: 'Whether to request a transparent viewport background (default: true)',
+              },
+              includeMetadata: {
+                type: 'boolean',
+                description: 'Whether to write adjacent JSON metadata (default: true)',
+              },
+              includeImageContent: {
+                type: 'boolean',
+                description: 'Whether to append the generated PNG as MCP image content (default: false)',
+              },
+              maxImageBytes: {
+                type: 'number',
+                description: 'Maximum PNG bytes to embed when includeImageContent is true (default: 1500000, max: 5000000)',
+              },
+              overwrite: {
+                type: 'boolean',
+                description: 'Whether to overwrite an existing preview with the same sanitized name (default: false)',
+              },
+              maxWaitFrames: {
+                type: 'number',
+                description: 'Frames to wait before capture (default: 3, min: 1, max: 60)',
+              },
+              sampleText: {
+                type: 'string',
+                description: 'Sample text for font previews (default: AaBbCc 123, max length: 120)',
+              },
+            },
+            required: ['projectPath', 'assetPath'],
           },
         },
         {
@@ -4653,6 +4862,8 @@ class GodotServer {
           return await this.handleInspectSceneEditContext(request.params.arguments);
         case 'capture_scene_preview':
           return await this.handleCaptureScenePreview(request.params.arguments);
+        case 'capture_asset_preview':
+          return await this.handleCaptureAssetPreview(request.params.arguments);
         case 'scan_assets':
           return await this.handleScanAssets(request.params.arguments);
         case 'get_asset_info':
@@ -6184,77 +6395,7 @@ class GodotServer {
 
       const content: any[] = [];
       if (parsedResult.success === true && includeImageContent) {
-        parsedResult.imageContent = {
-          included: false,
-          reason: null,
-          sizeBytes: null,
-          maxImageBytesApplied,
-        };
-
-        const addImageWarning = (code: string, message: string) => {
-          if (!Array.isArray(parsedResult.warnings)) {
-            parsedResult.warnings = [];
-          }
-          parsedResult.warnings.push({
-            severity: 'warning',
-            code,
-            message,
-          });
-          parsedResult.imageContent = {
-            included: false,
-            reason: code,
-            sizeBytes: parsedResult.imageContent?.sizeBytes ?? null,
-            maxImageBytesApplied,
-          };
-        };
-
-        try {
-          if (typeof parsedResult.previewPath !== 'string' || !parsedResult.previewPath.startsWith('res://')) {
-            addImageWarning('IMAGE_CONTENT_UNSAFE_PATH', 'Preview was captured but not embedded because the returned preview path was unsafe.');
-          } else if (extname(parsedResult.previewPath).toLowerCase() !== '.png') {
-            addImageWarning('IMAGE_CONTENT_NOT_PNG', 'Preview was captured but not embedded because the returned preview path was not a PNG.');
-          } else {
-            const previewRelativeFromResult = parsedResult.previewPath.slice('res://'.length).replace(/\\/g, '/');
-            const previewPathFromResult = resolve(projectRoot, previewRelativeFromResult);
-            if (
-              !this.isPathInside(projectRoot, previewPathFromResult) ||
-              !this.isPathInside(realOutputDirPath, previewPathFromResult)
-            ) {
-              addImageWarning('IMAGE_CONTENT_UNSAFE_PATH', 'Preview was captured but not embedded because the PNG path was outside the allowed output directory.');
-            } else if (!existsSync(previewPathFromResult)) {
-              addImageWarning('IMAGE_CONTENT_READ_FAILED', 'Preview was captured but not embedded because the PNG file could not be found.');
-            } else {
-              const previewImageStats = lstatSync(previewPathFromResult);
-              if (previewImageStats.isSymbolicLink()) {
-                addImageWarning('IMAGE_CONTENT_UNSAFE_PATH', 'Preview was captured but not embedded because the PNG file was a symbolic link.');
-              } else if (!previewImageStats.isFile()) {
-                addImageWarning('IMAGE_CONTENT_READ_FAILED', 'Preview was captured but not embedded because the PNG path was not a regular file.');
-              } else if (previewImageStats.size > maxImageBytesApplied) {
-                parsedResult.imageContent = {
-                  included: false,
-                  reason: 'IMAGE_CONTENT_TOO_LARGE',
-                  sizeBytes: previewImageStats.size,
-                  maxImageBytesApplied,
-                };
-                addImageWarning('IMAGE_CONTENT_TOO_LARGE', 'Preview was captured but not embedded because it exceeds maxImageBytes.');
-              } else {
-                const imageBuffer = readFileSync(previewPathFromResult);
-                parsedResult.imageContent = {
-                  included: true,
-                  mimeType: 'image/png',
-                  sizeBytes: imageBuffer.length,
-                };
-                content.push({
-                  type: 'image',
-                  data: imageBuffer.toString('base64'),
-                  mimeType: 'image/png',
-                });
-              }
-            }
-          }
-        } catch {
-          addImageWarning('IMAGE_CONTENT_READ_FAILED', 'Preview was captured but not embedded because the PNG file could not be read.');
-        }
+        this.appendPreviewImageContent(parsedResult, content, projectRoot, realOutputDirPath, maxImageBytesApplied);
       }
 
       content.unshift({
@@ -6270,6 +6411,456 @@ class GodotServer {
       return this.captureScenePreviewErrorResponse(
         'CAPTURE_SCENE_PREVIEW_FAILED',
         `Failed to capture scene preview: ${error?.message || 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * Handle the capture_asset_preview tool
+   */
+  private async handleCaptureAssetPreview(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || typeof args.projectPath !== 'string') {
+      return this.captureAssetPreviewErrorResponse(
+        'MISSING_PROJECT_PATH',
+        'projectPath is required and must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    if (!args.assetPath || typeof args.assetPath !== 'string') {
+      return this.captureAssetPreviewErrorResponse(
+        'MISSING_ASSET_PATH',
+        'assetPath is required and must be a Godot asset path such as res://assets/props/chair.png or assets/props/chair.png.'
+      );
+    }
+
+    if (args.projectPath.includes('\0')) {
+      return this.captureAssetPreviewErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must not contain null bytes.'
+      );
+    }
+
+    if (!isAbsolute(args.projectPath)) {
+      return this.captureAssetPreviewErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    const assetPathResult = this.normalizeAssetPath(args.assetPath);
+    if (assetPathResult.error) {
+      return this.captureAssetPreviewErrorResponse(
+        'UNSAFE_ASSET_PATH',
+        assetPathResult.error
+      );
+    }
+
+    const assetType = this.previewAssetType(assetPathResult.relativePath);
+    if (assetType === 'unsupported') {
+      return this.captureAssetPreviewErrorResponse(
+        'UNSUPPORTED_ASSET_PREVIEW_TYPE',
+        'This asset type is not supported for visual preview in this version.'
+      );
+    }
+
+    const outputDirResult = this.normalizePreviewOutputDir(args.outputDir, 'res://.godot_mcp/previews/assets');
+    if (outputDirResult.error) {
+      return this.captureAssetPreviewErrorResponse(
+        'UNSAFE_OUTPUT_DIR',
+        outputDirResult.error
+      );
+    }
+
+    const fileNameResult = this.sanitizePreviewFileName(args.fileName, assetPathResult.relativePath);
+    if (fileNameResult.error) {
+      return this.captureAssetPreviewErrorResponse(
+        'INVALID_FILE_NAME',
+        fileNameResult.error
+      );
+    }
+
+    const booleanOptions = ['transparent', 'includeMetadata', 'includeImageContent', 'overwrite'];
+    for (const option of booleanOptions) {
+      if (args[option] !== undefined && typeof args[option] !== 'boolean') {
+        return this.captureAssetPreviewErrorResponse(
+          'CAPTURE_ASSET_PREVIEW_FAILED',
+          `${option} must be a boolean.`
+        );
+      }
+    }
+
+    const widthRequested = args.width !== undefined ? args.width : null;
+    let widthApplied = 512;
+    let widthClamped = false;
+    if (args.width !== undefined) {
+      if (typeof args.width !== 'number' || !Number.isFinite(args.width) || args.width < 64) {
+        return this.captureAssetPreviewErrorResponse(
+          'INVALID_PREVIEW_SIZE',
+          'width must be a number between 64 and 4096.'
+        );
+      }
+
+      if (args.width > 4096) {
+        widthApplied = 4096;
+        widthClamped = true;
+      } else {
+        widthApplied = Math.floor(args.width);
+      }
+    }
+
+    const heightRequested = args.height !== undefined ? args.height : null;
+    let heightApplied = 512;
+    let heightClamped = false;
+    if (args.height !== undefined) {
+      if (typeof args.height !== 'number' || !Number.isFinite(args.height) || args.height < 64) {
+        return this.captureAssetPreviewErrorResponse(
+          'INVALID_PREVIEW_SIZE',
+          'height must be a number between 64 and 4096.'
+        );
+      }
+
+      if (args.height > 4096) {
+        heightApplied = 4096;
+        heightClamped = true;
+      } else {
+        heightApplied = Math.floor(args.height);
+      }
+    }
+
+    const maxWaitFramesRequested = args.maxWaitFrames !== undefined ? args.maxWaitFrames : null;
+    let maxWaitFramesApplied = 3;
+    let maxWaitFramesClamped = false;
+    if (args.maxWaitFrames !== undefined) {
+      if (typeof args.maxWaitFrames !== 'number' || !Number.isFinite(args.maxWaitFrames) || args.maxWaitFrames < 1) {
+        return this.captureAssetPreviewErrorResponse(
+          'INVALID_MAX_WAIT_FRAMES',
+          'maxWaitFrames must be a number between 1 and 60.'
+        );
+      }
+
+      if (args.maxWaitFrames > 60) {
+        maxWaitFramesApplied = 60;
+        maxWaitFramesClamped = true;
+      } else {
+        maxWaitFramesApplied = Math.floor(args.maxWaitFrames);
+      }
+    }
+
+    const maxImageBytesRequested = args.maxImageBytes !== undefined ? args.maxImageBytes : null;
+    let maxImageBytesApplied = 1500000;
+    let maxImageBytesClamped = false;
+    if (args.maxImageBytes !== undefined) {
+      if (typeof args.maxImageBytes !== 'number' || !Number.isFinite(args.maxImageBytes) || args.maxImageBytes < 1024) {
+        return this.captureAssetPreviewErrorResponse(
+          'INVALID_MAX_IMAGE_BYTES',
+          'maxImageBytes must be a number between 1024 and 5000000.'
+        );
+      }
+
+      if (args.maxImageBytes > 5000000) {
+        maxImageBytesApplied = 5000000;
+        maxImageBytesClamped = true;
+      } else {
+        maxImageBytesApplied = Math.floor(args.maxImageBytes);
+      }
+    }
+
+    let sampleText = 'AaBbCc 123';
+    if (args.sampleText !== undefined) {
+      if (typeof args.sampleText !== 'string') {
+        return this.captureAssetPreviewErrorResponse(
+          'CAPTURE_ASSET_PREVIEW_FAILED',
+          'sampleText must be a string when provided.'
+        );
+      }
+      sampleText = args.sampleText.replace(/\0/g, '').slice(0, 120) || 'AaBbCc 123';
+    }
+
+    const transparent = args.transparent !== undefined ? args.transparent : true;
+    const includeMetadata = args.includeMetadata !== undefined ? args.includeMetadata : true;
+    const includeImageContent = args.includeImageContent !== undefined ? args.includeImageContent : false;
+    const overwrite = args.overwrite !== undefined ? args.overwrite : false;
+
+    try {
+      const normalizedProjectPath = resolve(args.projectPath);
+      if (!existsSync(normalizedProjectPath)) {
+        return this.captureAssetPreviewErrorResponse(
+          'PROJECT_PATH_NOT_FOUND',
+          `Project path does not exist: ${args.projectPath}`
+        );
+      }
+
+      const projectStats = lstatSync(normalizedProjectPath);
+      if (projectStats.isSymbolicLink()) {
+        return this.captureAssetPreviewErrorResponse(
+          'PROJECT_PATH_IS_SYMLINK',
+          'projectPath must not be a symbolic link.'
+        );
+      }
+
+      if (!projectStats.isDirectory()) {
+        return this.captureAssetPreviewErrorResponse(
+          'PROJECT_PATH_NOT_DIRECTORY',
+          `Project path is not a directory: ${args.projectPath}`
+        );
+      }
+
+      const projectRoot = realpathSync(normalizedProjectPath);
+      const projectFile = join(projectRoot, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.captureAssetPreviewErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          `Not a valid Godot project: ${args.projectPath}. The directory must contain a project.godot file.`
+        );
+      }
+
+      const projectFileStats = lstatSync(projectFile);
+      if (projectFileStats.isSymbolicLink() || !projectFileStats.isFile()) {
+        return this.captureAssetPreviewErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          'project.godot must be a regular file and must not be a symbolic link.'
+        );
+      }
+
+      const assetFilePath = resolve(projectRoot, assetPathResult.relativePath);
+      if (!this.isPathInside(projectRoot, assetFilePath)) {
+        return this.captureAssetPreviewErrorResponse(
+          'UNSAFE_ASSET_PATH',
+          'assetPath must stay inside the Godot project directory.'
+        );
+      }
+
+      if (!existsSync(assetFilePath)) {
+        return this.captureAssetPreviewErrorResponse(
+          'ASSET_PATH_NOT_FOUND',
+          `Asset file does not exist: ${assetPathResult.resourcePath}`
+        );
+      }
+
+      const assetFileStats = lstatSync(assetFilePath);
+      if (assetFileStats.isSymbolicLink()) {
+        return this.captureAssetPreviewErrorResponse(
+          'UNSAFE_ASSET_PATH',
+          'assetPath must not be a symbolic link.'
+        );
+      }
+
+      if (!assetFileStats.isFile()) {
+        return this.captureAssetPreviewErrorResponse(
+          'ASSET_PATH_NOT_FILE',
+          `Asset path is not a file: ${assetPathResult.resourcePath}`
+        );
+      }
+
+      const realAssetFilePath = realpathSync(assetFilePath);
+      if (!this.isPathInside(projectRoot, realAssetFilePath)) {
+        return this.captureAssetPreviewErrorResponse(
+          'UNSAFE_ASSET_PATH',
+          'assetPath must stay inside the Godot project directory.'
+        );
+      }
+
+      const outputDirPath = resolve(projectRoot, outputDirResult.relativePath);
+      if (!this.isPathInside(projectRoot, outputDirPath)) {
+        return this.captureAssetPreviewErrorResponse(
+          'UNSAFE_OUTPUT_DIR',
+          'outputDir must stay inside the Godot project directory.'
+        );
+      }
+
+      const ancestorValidation = this.validatePreviewOutputAncestors(projectRoot, outputDirResult.relativePath);
+      if (ancestorValidation.error) {
+        return this.captureAssetPreviewErrorResponse(
+          ancestorValidation.error,
+          ancestorValidation.message || 'outputDir is not safe.'
+        );
+      }
+
+      mkdirSync(outputDirPath, { recursive: true });
+
+      const outputDirStats = lstatSync(outputDirPath);
+      if (outputDirStats.isSymbolicLink()) {
+        return this.captureAssetPreviewErrorResponse(
+          'OUTPUT_DIR_IS_SYMLINK',
+          'outputDir must not be a symbolic link.'
+        );
+      }
+
+      if (!outputDirStats.isDirectory()) {
+        return this.captureAssetPreviewErrorResponse(
+          'UNSAFE_OUTPUT_DIR',
+          'outputDir must be a directory.'
+        );
+      }
+
+      const realOutputDirPath = realpathSync(outputDirPath);
+      if (!this.isPathInside(projectRoot, realOutputDirPath)) {
+        return this.captureAssetPreviewErrorResponse(
+          'UNSAFE_OUTPUT_DIR',
+          'Resolved outputDir must stay inside the Godot project directory.'
+        );
+      }
+
+      let previewBaseName = fileNameResult.baseName;
+      let previewRelativePath = `${outputDirResult.relativePath}/${previewBaseName}.png`;
+      let previewFilePath = resolve(projectRoot, previewRelativePath);
+      let metadataRelativePath = `${outputDirResult.relativePath}/${previewBaseName}.json`;
+      let metadataFilePath = resolve(projectRoot, metadataRelativePath);
+
+      if (!overwrite) {
+        let counter = 1;
+        while (existsSync(previewFilePath) || existsSync(metadataFilePath)) {
+          previewBaseName = `${fileNameResult.baseName}_${String(counter).padStart(2, '0')}`;
+          previewRelativePath = `${outputDirResult.relativePath}/${previewBaseName}.png`;
+          previewFilePath = resolve(projectRoot, previewRelativePath);
+          metadataRelativePath = `${outputDirResult.relativePath}/${previewBaseName}.json`;
+          metadataFilePath = resolve(projectRoot, metadataRelativePath);
+          counter += 1;
+        }
+      }
+
+      for (const candidatePath of [previewFilePath, metadataFilePath]) {
+        if (!this.isPathInside(projectRoot, candidatePath) || !this.isPathInside(realOutputDirPath, candidatePath)) {
+          return this.captureAssetPreviewErrorResponse(
+            'UNSAFE_OUTPUT_DIR',
+            'Generated preview paths must stay inside outputDir.'
+          );
+        }
+
+        if (existsSync(candidatePath) && lstatSync(candidatePath).isSymbolicLink()) {
+          return this.captureAssetPreviewErrorResponse(
+            'OUTPUT_DIR_IS_SYMLINK',
+            'Preview output files must not be symbolic links.'
+          );
+        }
+      }
+
+      const previewResourcePath = `res://${previewRelativePath.replace(/\\/g, '/')}`;
+      const metadataResourcePath = includeMetadata ? `res://${metadataRelativePath.replace(/\\/g, '/')}` : null;
+      const params = {
+        projectPath: projectRoot.replace(/\\/g, '/'),
+        assetPath: assetPathResult.resourcePath,
+        assetType,
+        previewPath: previewResourcePath,
+        metadataPath: metadataResourcePath,
+        width: widthApplied,
+        height: heightApplied,
+        widthRequested,
+        heightRequested,
+        widthClamped,
+        heightClamped,
+        transparent,
+        includeMetadata,
+        overwrite,
+        maxWaitFrames: maxWaitFramesApplied,
+        maxWaitFramesRequested,
+        maxWaitFramesClamped,
+        sampleText,
+        assetSizeBytes: assetFileStats.size,
+      };
+
+      const { stdout, stderr } = await this.executeOperation('capture_asset_preview', params, projectRoot);
+      let parsedResult = this.extractLastJsonObject(stdout);
+
+      if (
+        (!parsedResult || parsedResult.success === false) &&
+        assetType === 'texture' &&
+        extname(assetPathResult.relativePath).toLowerCase() === '.png' &&
+        assetFileStats.size <= maxImageBytesApplied
+      ) {
+        copyFileSync(realAssetFilePath, previewFilePath);
+        let metadataWritten = false;
+        if (includeMetadata && metadataResourcePath) {
+          writeFileSync(
+            metadataFilePath,
+            JSON.stringify(
+              {
+                assetPath: assetPathResult.resourcePath,
+                assetType,
+                previewPath: previewResourcePath,
+                capturedAt: new Date().toISOString(),
+                width: widthApplied,
+                height: heightApplied,
+                transparent,
+                fallback: 'original_png_copy',
+              },
+              null,
+              2
+            )
+          );
+          metadataWritten = true;
+        }
+
+        parsedResult = {
+          success: true,
+          projectPath: projectRoot.replace(/\\/g, '/'),
+          assetPath: assetPathResult.resourcePath,
+          assetType,
+          previewPath: previewResourcePath,
+          metadataPath: metadataWritten ? metadataResourcePath : null,
+          created: true,
+          width: widthApplied,
+          height: heightApplied,
+          transparent,
+          warnings: [
+            {
+              severity: 'warning',
+              code: 'TEXTURE_IMPORT_UNAVAILABLE',
+              message: 'Texture could not be rendered through Godot; copied the source PNG as the preview instead.',
+            },
+          ],
+          summary: {
+            assetSizeBytes: assetFileStats.size,
+            outputSizeBytes: statSync(previewFilePath).size,
+            metadataWritten,
+            maxWaitFramesRequested,
+            maxWaitFramesApplied,
+            maxWaitFramesClamped,
+            widthRequested,
+            heightRequested,
+            widthClamped,
+            heightClamped,
+          },
+        };
+      }
+
+      if (!parsedResult) {
+        const stderrText = stderr?.trim();
+        return this.captureAssetPreviewErrorResponse(
+          'CAPTURE_ASSET_PREVIEW_FAILED',
+          stderrText
+            ? `Godot did not return valid JSON for capture_asset_preview. Stderr: ${stderrText}`
+            : 'Godot did not return valid JSON for capture_asset_preview.'
+        );
+      }
+
+      parsedResult.summary = {
+        ...(parsedResult.summary || {}),
+        maxImageBytesRequested,
+        maxImageBytesApplied,
+        maxImageBytesClamped,
+      };
+
+      const content: any[] = [];
+      if (parsedResult.success === true && includeImageContent) {
+        this.appendPreviewImageContent(parsedResult, content, projectRoot, realOutputDirPath, maxImageBytesApplied);
+      }
+
+      content.unshift({
+        type: 'text',
+        text: JSON.stringify(parsedResult, null, 2),
+      });
+
+      return {
+        content,
+        ...(parsedResult.success === false ? { isError: true } : {}),
+      };
+    } catch (error: any) {
+      return this.captureAssetPreviewErrorResponse(
+        'CAPTURE_ASSET_PREVIEW_FAILED',
+        `Failed to capture asset preview: ${error?.message || 'Unknown error'}`
       );
     }
   }

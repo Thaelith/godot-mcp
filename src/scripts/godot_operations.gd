@@ -28,7 +28,7 @@ func _init():
     
     var operation = args[operation_index]
     var params_json = args[params_index]
-    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "capture_scene_preview" or operation == "dry_run_align_nodes" or operation == "align_nodes" or operation == "dry_run_place_asset_in_scene" or operation == "place_asset_in_scene" or operation == "dry_run_update_node_properties" or operation == "update_node_properties" or operation == "dry_run_scene_patch" or operation == "apply_scene_patch" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
+    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "capture_scene_preview" or operation == "capture_asset_preview" or operation == "dry_run_align_nodes" or operation == "align_nodes" or operation == "dry_run_place_asset_in_scene" or operation == "place_asset_in_scene" or operation == "dry_run_update_node_properties" or operation == "update_node_properties" or operation == "dry_run_scene_patch" or operation == "apply_scene_patch" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
 
     if quiet_output:
         debug_mode = false
@@ -69,6 +69,8 @@ func _init():
             get_scene_layout(params)
         "capture_scene_preview":
             await capture_scene_preview(params)
+        "capture_asset_preview":
+            await capture_asset_preview(params)
         "dry_run_align_nodes":
             dry_run_align_nodes(params)
         "align_nodes":
@@ -1093,6 +1095,286 @@ func capture_scene_preview(params):
     print(JSON.stringify(result))
     viewport.remove_child(scene_root)
     scene_root.free()
+    viewport.queue_free()
+
+func capture_asset_preview_type_from_path(asset_path):
+    var extension = asset_path.get_extension().to_lower()
+    if extension in ["png", "jpg", "jpeg", "webp", "svg", "tga", "bmp"]:
+        return "texture"
+    if extension in ["tscn", "scn"]:
+        return "scene"
+    if extension in ["glb", "gltf", "obj", "fbx"]:
+        return "model"
+    if extension in ["ttf", "otf"]:
+        return "font"
+    return "unsupported"
+
+func capture_asset_center_node2d(node, width, height):
+    if node is Node2D:
+        node.position = Vector2(width / 2.0, height / 2.0)
+
+func capture_asset_add_default_camera(root_3d, mesh_aabb=null):
+    var light = DirectionalLight3D.new()
+    light.rotation_degrees = Vector3(-45, 35, 0)
+    root_3d.add_child(light)
+
+    var camera = Camera3D.new()
+    camera.current = true
+    var center = Vector3.ZERO
+    var radius = 2.5
+    if mesh_aabb != null:
+        center = mesh_aabb.position + mesh_aabb.size / 2.0
+        radius = max(mesh_aabb.size.x, max(mesh_aabb.size.y, mesh_aabb.size.z))
+        if radius <= 0.001:
+            radius = 2.5
+    camera.position = center + Vector3(radius * 1.5, radius * 1.1, radius * 2.0)
+    camera.look_at(center, Vector3.UP)
+    root_3d.add_child(camera)
+
+func capture_asset_prepare_render_root(asset_path, asset_type, width, height, transparent, sample_text, warnings):
+    var resource = ResourceLoader.load(asset_path)
+    if resource == null:
+        return {
+            "success": false,
+            "error": "ASSET_LOAD_FAILED",
+            "message": "Asset could not be loaded by Godot ResourceLoader."
+        }
+
+    if asset_type == "texture":
+        if not (resource is Texture2D):
+            return {
+                "success": false,
+                "error": "ASSET_LOAD_FAILED",
+                "message": "Texture asset did not load as Texture2D."
+            }
+        var texture_rect = TextureRect.new()
+        texture_rect.texture = resource
+        texture_rect.size = Vector2(width, height)
+        texture_rect.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+        texture_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+        return {
+            "success": true,
+            "node": texture_rect,
+            "resourceType": resource.get_class()
+        }
+
+    if asset_type == "scene":
+        if not (resource is PackedScene):
+            return {
+                "success": false,
+                "error": "ASSET_LOAD_FAILED",
+                "message": "Scene asset did not load as PackedScene."
+            }
+        var scene_root = resource.instantiate()
+        if scene_root == null:
+            return {
+                "success": false,
+                "error": "SCENE_INSTANTIATE_FAILED",
+                "message": "Scene asset could not be instantiated."
+            }
+        capture_preview_add_warning(warnings, "SCENE_PREVIEW_MAY_BE_EMPTY", "Scene asset previews depend on the asset's own camera or default viewport transform.")
+        capture_asset_center_node2d(scene_root, width, height)
+        return {
+            "success": true,
+            "node": scene_root,
+            "resourceType": resource.get_class()
+        }
+
+    if asset_type == "model":
+        var root_3d = Node3D.new()
+        var mesh_aabb = null
+        if resource is PackedScene:
+            var model_root = resource.instantiate()
+            if model_root == null:
+                return {
+                    "success": false,
+                    "error": "SCENE_INSTANTIATE_FAILED",
+                    "message": "Model PackedScene could not be instantiated."
+                }
+            root_3d.add_child(model_root)
+        elif resource is Mesh:
+            var mesh_instance = MeshInstance3D.new()
+            mesh_instance.mesh = resource
+            mesh_aabb = resource.get_aabb()
+            root_3d.add_child(mesh_instance)
+        else:
+            return {
+                "success": false,
+                "error": "UNSUPPORTED_ASSET_PREVIEW_TYPE",
+                "message": "Model asset did not load as PackedScene or Mesh."
+            }
+        capture_preview_add_warning(warnings, "MODEL_PREVIEW_APPROXIMATE", "Model preview uses an approximate default camera and light.")
+        capture_asset_add_default_camera(root_3d, mesh_aabb)
+        return {
+            "success": true,
+            "node": root_3d,
+            "resourceType": resource.get_class()
+        }
+
+    if asset_type == "font":
+        if not (resource is Font):
+            return {
+                "success": false,
+                "error": "ASSET_LOAD_FAILED",
+                "message": "Font asset did not load as Font."
+            }
+        var label = Label.new()
+        label.text = sample_text
+        label.size = Vector2(width, height)
+        label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+        label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+        label.add_theme_font_override("font", resource)
+        label.add_theme_font_size_override("font_size", 48)
+        capture_preview_add_warning(warnings, "FONT_PREVIEW_APPROXIMATE", "Font preview uses sample text and a fixed preview font size.")
+        return {
+            "success": true,
+            "node": label,
+            "resourceType": resource.get_class()
+        }
+
+    return {
+        "success": false,
+        "error": "UNSUPPORTED_ASSET_PREVIEW_TYPE",
+        "message": "This asset type is not supported for visual preview."
+    }
+
+func capture_asset_preview(params):
+    if not params.has("asset_path"):
+        print(JSON.stringify(capture_preview_error("MISSING_ASSET_PATH", "asset_path is required.")))
+        return
+
+    if not params.has("preview_path"):
+        print(JSON.stringify(capture_preview_error("CAPTURE_ASSET_PREVIEW_FAILED", "preview_path is required.")))
+        return
+
+    var asset_path = normalize_resource_scene_path(params.asset_path)
+    var preview_path = normalize_resource_scene_path(params.preview_path)
+    var metadata_path = normalize_resource_scene_path(params.metadata_path) if params.has("metadata_path") and params.metadata_path != null else null
+    var project_path = params.project_path if params.has("project_path") else ProjectSettings.globalize_path("res://")
+    var width = int(params.width) if params.has("width") else 512
+    var height = int(params.height) if params.has("height") else 512
+    var transparent = params.transparent if params.has("transparent") else true
+    var include_metadata = params.include_metadata if params.has("include_metadata") else true
+    var max_wait_frames = int(params.max_wait_frames) if params.has("max_wait_frames") else 3
+    var max_wait_frames_requested = params.max_wait_frames_requested if params.has("max_wait_frames_requested") else null
+    var max_wait_frames_clamped = params.max_wait_frames_clamped if params.has("max_wait_frames_clamped") else false
+    var width_requested = params.width_requested if params.has("width_requested") else null
+    var height_requested = params.height_requested if params.has("height_requested") else null
+    var width_clamped = params.width_clamped if params.has("width_clamped") else false
+    var height_clamped = params.height_clamped if params.has("height_clamped") else false
+    var sample_text = params.sample_text if params.has("sample_text") else "AaBbCc 123"
+    var asset_size_bytes = params.asset_size_bytes if params.has("asset_size_bytes") else 0
+    var warnings = []
+    var asset_type = params.asset_type if params.has("asset_type") else capture_asset_preview_type_from_path(asset_path)
+
+    if not FileAccess.file_exists(asset_path):
+        print(JSON.stringify(capture_preview_error("ASSET_PATH_NOT_FOUND", "Asset file does not exist: " + asset_path, warnings)))
+        return
+
+    if asset_type == "unsupported":
+        print(JSON.stringify(capture_preview_error("UNSUPPORTED_ASSET_PREVIEW_TYPE", "This asset type is not supported for visual preview.", warnings)))
+        return
+
+    var render_result = capture_asset_prepare_render_root(asset_path, asset_type, width, height, transparent, sample_text, warnings)
+    if not render_result.has("success") or not render_result["success"]:
+        print(JSON.stringify(capture_preview_error(
+            render_result["error"] if render_result.has("error") else "CAPTURE_ASSET_PREVIEW_FAILED",
+            render_result["message"] if render_result.has("message") else "Asset preview could not be prepared.",
+            warnings
+        )))
+        return
+
+    var viewport = SubViewport.new()
+    viewport.size = Vector2i(width, height)
+    viewport.transparent_bg = transparent
+    viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+    viewport.disable_3d = false
+    viewport.gui_disable_input = true
+
+    var render_node = render_result["node"]
+    get_root().add_child(viewport)
+    viewport.add_child(render_node)
+
+    for _frame_index in range(max_wait_frames):
+        await process_frame
+
+    RenderingServer.force_draw(false)
+    await process_frame
+
+    var texture = viewport.get_texture()
+    if texture == null:
+        viewport.remove_child(render_node)
+        render_node.free()
+        viewport.queue_free()
+        print(JSON.stringify(capture_preview_error("VIEWPORT_RENDER_FAILED", "SubViewport did not produce a texture.", warnings)))
+        return
+
+    var image = texture.get_image()
+    if image == null or image.get_width() <= 0 or image.get_height() <= 0:
+        viewport.remove_child(render_node)
+        render_node.free()
+        viewport.queue_free()
+        print(JSON.stringify(capture_preview_error("IMAGE_CAPTURE_FAILED", "Failed to capture a preview image from the viewport.", warnings)))
+        return
+
+    var save_result = image.save_png(preview_path)
+    if save_result != OK:
+        viewport.remove_child(render_node)
+        render_node.free()
+        viewport.queue_free()
+        print(JSON.stringify(capture_preview_error("PREVIEW_SAVE_FAILED", "Failed to save preview PNG to: " + preview_path, warnings)))
+        return
+
+    var captured_at = capture_preview_timestamp()
+    var metadata_written = false
+    if include_metadata and metadata_path != null:
+        var metadata = {
+            "assetPath": asset_path,
+            "assetType": asset_type,
+            "previewPath": preview_path,
+            "capturedAt": captured_at,
+            "width": width,
+            "height": height,
+            "transparent": transparent
+        }
+        var metadata_file = FileAccess.open(metadata_path, FileAccess.WRITE)
+        if metadata_file == null:
+            capture_preview_add_warning(warnings, "METADATA_WRITE_SKIPPED", "Metadata JSON could not be opened for writing.")
+        else:
+            metadata_file.store_string(JSON.stringify(metadata, "  "))
+            metadata_file.close()
+            metadata_written = true
+
+    var result = {
+        "success": true,
+        "projectPath": project_path,
+        "assetPath": asset_path,
+        "assetType": asset_type,
+        "resourceType": render_result["resourceType"] if render_result.has("resourceType") else null,
+        "previewPath": preview_path,
+        "metadataPath": metadata_path if metadata_written else null,
+        "created": true,
+        "width": width,
+        "height": height,
+        "transparent": transparent,
+        "warnings": warnings,
+        "summary": {
+            "assetSizeBytes": asset_size_bytes,
+            "outputSizeBytes": capture_preview_file_size(preview_path),
+            "metadataWritten": metadata_written,
+            "maxWaitFramesRequested": max_wait_frames_requested,
+            "maxWaitFramesApplied": max_wait_frames,
+            "maxWaitFramesClamped": max_wait_frames_clamped,
+            "widthRequested": width_requested,
+            "heightRequested": height_requested,
+            "widthClamped": width_clamped,
+            "heightClamped": height_clamped
+        }
+    }
+
+    print(JSON.stringify(result))
+    viewport.remove_child(render_node)
+    render_node.free()
     viewport.queue_free()
 
 func dry_align_error(error_code, message):
