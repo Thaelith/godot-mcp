@@ -3938,10 +3938,32 @@ func scene_patch_place_asset_step(step, project_path, scene_path, simulation_roo
         extra["simulationOnly"] = true
         extra["simulatedNodePath"] = simulation_result["simulatedNodePath"] if simulation_result.has("simulatedNodePath") else planned["proposed_path"]
         extra["simulatedActionCount"] = simulation_result["simulatedActionCount"] if simulation_result.has("simulatedActionCount") else 0
-        extra["simulatedChanges"] = [{
+        var simulated_changes = [{
             "action": "add_node",
-            "path": extra["simulatedNodePath"]
+            "path": extra["simulatedNodePath"],
+            "nodePath": extra["simulatedNodePath"],
+            "nodeType": planned["node_type"],
+            "assetPath": planned["asset_path"],
+            "assetType": planned["asset_type"],
+            "assetProperty": planned["asset_property"]
+        }, {
+            "action": "assign_asset",
+            "path": extra["simulatedNodePath"],
+            "nodePath": extra["simulatedNodePath"],
+            "nodeType": planned["node_type"],
+            "assetPath": planned["asset_path"],
+            "assetType": planned["asset_type"],
+            "assetProperty": planned["asset_property"]
         }]
+        if planned.has("properties") and typeof(planned["properties"]) == TYPE_DICTIONARY and planned["properties"].size() > 0:
+            simulated_changes.append({
+                "action": "set_properties",
+                "path": extra["simulatedNodePath"],
+                "nodePath": extra["simulatedNodePath"],
+                "nodeType": planned["node_type"],
+                "properties": planned["properties"].duplicate(true)
+            })
+        extra["simulatedChanges"] = simulated_changes
     elif not dry_align_has_error_issues(planned["issues"]):
         scene_patch_track_created_nodes(step_plan, planned_node_paths)
 
@@ -4000,6 +4022,8 @@ func scene_patch_align_nodes_step(step, project_path, scene_path, scene_root, ma
         for change in applied_changes:
             var simulated_change = change.duplicate(true)
             simulated_change["action"] = "set_position"
+            simulated_change["expectedValue"] = simulated_change["newValue"] if simulated_change.has("newValue") else null
+            simulated_change["valueType"] = "Vector3" if simulated_change.has("newValue") and typeof(simulated_change["newValue"]) == TYPE_ARRAY and simulated_change["newValue"].size() == 3 else "Vector2"
             simulated_changes.append(simulated_change)
         extra["simulatedChanges"] = simulated_changes
     return scene_patch_step_result(step_index, step_type, wrapped_issues, step_plan, include_plan, extra)
@@ -4059,6 +4083,7 @@ func scene_patch_update_properties_step(step, project_path, scene_path, simulati
         for change in applied_changes:
             var simulated_change = change.duplicate(true)
             simulated_change["action"] = "set_property"
+            simulated_change["expectedValue"] = simulated_change["newValue"] if simulated_change.has("newValue") else null
             simulated_changes.append(simulated_change)
         extra["simulatedChanges"] = simulated_changes
 
@@ -4314,12 +4339,328 @@ func scene_patch_add_validation_after_errors(issues, validation_after):
             item["validationScope"] = validation_after["validationScope"] if validation_after.has("validationScope") else "simulated_patch_state"
             issues.append(item)
 
-func scene_patch_post_validate_saved_scene(scene_path, project_path, source_params, max_depth, max_depth_requested, max_depth_clamped):
+func scene_patch_expected_node_path(change):
+    if change.has("nodePath"):
+        return change["nodePath"]
+    if change.has("path"):
+        return change["path"]
+    return null
+
+func scene_patch_expected_value(change):
+    if change.has("expectedValue"):
+        return change["expectedValue"]
+    if change.has("newValue"):
+        return change["newValue"]
+    if change.has("proposedValue"):
+        return change["proposedValue"]
+    return null
+
+func scene_patch_expected_base_detail(change, action):
+    var node_path = scene_patch_expected_node_path(change)
+    var detail = {
+        "stepIndex": change["stepIndex"] if change.has("stepIndex") else -1,
+        "stepType": change["stepType"] if change.has("stepType") else null,
+        "action": action,
+        "nodePath": node_path,
+        "matches": false,
+        "message": ""
+    }
+    if change.has("property"):
+        detail["property"] = change["property"]
+    if change.has("assetPath"):
+        detail["assetPath"] = change["assetPath"]
+    if change.has("assetProperty"):
+        detail["assetProperty"] = change["assetProperty"]
+    return detail
+
+func scene_patch_expected_issue_from_detail(severity, code, message, detail):
+    var issue = {
+        "severity": severity,
+        "code": code,
+        "message": message
+    }
+    if detail.has("stepIndex") and detail["stepIndex"] != -1:
+        issue["stepIndex"] = detail["stepIndex"]
+    if detail.has("stepType") and detail["stepType"] != null:
+        issue["stepType"] = detail["stepType"]
+    if detail.has("action"):
+        issue["action"] = detail["action"]
+    if detail.has("nodePath") and detail["nodePath"] != null:
+        issue["nodePath"] = detail["nodePath"]
+    if detail.has("property"):
+        issue["property"] = detail["property"]
+    if detail.has("assetPath"):
+        issue["assetPath"] = detail["assetPath"]
+    if detail.has("assetProperty"):
+        issue["assetProperty"] = detail["assetProperty"]
+    issue["validationScope"] = "saved_scene_after_patch"
+    return issue
+
+func scene_patch_check_expected_node(scene_root, change):
+    var detail = scene_patch_expected_base_detail(change, "add_node")
+    var issues = []
+    var node_path = detail["nodePath"]
+    if node_path == null:
+        detail["message"] = "Expected node path was unavailable."
+        issues.append(scene_patch_expected_issue_from_detail("error", "EXPECTED_CHANGE_UNSUPPORTED", detail["message"], detail))
+        return {"success": false, "details": [detail], "issues": issues}
+
+    var node = update_node_properties_find_node(scene_root, node_path)
+    if node == null:
+        detail["message"] = "Expected node was not found in saved scene."
+        issues.append(scene_patch_expected_issue_from_detail("error", "EXPECTED_NODE_NOT_FOUND", detail["message"], detail))
+        return {"success": false, "details": [detail], "issues": issues}
+
+    var expected_type = change["nodeType"] if change.has("nodeType") else null
+    var actual_type = node.get_class()
+    detail["nodeType"] = actual_type
+    if expected_type != null and expected_type != actual_type:
+        detail["expectedNodeType"] = expected_type
+        detail["actualNodeType"] = actual_type
+        var asset_type = change["assetType"] if change.has("assetType") else null
+        var asset_property = change["assetProperty"] if change.has("assetProperty") else null
+        if (asset_type == "scene" or asset_type == "model") and asset_property == "instance":
+            detail["matches"] = true
+            detail["message"] = "Expected instance node exists; type differs because the instanced scene/model controls its root type."
+            issues.append(scene_patch_expected_issue_from_detail("warning", "EXPECTED_NODE_TYPE_MISMATCH", detail["message"], detail))
+            return {"success": true, "details": [detail], "issues": issues}
+        detail["message"] = "Expected node type did not match saved node type."
+        issues.append(scene_patch_expected_issue_from_detail("error", "EXPECTED_NODE_TYPE_MISMATCH", detail["message"], detail))
+        return {"success": false, "details": [detail], "issues": issues}
+
+    detail["matches"] = true
+    detail["message"] = "Expected node exists in saved scene."
+    return {"success": true, "details": [detail], "issues": issues}
+
+func scene_patch_check_expected_asset_assignment(scene_root, change):
+    var detail = scene_patch_expected_base_detail(change, "assign_asset")
+    var issues = []
+    var node_path = detail["nodePath"]
+    if node_path == null:
+        detail["message"] = "Expected asset assignment node path was unavailable."
+        issues.append(scene_patch_expected_issue_from_detail("error", "EXPECTED_CHANGE_UNSUPPORTED", detail["message"], detail))
+        return {"success": false, "details": [detail], "issues": issues}
+
+    var node = update_node_properties_find_node(scene_root, node_path)
+    if node == null:
+        detail["message"] = "Target node for expected asset assignment was not found in saved scene."
+        issues.append(scene_patch_expected_issue_from_detail("error", "EXPECTED_NODE_NOT_FOUND", detail["message"], detail))
+        return {"success": false, "details": [detail], "issues": issues}
+
+    var asset_path = change["assetPath"] if change.has("assetPath") else null
+    var asset_property = change["assetProperty"] if change.has("assetProperty") else null
+    var asset_type = change["assetType"] if change.has("assetType") else null
+    if asset_path == null or asset_type == null:
+        detail["message"] = "Expected asset assignment lacked asset metadata."
+        issues.append(scene_patch_expected_issue_from_detail("error", "EXPECTED_CHANGE_UNSUPPORTED", detail["message"], detail))
+        return {"success": false, "details": [detail], "issues": issues}
+
+    var assignment = place_asset_check_assignment(node, asset_path, asset_property, asset_type)
+    detail["check"] = assignment["check"] if assignment.has("check") else "unknown"
+    detail["message"] = assignment["message"] if assignment.has("message") else "Asset assignment check completed."
+    detail["matches"] = assignment["assigned"] if assignment.has("assigned") else false
+    if assignment.has("warning") and assignment["warning"] != null:
+        issues.append(scene_patch_expected_issue_from_detail("warning", assignment["warning"], detail["message"], detail))
+
+    var assignment_failed = (not detail["matches"]) and assignment.get("failHard", true)
+    if assignment_failed:
+        issues.append(scene_patch_expected_issue_from_detail("error", "EXPECTED_ASSET_ASSIGNMENT_MISSING", detail["message"], detail))
+        return {"success": false, "details": [detail], "issues": issues}
+
+    if not detail["matches"]:
+        detail["matches"] = true
+        detail["message"] = detail["message"] + " Treated as non-fatal because this assignment is presence/provenance limited."
+    return {"success": true, "details": [detail], "issues": issues}
+
+func scene_patch_check_expected_property(scene_root, change, action="set_property"):
+    var detail = scene_patch_expected_base_detail(change, action)
+    var issues = []
+    var node_path = detail["nodePath"]
+    var property_name = change["property"] if change.has("property") else null
+    detail["property"] = property_name
+    if node_path == null or property_name == null:
+        detail["message"] = "Expected property change lacked nodePath or property."
+        issues.append(scene_patch_expected_issue_from_detail("error", "EXPECTED_CHANGE_UNSUPPORTED", detail["message"], detail))
+        return {"success": false, "details": [detail], "issues": issues}
+
+    var node = update_node_properties_find_node(scene_root, node_path)
+    if node == null:
+        detail["message"] = "Target node for expected property change was not found in saved scene."
+        issues.append(scene_patch_expected_issue_from_detail("error", "EXPECTED_NODE_NOT_FOUND", detail["message"], detail))
+        return {"success": false, "details": [detail], "issues": issues}
+
+    if property_name == "position" and action == "set_position":
+        var expected_position = scene_patch_expected_value(change)
+        var actual_position = dry_align_get_local_position(node)
+        detail["expectedValue"] = expected_position
+        detail["actualValue"] = actual_position
+        if actual_position == null or typeof(expected_position) != TYPE_ARRAY:
+            detail["message"] = "Saved node position could not be checked for this node dimension."
+            issues.append(scene_patch_expected_issue_from_detail("error", "EXPECTED_POSITION_MISMATCH", detail["message"], detail))
+            return {"success": false, "details": [detail], "issues": issues}
+        if update_node_properties_values_match_post(actual_position, expected_position):
+            detail["matches"] = true
+            detail["message"] = "Position matched the planned value within epsilon."
+            return {"success": true, "details": [detail], "issues": issues}
+        detail["message"] = "Position did not match the planned value."
+        issues.append(scene_patch_expected_issue_from_detail("error", "EXPECTED_POSITION_MISMATCH", detail["message"], detail))
+        return {"success": false, "details": [detail], "issues": issues}
+
+    if not create_scene_blueprint_node_has_property(node, property_name):
+        detail["message"] = "Expected property is not available on the saved node."
+        issues.append(scene_patch_expected_issue_from_detail("error", "EXPECTED_PROPERTY_MISMATCH", detail["message"], detail))
+        return {"success": false, "details": [detail], "issues": issues}
+
+    var converted_current = update_node_properties_convert_current_value(node.get(property_name))
+    if not converted_current["success"]:
+        detail["message"] = "Saved property value could not be converted safely."
+        issues.append(scene_patch_expected_issue_from_detail("error", "EXPECTED_CHANGE_UNSUPPORTED", detail["message"], detail))
+        return {"success": false, "details": [detail], "issues": issues}
+
+    var expected_value = scene_patch_expected_value(change)
+    detail["expectedValue"] = expected_value
+    detail["actualValue"] = converted_current["value"]
+    if update_node_properties_values_match_post(converted_current["value"], expected_value):
+        detail["matches"] = true
+        detail["message"] = "Property matched the planned value within epsilon."
+        return {"success": true, "details": [detail], "issues": issues}
+
+    detail["message"] = "Property did not match the planned value."
+    issues.append(scene_patch_expected_issue_from_detail("error", "EXPECTED_PROPERTY_MISMATCH", detail["message"], detail))
+    return {"success": false, "details": [detail], "issues": issues}
+
+func scene_patch_post_validate_expected_changes(scene_root, applied_changes, source_params):
+    var post = {
+        "expectedChangesPassed": true,
+        "checkedExpectedChanges": 0,
+        "failedExpectedChanges": [],
+        "details": [],
+        "issues": []
+    }
+
+    var latest_property_tokens = {}
+    for index in range(applied_changes.size()):
+        var change_for_latest = applied_changes[index]
+        if typeof(change_for_latest) != TYPE_DICTIONARY:
+            continue
+        var latest_action = change_for_latest["action"] if change_for_latest.has("action") else null
+        var latest_node_path = scene_patch_expected_node_path(change_for_latest)
+        if latest_node_path == null:
+            continue
+        if latest_action == "set_position":
+            latest_property_tokens[str(latest_node_path) + "::position"] = str(index)
+        elif latest_action == "set_property" and change_for_latest.has("property"):
+            latest_property_tokens[str(latest_node_path) + "::" + str(change_for_latest["property"])] = str(index)
+        elif latest_action == "set_properties" and change_for_latest.has("properties") and typeof(change_for_latest["properties"]) == TYPE_DICTIONARY:
+            for property_name in change_for_latest["properties"].keys():
+                latest_property_tokens[str(latest_node_path) + "::" + str(property_name)] = str(index) + "::" + str(property_name)
+
+    for change_index in range(applied_changes.size()):
+        var change = applied_changes[change_index]
+        if typeof(change) != TYPE_DICTIONARY:
+            var detail = {
+                "stepIndex": -1,
+                "stepType": null,
+                "action": "unknown",
+                "nodePath": null,
+                "matches": false,
+                "message": "Applied change entry was not an object."
+            }
+            post["details"].append(detail)
+            post["failedExpectedChanges"].append(detail)
+            post["issues"].append(scene_patch_expected_issue_from_detail("error", "EXPECTED_CHANGE_UNSUPPORTED", detail["message"], detail))
+            continue
+
+        var action = change["action"] if change.has("action") else null
+        var check = null
+        if action == "add_node":
+            check = scene_patch_check_expected_node(scene_root, change)
+        elif action == "assign_asset":
+            check = scene_patch_check_expected_asset_assignment(scene_root, change)
+        elif action == "set_position":
+            var position_node_path = scene_patch_expected_node_path(change)
+            var position_key = str(position_node_path) + "::position"
+            if latest_property_tokens.get(position_key, null) != str(change_index):
+                continue
+            var position_change = change.duplicate(true)
+            position_change["property"] = "position"
+            check = scene_patch_check_expected_property(scene_root, position_change, "set_position")
+        elif action == "set_property":
+            var property_node_path = scene_patch_expected_node_path(change)
+            var property_key = str(property_node_path) + "::" + str(change["property"] if change.has("property") else "")
+            if latest_property_tokens.get(property_key, null) != str(change_index):
+                continue
+            check = scene_patch_check_expected_property(scene_root, change, "set_property")
+        elif action == "set_properties":
+            var set_properties_success = true
+            var set_properties_details = []
+            var set_properties_issues = []
+            var properties = change["properties"] if change.has("properties") else {}
+            if typeof(properties) != TYPE_DICTIONARY:
+                var unsupported_detail = scene_patch_expected_base_detail(change, "set_properties")
+                unsupported_detail["message"] = "set_properties change did not contain a properties object."
+                set_properties_details.append(unsupported_detail)
+                set_properties_issues.append(scene_patch_expected_issue_from_detail("error", "EXPECTED_CHANGE_UNSUPPORTED", unsupported_detail["message"], unsupported_detail))
+                set_properties_success = false
+            else:
+                for property_name in properties.keys():
+                    var set_properties_node_path = scene_patch_expected_node_path(change)
+                    var set_properties_key = str(set_properties_node_path) + "::" + str(property_name)
+                    if latest_property_tokens.get(set_properties_key, null) != str(change_index) + "::" + str(property_name):
+                        continue
+                    var property_change = change.duplicate(true)
+                    property_change["action"] = "set_property"
+                    property_change["property"] = property_name
+                    property_change["expectedValue"] = properties[property_name]
+                    var property_check = scene_patch_check_expected_property(scene_root, property_change, "set_property")
+                    set_properties_details.append_array(property_check["details"])
+                    set_properties_issues.append_array(property_check["issues"])
+                    if not property_check["success"]:
+                        set_properties_success = false
+            check = {
+                "success": set_properties_success,
+                "details": set_properties_details,
+                "issues": set_properties_issues
+            }
+        else:
+            var detail_unknown = scene_patch_expected_base_detail(change, str(action))
+            detail_unknown["message"] = "Expected change action is not supported by post-validation."
+            check = {
+                "success": false,
+                "details": [detail_unknown],
+                "issues": [scene_patch_expected_issue_from_detail("error", "EXPECTED_CHANGE_UNSUPPORTED", detail_unknown["message"], detail_unknown)]
+            }
+
+        post["details"].append_array(check["details"])
+        post["issues"].append_array(check["issues"])
+        for detail_item in check["details"]:
+            post["checkedExpectedChanges"] += 1
+            if typeof(detail_item) == TYPE_DICTIONARY and (not detail_item.has("matches") or not detail_item["matches"]):
+                post["failedExpectedChanges"].append(detail_item)
+
+    if not post["failedExpectedChanges"].is_empty():
+        post["expectedChangesPassed"] = false
+        post["issues"].append({
+            "severity": "error",
+            "code": "EXPECTED_CHANGE_MISMATCH",
+            "message": "One or more expected saved changes did not match the patch plan.",
+            "validationScope": "saved_scene_after_patch"
+        })
+    else:
+        post["expectedChangesPassed"] = not dry_align_has_error_issues(post["issues"])
+
+    return post
+
+func scene_patch_post_validate_saved_scene(scene_path, project_path, source_params, max_depth, max_depth_requested, max_depth_clamped, applied_changes=[]):
     var post = {
         "loadable": false,
         "instantiable": false,
         "validationScope": "saved_scene_after_patch",
         "valid": false,
+        "expectedChangesPassed": false,
+        "checkedExpectedChanges": 0,
+        "failedExpectedChanges": [],
+        "details": [],
         "issues": [],
         "summary": {},
         "severity": "error"
@@ -4344,16 +4685,23 @@ func scene_patch_post_validate_saved_scene(scene_path, project_path, source_para
     post["instantiable"] = true
 
     var validation = scene_patch_validation_result(project_path, scene_path, scene_root, source_params, max_depth, max_depth_requested, max_depth_clamped, "saved_scene_after_patch")
+    var expected = scene_patch_post_validate_expected_changes(scene_root, applied_changes, source_params)
     scene_root.free()
     post["valid"] = validation["valid"] if validation.has("valid") else false
     post["issues"] = validation["issues"] if validation.has("issues") else []
+    post["issues"].append_array(expected["issues"])
+    post["expectedChangesPassed"] = expected["expectedChangesPassed"]
+    post["checkedExpectedChanges"] = expected["checkedExpectedChanges"]
+    post["failedExpectedChanges"] = expected["failedExpectedChanges"]
+    post["details"] = expected["details"]
     post["summary"] = validation["summary"] if validation.has("summary") else {}
-    post["severity"] = validation["severity"] if validation.has("severity") else "error"
+    var post_counts = scene_patch_issue_counts(post["issues"])
+    post["severity"] = dry_align_severity_from_counts(post_counts)
     post["limits"] = validation["limits"] if validation.has("limits") else {}
 
     return {
-        "success": post["valid"],
-        "message": "Saved scene validation failed." if not post["valid"] else "Post-validation passed.",
+        "success": post["valid"] and post["expectedChangesPassed"],
+        "message": "Saved scene validation failed." if not post["valid"] else ("Expected saved changes did not match the patch plan." if not post["expectedChangesPassed"] else "Post-validation passed."),
         "postValidation": post
     }
 
@@ -4487,7 +4835,7 @@ func apply_scene_patch(params):
 
     var post_validation = null
     if validate_after_write:
-        var post_result = scene_patch_post_validate_saved_scene(scene_path, project_path, params, max_depth, max_depth_requested, max_depth_clamped)
+        var post_result = scene_patch_post_validate_saved_scene(scene_path, project_path, params, max_depth, max_depth_requested, max_depth_clamped, applied_changes)
         post_validation = post_result["postValidation"]
         scene_patch_append_post_validation_issues(issues, post_validation)
         if not post_result["success"]:

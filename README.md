@@ -1985,7 +1985,25 @@ Output example:
       "stepIndex": 1,
       "stepType": "place_asset",
       "action": "add_node",
-      "path": "Room/Chair"
+      "nodePath": "Room/Chair",
+      "nodeType": "Sprite2D"
+    },
+    {
+      "stepIndex": 2,
+      "stepType": "align_nodes",
+      "action": "set_position",
+      "nodePath": "Room/Chair",
+      "property": "position",
+      "expectedValue": [128, 0]
+    },
+    {
+      "stepIndex": 3,
+      "stepType": "update_node_properties",
+      "action": "set_property",
+      "nodePath": "Room/Chair",
+      "property": "z_index",
+      "expectedValue": 5,
+      "valueType": "number"
     }
   ],
   "write": {
@@ -1998,6 +2016,28 @@ Output example:
     "instantiable": true,
     "validationScope": "saved_scene_after_patch",
     "valid": true,
+    "expectedChangesPassed": true,
+    "checkedExpectedChanges": 4,
+    "failedExpectedChanges": [],
+    "details": [
+      {
+        "stepIndex": 1,
+        "stepType": "place_asset",
+        "action": "add_node",
+        "nodePath": "Room/Chair",
+        "matches": true,
+        "message": "Expected node exists in saved scene."
+      },
+      {
+        "stepIndex": 2,
+        "stepType": "align_nodes",
+        "action": "set_position",
+        "nodePath": "Room/Chair",
+        "property": "position",
+        "matches": true,
+        "message": "Position matched the planned value within epsilon."
+      }
+    ],
     "issues": []
   }
 }
@@ -2007,9 +2047,13 @@ Output example:
 
 **Checkpoint behavior:** `createCheckpoint` defaults to `true`. The TypeScript server creates exactly one project-local checkpoint before running the Godot writer. A `create_checkpoint` step can provide the checkpoint name when the top-level `checkpointName` is omitted, but it does not create an additional checkpoint. Set `createCheckpoint: false` to skip real checkpoint creation; checkpoint steps then behave as planned/no-op entries.
 
-**Restore on failure:** `restoreOnFailure` defaults to `true`. If a checkpoint was created and Godot reports a save or post-validation failure after a write attempt, the server copies the checkpoint back to the target scene and returns `restored: true` when that succeeds.
+**Restore on failure:** `restoreOnFailure` defaults to `true`. If a checkpoint was created and Godot reports a save or post-validation failure after a write attempt, including an expected-change mismatch, the server copies the checkpoint back to the target scene and returns `restored: true` when that succeeds.
 
 **Validation behavior:** `validateBeforeWrite` blocks writing when the cumulative plan has errors. `includeValidationAfter` validates the final in-memory patch state before saving. `validateAfterWrite` reloads the saved scene with cache ignored and validates it as `saved_scene_after_patch`; post-validation issues are surfaced in the response.
+
+**Expected-change post-validation:** after the saved scene reloads, `apply_scene_patch` verifies normalized applied changes, not raw user input. It checks expected node existence for `place_asset`, safe asset assignment/provenance where possible, local position values from `align_nodes`, and safe property values from `update_node_properties`. Numeric, vector, and color values use epsilon `0.001`; strings and booleans require exact matches. Later updates to the same node/property supersede earlier planned values so final-state validation does not fail on intentional multi-step edits.
+
+**Asset assignment provenance:** standalone `res://` resource paths require an exact path match. Embedded or runtime resources are validated by presence and reported with `POST_VALIDATION_PRESENCE_ONLY`. Scene/model instances are validated primarily by expected node existence and may report `ASSIGNMENT_PROVENANCE_LIMITED` because exact instance provenance is not always available after saving.
 
 **Supported step types:** `place_asset`, `align_nodes`, `update_node_properties`, `validate_scene`, and `create_checkpoint`. Placement uses the existing safe asset placement behavior, alignment applies only local `position` changes, and property updates use the same safe allowlist as `update_node_properties`.
 
@@ -2022,7 +2066,7 @@ npm run build
 npx @modelcontextprotocol/inspector build/index.js
 ```
 
-Call `apply_scene_patch` with placement, alignment, property update, and validation steps. Confirm it creates one checkpoint when enabled, saves the target scene once, `read_scene_tree` can see the new node, `get_scene_layout` reflects final positions, invalid plans abort before writing, no-op patches do not save, and post-validation failure restores the checkpoint when `restoreOnFailure` is true.
+Call `apply_scene_patch` with placement, alignment, property update, and validation steps. Confirm it creates one checkpoint when enabled, saves the target scene once, `read_scene_tree` can see the new node, `get_scene_layout` reflects final positions, `postValidation.expectedChangesPassed` is true for successful patches, invalid plans abort before writing, no-op patches do not save, and post-validation failure or expected-change mismatch restores the checkpoint when `restoreOnFailure` is true.
 
 ### `validate_scene`
 
