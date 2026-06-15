@@ -587,6 +587,8 @@ Input example:
   "height": 720,
   "transparent": false,
   "includeMetadata": true,
+  "includeImageContent": true,
+  "maxImageBytes": 1500000,
   "overwrite": false,
   "maxWaitFrames": 3
 }
@@ -605,19 +607,38 @@ Output example:
   "width": 1280,
   "height": 720,
   "transparent": false,
+  "imageContent": {
+    "included": true,
+    "mimeType": "image/png",
+    "sizeBytes": 12345
+  },
   "warnings": [],
   "summary": {
     "outputSizeBytes": 12345,
     "metadataWritten": true,
     "maxWaitFramesApplied": 3,
-    "maxWaitFramesClamped": false
+    "maxWaitFramesClamped": false,
+    "maxImageBytesApplied": 1500000,
+    "maxImageBytesClamped": false
   }
 }
 ```
 
+The MCP response always includes the JSON text response first. When `includeImageContent` is true and the generated PNG is at or below `maxImageBytes`, the response appends a second content item:
+
+```json
+{
+  "type": "image",
+  "data": "<base64 png data>",
+  "mimeType": "image/png"
+}
+```
+
+`maxImageBytes` defaults to `1500000`, rejects values below `1024`, and clamps values above `5000000`. If the PNG is larger than the applied cap, capture still succeeds, image content is omitted, and the JSON includes an `IMAGE_CONTENT_TOO_LARGE` warning plus `imageContent.included: false`. If the PNG cannot be read safely after capture, image content is omitted with an `IMAGE_CONTENT_READ_FAILED` warning.
+
 **Output location:** `outputDir` defaults to `res://.godot_mcp/previews`. The directory is created after path validation. `fileName` is sanitized; when omitted, the tool uses a timestamped name derived from the scene path. If `overwrite` is false and a preview already exists, a numeric suffix is added.
 
-**Safety model:** project and scene paths must stay inside the Godot project, scenes must be `.tscn` or `.scn`, symlink project/scene/output paths are rejected, and output is limited to the preview PNG plus optional metadata JSON under the validated output directory. `outputDir` cannot point to `.git`, `.godot`, or `node_modules`. `.godot_mcp/` is ignored by the repository so generated previews do not get committed by default.
+**Safety model:** project and scene paths must stay inside the Godot project, scenes must be `.tscn` or `.scn`, symlink project/scene/output paths are rejected, and output is limited to the preview PNG plus optional metadata JSON under the validated output directory. Optional image content is read only from the exact generated preview PNG after verifying it remains inside the project and output directory, is a regular `.png` file, is not a symlink, and is within `maxImageBytes`. `outputDir` cannot point to `.git`, `.godot`, or `node_modules`. `.godot_mcp/` is ignored by the repository so generated previews do not get committed by default.
 
 **Rendering limitations:** the tool uses Godot with an offscreen `SubViewport`. It requires a working rendering backend; on Linux CI the optional Godot Integration workflow runs it through `xvfb-run`. Scenes with an active `Camera2D` or `Camera3D` generally preview more predictably. If no camera is found, the tool still attempts a simple viewport capture and returns `NO_CAMERA_FOUND` / `PREVIEW_MAY_BE_EMPTY` warnings. Some shader, viewport, editor-only, or environment-dependent rendering may differ from the editor.
 

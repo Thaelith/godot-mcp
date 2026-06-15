@@ -425,6 +425,14 @@ async function runAlwaysSmoke({ godotPathForServer }) {
       'UNSAFE_SCENE_PATH'
     );
     logPass('capture_scene_preview unsafe scenePath');
+
+    await expectStructuredError(
+      client,
+      'capture_scene_preview',
+      { projectPath: process.cwd(), scenePath: 'scenes/Main.tscn', includeImageContent: true, maxImageBytes: 0 },
+      'INVALID_MAX_IMAGE_BYTES'
+    );
+    logPass('capture_scene_preview invalid maxImageBytes');
   } finally {
     await client.close();
   }
@@ -495,6 +503,7 @@ async function runIntegrationSmoke({ godotPath }) {
       width: 320,
       height: 180,
       includeMetadata: true,
+      includeImageContent: true,
       maxWaitFrames: 2,
     });
     assert.equal(preview.parsed?.success, true, JSON.stringify(preview.parsed, null, 2));
@@ -502,6 +511,33 @@ async function runIntegrationSmoke({ godotPath }) {
     assert.ok(existsSync(godotResourceToFilePath(projectRoot, preview.parsed.previewPath)), 'preview PNG should exist');
     assert.ok(preview.parsed?.metadataPath);
     assert.ok(existsSync(godotResourceToFilePath(projectRoot, preview.parsed.metadataPath)), 'preview metadata JSON should exist');
+    assert.equal(preview.parsed?.imageContent?.included, true, JSON.stringify(preview.parsed?.imageContent, null, 2));
+    assert.equal(preview.parsed?.imageContent?.mimeType, 'image/png');
+    assert.ok(preview.parsed?.imageContent?.sizeBytes > 0);
+    const previewImageContent = preview.raw?.content?.find((item) => item.type === 'image');
+    assert.equal(previewImageContent?.mimeType, 'image/png');
+    assert.match(previewImageContent?.data || '', /^[A-Za-z0-9+/]+={0,2}$/);
+    assert.ok(previewImageContent?.data?.length > 0, 'embedded preview image data should be non-empty');
+
+    if (preview.parsed.imageContent.sizeBytes > 1024) {
+      const cappedPreview = await client.callTool('capture_scene_preview', {
+        projectPath: projectRoot,
+        scenePath: 'scenes/Main.tscn',
+        fileName: 'main_smoke_preview_capped',
+        width: 320,
+        height: 180,
+        includeMetadata: false,
+        includeImageContent: true,
+        maxImageBytes: 1024,
+        maxWaitFrames: 2,
+      });
+      assert.equal(cappedPreview.parsed?.success, true, JSON.stringify(cappedPreview.parsed, null, 2));
+      assert.equal(cappedPreview.parsed?.imageContent?.included, false);
+      assert.equal(cappedPreview.parsed?.imageContent?.reason, 'IMAGE_CONTENT_TOO_LARGE');
+      assert.ok(cappedPreview.parsed?.warnings?.some((warning) => warning.code === 'IMAGE_CONTENT_TOO_LARGE'));
+      assert.equal(cappedPreview.raw?.content?.some((item) => item.type === 'image'), false);
+    }
+
     assert.equal(sha256File(scenePath), originalSceneHash, 'capture_scene_preview should not modify the scene file');
     assertOnlyAllowedDiff(diffSnapshots(previewBefore, snapshotProjectFiles(projectRoot)), ['.godot_mcp/previews'], 'capture_scene_preview');
     logPass('capture_scene_preview');

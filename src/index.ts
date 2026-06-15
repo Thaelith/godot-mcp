@@ -141,6 +141,7 @@ class GodotServer {
     'create_checkpoint': 'createCheckpoint',
     'restore_on_failure': 'restoreOnFailure',
     'include_metadata': 'includeMetadata',
+    'include_image_content': 'includeImageContent',
     'include_missing_metadata': 'includeMissingMetadata',
     'include_scenes': 'includeScenes',
     'include_asset_summary': 'includeAssetSummary',
@@ -172,6 +173,7 @@ class GodotServer {
     'max_results': 'maxResults',
     'max_depth': 'maxDepth',
     'max_wait_frames': 'maxWaitFrames',
+    'max_image_bytes': 'maxImageBytes',
     'include_properties': 'includeProperties',
     'include_scripts': 'includeScripts',
     'include_groups': 'includeGroups',
@@ -3549,6 +3551,14 @@ class GodotServer {
                 type: 'boolean',
                 description: 'Whether to write adjacent JSON metadata (default: true)',
               },
+              includeImageContent: {
+                type: 'boolean',
+                description: 'Whether to append the generated PNG as MCP image content (default: false)',
+              },
+              maxImageBytes: {
+                type: 'number',
+                description: 'Maximum PNG bytes to embed when includeImageContent is true (default: 1500000, max: 5000000)',
+              },
               overwrite: {
                 type: 'boolean',
                 description: 'Whether to overwrite an existing preview with the same sanitized name (default: false)',
@@ -5888,7 +5898,7 @@ class GodotServer {
       );
     }
 
-    const booleanOptions = ['transparent', 'includeMetadata', 'overwrite'];
+    const booleanOptions = ['transparent', 'includeMetadata', 'includeImageContent', 'overwrite'];
     for (const option of booleanOptions) {
       if (args[option] !== undefined && typeof args[option] !== 'boolean') {
         return this.captureScenePreviewErrorResponse(
@@ -5955,8 +5965,28 @@ class GodotServer {
       }
     }
 
+    const maxImageBytesRequested = args.maxImageBytes !== undefined ? args.maxImageBytes : null;
+    let maxImageBytesApplied = 1500000;
+    let maxImageBytesClamped = false;
+    if (args.maxImageBytes !== undefined) {
+      if (typeof args.maxImageBytes !== 'number' || !Number.isFinite(args.maxImageBytes) || args.maxImageBytes < 1024) {
+        return this.captureScenePreviewErrorResponse(
+          'INVALID_MAX_IMAGE_BYTES',
+          'maxImageBytes must be a number between 1024 and 5000000.'
+        );
+      }
+
+      if (args.maxImageBytes > 5000000) {
+        maxImageBytesApplied = 5000000;
+        maxImageBytesClamped = true;
+      } else {
+        maxImageBytesApplied = Math.floor(args.maxImageBytes);
+      }
+    }
+
     const transparent = args.transparent !== undefined ? args.transparent : false;
     const includeMetadata = args.includeMetadata !== undefined ? args.includeMetadata : true;
+    const includeImageContent = args.includeImageContent !== undefined ? args.includeImageContent : false;
     const overwrite = args.overwrite !== undefined ? args.overwrite : false;
 
     try {
@@ -6145,13 +6175,95 @@ class GodotServer {
         );
       }
 
+      parsedResult.summary = {
+        ...(parsedResult.summary || {}),
+        maxImageBytesRequested,
+        maxImageBytesApplied,
+        maxImageBytesClamped,
+      };
+
+      const content: any[] = [];
+      if (parsedResult.success === true && includeImageContent) {
+        parsedResult.imageContent = {
+          included: false,
+          reason: null,
+          sizeBytes: null,
+          maxImageBytesApplied,
+        };
+
+        const addImageWarning = (code: string, message: string) => {
+          if (!Array.isArray(parsedResult.warnings)) {
+            parsedResult.warnings = [];
+          }
+          parsedResult.warnings.push({
+            severity: 'warning',
+            code,
+            message,
+          });
+          parsedResult.imageContent = {
+            included: false,
+            reason: code,
+            sizeBytes: parsedResult.imageContent?.sizeBytes ?? null,
+            maxImageBytesApplied,
+          };
+        };
+
+        try {
+          if (typeof parsedResult.previewPath !== 'string' || !parsedResult.previewPath.startsWith('res://')) {
+            addImageWarning('IMAGE_CONTENT_UNSAFE_PATH', 'Preview was captured but not embedded because the returned preview path was unsafe.');
+          } else if (extname(parsedResult.previewPath).toLowerCase() !== '.png') {
+            addImageWarning('IMAGE_CONTENT_NOT_PNG', 'Preview was captured but not embedded because the returned preview path was not a PNG.');
+          } else {
+            const previewRelativeFromResult = parsedResult.previewPath.slice('res://'.length).replace(/\\/g, '/');
+            const previewPathFromResult = resolve(projectRoot, previewRelativeFromResult);
+            if (
+              !this.isPathInside(projectRoot, previewPathFromResult) ||
+              !this.isPathInside(realOutputDirPath, previewPathFromResult)
+            ) {
+              addImageWarning('IMAGE_CONTENT_UNSAFE_PATH', 'Preview was captured but not embedded because the PNG path was outside the allowed output directory.');
+            } else if (!existsSync(previewPathFromResult)) {
+              addImageWarning('IMAGE_CONTENT_READ_FAILED', 'Preview was captured but not embedded because the PNG file could not be found.');
+            } else {
+              const previewImageStats = lstatSync(previewPathFromResult);
+              if (previewImageStats.isSymbolicLink()) {
+                addImageWarning('IMAGE_CONTENT_UNSAFE_PATH', 'Preview was captured but not embedded because the PNG file was a symbolic link.');
+              } else if (!previewImageStats.isFile()) {
+                addImageWarning('IMAGE_CONTENT_READ_FAILED', 'Preview was captured but not embedded because the PNG path was not a regular file.');
+              } else if (previewImageStats.size > maxImageBytesApplied) {
+                parsedResult.imageContent = {
+                  included: false,
+                  reason: 'IMAGE_CONTENT_TOO_LARGE',
+                  sizeBytes: previewImageStats.size,
+                  maxImageBytesApplied,
+                };
+                addImageWarning('IMAGE_CONTENT_TOO_LARGE', 'Preview was captured but not embedded because it exceeds maxImageBytes.');
+              } else {
+                const imageBuffer = readFileSync(previewPathFromResult);
+                parsedResult.imageContent = {
+                  included: true,
+                  mimeType: 'image/png',
+                  sizeBytes: imageBuffer.length,
+                };
+                content.push({
+                  type: 'image',
+                  data: imageBuffer.toString('base64'),
+                  mimeType: 'image/png',
+                });
+              }
+            }
+          }
+        } catch {
+          addImageWarning('IMAGE_CONTENT_READ_FAILED', 'Preview was captured but not embedded because the PNG file could not be read.');
+        }
+      }
+
+      content.unshift({
+        type: 'text',
+        text: JSON.stringify(parsedResult, null, 2),
+      });
+
       return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(parsedResult, null, 2),
-          },
-        ],
+        content,
         ...(parsedResult.success === false ? { isError: true } : {}),
       };
     } catch (error: any) {
