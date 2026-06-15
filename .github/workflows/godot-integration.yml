@@ -1,0 +1,47 @@
+name: Godot Integration
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 0"
+
+jobs:
+  full-integration-smoke:
+    name: Full Godot smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Install Godot
+        env:
+          GODOT_VERSION: 4.6.2
+          GODOT_STATUS: stable
+        run: |
+          set -euo pipefail
+          GODOT_ZIP="Godot_v${GODOT_VERSION}-${GODOT_STATUS}_linux.x86_64.zip"
+          GODOT_URL="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-${GODOT_STATUS}/${GODOT_ZIP}"
+          GODOT_DIR="${RUNNER_TEMP}/godot"
+          mkdir -p "${GODOT_DIR}"
+          curl --fail --location --retry 3 --output "${GODOT_DIR}/${GODOT_ZIP}" "${GODOT_URL}"
+          unzip -q "${GODOT_DIR}/${GODOT_ZIP}" -d "${GODOT_DIR}"
+          GODOT_BIN="${GODOT_DIR}/Godot_v${GODOT_VERSION}-${GODOT_STATUS}_linux.x86_64"
+          chmod +x "${GODOT_BIN}"
+          "${GODOT_BIN}" --version
+          echo "GODOT_PATH=${GODOT_BIN}" >> "${GITHUB_ENV}"
+
+      - name: Full smoke tests
+        run: npm run smoke
