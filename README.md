@@ -257,6 +257,43 @@ The Godot MCP server uses a bundled GDScript approach for complex operations:
 
 The bundled script accepts operation type and parameters as JSON, allowing for flexible and dynamic operation execution without generating temporary files for each operation.
 
+## Regression Smoke Tests
+
+Run the lightweight MCP regression smoke suite with:
+
+```bash
+npm run smoke
+```
+
+`npm test` runs the same command. The script builds the TypeScript server first, creates a temporary Godot project under the OS temp directory, starts `build/index.js` over MCP stdio, lists tools, calls representative read-only/dry-run/writer/checkpoint/patch/context tools, and removes the temporary project when finished.
+
+Godot integration tests require a working Godot executable. Set it explicitly when needed:
+
+```bash
+GODOT_PATH=/path/to/godot npm run smoke
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:GODOT_PATH = "C:\path\to\Godot.exe"
+npm run smoke
+```
+
+If Godot is not available, the suite still verifies the server starts, required tools are registered, and TypeScript-side safety errors are returned for invalid project and unsafe scene paths. It prints `Godot not found; skipped integration tests` in that mode. When Godot is found, it runs the full integration flow.
+
+Current coverage includes:
+
+- tool registration for the expanded toolchain
+- `inspect_project_capabilities` and `inspect_scene_edit_context`
+- `scan_assets`, `get_asset_info`, `read_scene_tree`, `get_scene_layout`, and `validate_scene`
+- `dry_run_place_asset_in_scene`, `dry_run_align_nodes`, `dry_run_update_node_properties`, and `dry_run_scene_patch`
+- `place_asset_in_scene`, `align_nodes`, `update_node_properties`, and `apply_scene_patch`
+- `create_scene_checkpoint`, `list_scene_checkpoints`, and `restore_scene_checkpoint`
+- hash/snapshot checks that dry-run tools do not modify scene files, writer tools only touch the target scene and expected checkpoint files, and asset files remain unchanged
+
+The smoke client is implemented in `scripts/smoke-test.mjs` using built-in Node modules. It speaks the newline-delimited JSON-RPC framing used by this MCP SDK version.
+
 ## Project Capability Inspection
 
 ### `inspect_project_capabilities`

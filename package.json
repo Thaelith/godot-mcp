@@ -28,6 +28,8 @@
   ],
   "scripts": {
     "build": "tsc && node scripts/build.js",
+    "smoke": "npm run build && node scripts/smoke-test.mjs",
+    "test": "npm run smoke",
     "inspector": "npx @modelcontextprotocol/inspector build/index.js",
     "prepare": "npm run build",
     "watch": "tsc --watch"
