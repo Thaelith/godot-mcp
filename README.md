@@ -143,6 +143,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "align_nodes",
         "dry_run_place_asset_in_scene",
         "place_asset_in_scene",
+        "dry_run_update_node_properties",
         "validate_scene",
         "dry_run_scene_blueprint",
         "create_scene_from_blueprint",
@@ -1222,6 +1223,102 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Then call `dry_run_place_asset_in_scene` to confirm the plan is valid, call `place_asset_in_scene` with the same inputs, and verify with `read_scene_tree`/`get_scene_layout`/`validate_scene` that the new node was added and the scene still loads.
+
+### `dry_run_update_node_properties`
+
+Plans safe property updates for existing nodes in an existing scene without modifying, saving, importing, reimporting, or creating files. This was added after `place_asset_in_scene` and follows the same plan-first safety pattern: validate and normalize a plan first, then leave any future writer to apply only that normalized plan.
+
+Input example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "updates": [
+    {
+      "nodePath": "Room/Chair",
+      "properties": {
+        "scale": [1.5, 1.5],
+        "z_index": 5,
+        "visible": true
+      }
+    },
+    {
+      "nodePath": "Room/Label",
+      "properties": {
+        "text": "Ready"
+      }
+    }
+  ],
+  "includeCurrentValues": true,
+  "includeLayoutBefore": false,
+  "validateProperties": true,
+  "maxUpdates": 100,
+  "maxDepth": 100
+}
+```
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Room.tscn",
+  "valid": true,
+  "severity": "ok",
+  "summary": {
+    "updateCount": 2,
+    "plannedChangeCount": 3,
+    "errorCount": 0,
+    "warningCount": 0,
+    "infoCount": 0
+  },
+  "issues": [],
+  "plan": [
+    {
+      "updateIndex": 0,
+      "nodePath": "Room/Chair",
+      "nodeType": "Sprite2D",
+      "property": "scale",
+      "currentValue": [1, 1],
+      "proposedValue": [1.5, 1.5],
+      "valueType": "Vector2",
+      "reason": "Safe property update planned."
+    }
+  ],
+  "layoutBefore": null,
+  "limits": {
+    "maxUpdatesRequested": null,
+    "maxUpdatesApplied": 100,
+    "maxUpdatesClamped": false,
+    "maxDepthRequested": null,
+    "maxDepthApplied": 100,
+    "maxDepthClamped": false
+  }
+}
+```
+
+**Read-only:** the tool loads and instantiates the scene only to inspect it. It does not call setters, save scenes, create files, edit resources, attach scripts, import, or reimport anything.
+
+**Supported property allowlist:** `position`, `scale`, `rotation`, `rotation_degrees`, `z_index`, `visible`, `size`, `text`, `disabled`, `enabled`, `centered`, `flip_h`, `flip_v`, `offset`, `zoom`, `volume_db`, `autoplay`, `modulate`, `self_modulate`.
+
+**Always refused properties:** `script`, `owner`, `name`, `groups`, `signals`, `metadata`, `process_mode`, `pause_mode`, `texture`, `stream`, `mesh`, and `font`. Resource assignment properties are intentionally left to explicit asset-placement tools.
+
+**Current values:** when `includeCurrentValues` is true, current values are returned only when they can be safely converted to JSON (`Vector2`, `Vector3`, `Color`, numbers, booleans, and strings). Unavailable values produce `CURRENT_VALUE_UNAVAILABLE` warnings. No-op updates produce `NO_OP_PROPERTY_UPDATE` info issues and are skipped from the plan.
+
+**Limits:** `maxUpdates` defaults to `100`, rejects values below `1`, and clamps above `1000`. `maxDepth` defaults to `100`, rejects values below `1`, and clamps above `200`.
+
+**Difference from future `update_node_properties`:** this tool only returns a normalized plan and structured issues. A future writer should refuse plans with errors and apply only planned safe property changes, not raw user input.
+
+Manual test:
+
+```bash
+npm run build
+npx @modelcontextprotocol/inspector build/index.js
+```
+
+Then call `dry_run_update_node_properties` against an existing scene. Confirm safe updates produce a plan, dangerous fields such as `script` or `texture` produce `UNSUPPORTED_PROPERTY`, missing nodes produce `NODE_NOT_FOUND`, duplicate properties produce `DUPLICATE_PROPERTY_UPDATE`, and the scene file hash is unchanged.
 
 ### `validate_scene`
 

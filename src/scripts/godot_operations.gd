@@ -28,7 +28,7 @@ func _init():
     
     var operation = args[operation_index]
     var params_json = args[params_index]
-    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "dry_run_align_nodes" or operation == "align_nodes" or operation == "dry_run_place_asset_in_scene" or operation == "place_asset_in_scene" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
+    var quiet_output = operation == "read_scene_tree" or operation == "get_scene_layout" or operation == "dry_run_align_nodes" or operation == "align_nodes" or operation == "dry_run_place_asset_in_scene" or operation == "place_asset_in_scene" or operation == "dry_run_update_node_properties" or operation == "validate_scene" or operation == "get_asset_info" or operation == "dry_run_scene_blueprint" or operation == "create_scene_from_blueprint"
 
     if quiet_output:
         debug_mode = false
@@ -75,6 +75,8 @@ func _init():
             dry_run_place_asset_in_scene(params)
         "place_asset_in_scene":
             place_asset_in_scene(params)
+        "dry_run_update_node_properties":
+            dry_run_update_node_properties(params)
         "validate_scene":
             validate_scene(params)
         "get_asset_info":
@@ -3122,6 +3124,385 @@ func place_asset_in_scene(params):
         "limits": planned["limits"]
     }
     print(JSON.stringify(result))
+
+func update_node_properties_error(error_code, message):
+    return {
+        "success": false,
+        "error": error_code,
+        "message": message
+    }
+
+func update_node_properties_add_issue(issues, severity, code, message, update_index=-1, node_path=null, node_type=null, property_name=null, suggestion=null):
+    var issue = {
+        "severity": severity,
+        "code": code,
+        "message": message
+    }
+
+    if update_index != -1:
+        issue["updateIndex"] = update_index
+    if node_path != null:
+        issue["nodePath"] = node_path
+    if node_type != null:
+        issue["nodeType"] = node_type
+    if property_name != null:
+        issue["property"] = property_name
+    if suggestion != null:
+        issue["suggestion"] = suggestion
+
+    issues.append(issue)
+
+func update_node_properties_safe_properties():
+    return [
+        "position",
+        "scale",
+        "rotation",
+        "rotation_degrees",
+        "z_index",
+        "visible",
+        "size",
+        "text",
+        "disabled",
+        "enabled",
+        "centered",
+        "flip_h",
+        "flip_v",
+        "offset",
+        "zoom",
+        "volume_db",
+        "autoplay",
+        "modulate",
+        "self_modulate"
+    ]
+
+func update_node_properties_dangerous_properties():
+    return [
+        "script",
+        "owner",
+        "name",
+        "groups",
+        "signals",
+        "metadata",
+        "process_mode",
+        "pause_mode",
+        "texture",
+        "stream",
+        "mesh",
+        "font"
+    ]
+
+func update_node_properties_convert_current_value(value):
+    var value_type = typeof(value)
+    if value_type == TYPE_NIL:
+        return {"success": true, "value": null}
+    if value_type == TYPE_VECTOR2:
+        return {"success": true, "value": [value.x, value.y]}
+    if value_type == TYPE_VECTOR3:
+        return {"success": true, "value": [value.x, value.y, value.z]}
+    if value_type == TYPE_COLOR:
+        return {"success": true, "value": [value.r, value.g, value.b, value.a]}
+    if value_type == TYPE_INT or value_type == TYPE_FLOAT or value_type == TYPE_BOOL or value_type == TYPE_STRING:
+        return {"success": true, "value": value}
+    return {"success": false, "value": null}
+
+func update_node_properties_color_array(value):
+    if not dry_align_is_number_array_any_size(value, [3, 4]):
+        return null
+    if value.size() == 3:
+        return [value[0], value[1], value[2], 1]
+    return [value[0], value[1], value[2], value[3]]
+
+func update_node_properties_validate_value(node, property_name, value):
+    if property_name == "position" or property_name == "scale":
+        if node is Node3D:
+            if dry_run_is_number_array(value, 3):
+                return {"success": true, "value": [value[0], value[1], value[2]], "valueType": "Vector3"}
+            return {"success": false, "message": "Property " + property_name + " expects a 3D vector array.", "suggestion": "Use [x, y, z] for Node3D nodes."}
+        if node is Node2D or node is Control:
+            if dry_run_is_number_array(value, 2):
+                return {"success": true, "value": [value[0], value[1]], "valueType": "Vector2"}
+            return {"success": false, "message": "Property " + property_name + " expects a 2D vector array.", "suggestion": "Use [x, y] for Node2D or Control nodes."}
+        return {"success": false, "message": "Property " + property_name + " is only supported for Node2D, Control, or Node3D nodes.", "suggestion": "Use a node with a supported transform property."}
+
+    if property_name == "rotation":
+        if node is Node2D or node is Control:
+            if dry_run_is_number_value(value):
+                return {"success": true, "value": value, "valueType": "number"}
+            return {"success": false, "message": "Property rotation expects a number for 2D nodes.", "suggestion": "Use a numeric radians value."}
+        if node is Node3D:
+            return {"success": false, "message": "Property rotation is not supported for Node3D in this dry-run because it is vector-valued.", "suggestion": "Use rotation_degrees with [x, y, z] for Node3D nodes."}
+        return {"success": false, "message": "Property rotation is only supported for Node2D or Control nodes.", "suggestion": "Use a 2D node or Control node."}
+
+    if property_name == "rotation_degrees":
+        if node is Node3D:
+            if dry_run_is_number_array(value, 3):
+                return {"success": true, "value": [value[0], value[1], value[2]], "valueType": "Vector3"}
+            return {"success": false, "message": "Property rotation_degrees expects a 3D vector array for Node3D nodes.", "suggestion": "Use [x, y, z] degrees for Node3D nodes."}
+        if node is Node2D or node is Control:
+            if dry_run_is_number_value(value):
+                return {"success": true, "value": value, "valueType": "number"}
+            return {"success": false, "message": "Property rotation_degrees expects a number for 2D nodes.", "suggestion": "Use a numeric degrees value."}
+        return {"success": false, "message": "Property rotation_degrees is only supported for Node2D, Control, or Node3D nodes.", "suggestion": "Use a node with a supported rotation property."}
+
+    if property_name == "z_index":
+        if not (node is CanvasItem):
+            return {"success": false, "message": "Property z_index is only supported for CanvasItem nodes.", "suggestion": "Use z_index only on Node2D, Control, or other CanvasItem nodes."}
+        if dry_run_is_number_value(value):
+            return {"success": true, "value": value, "valueType": "number"}
+        return {"success": false, "message": "Property z_index expects a number.", "suggestion": "Use a numeric value."}
+
+    if property_name == "visible":
+        if typeof(value) == TYPE_BOOL:
+            return {"success": true, "value": value, "valueType": "boolean"}
+        return {"success": false, "message": "Property visible expects a boolean.", "suggestion": "Use true or false."}
+
+    if property_name == "size":
+        if not (node is Control):
+            return {"success": false, "message": "Property size is only supported for Control nodes in this dry-run.", "suggestion": "Use [x, y] size on Control-like nodes."}
+        if dry_run_is_number_array(value, 2):
+            return {"success": true, "value": [value[0], value[1]], "valueType": "Vector2"}
+        return {"success": false, "message": "Property size expects a 2D vector array.", "suggestion": "Use [x, y]."}
+
+    if property_name == "text":
+        if typeof(value) == TYPE_STRING:
+            return {"success": true, "value": value, "valueType": "string"}
+        return {"success": false, "message": "Property text expects a string.", "suggestion": "Use a string value."}
+
+    if property_name == "disabled" or property_name == "enabled" or property_name == "centered" or property_name == "flip_h" or property_name == "flip_v" or property_name == "autoplay":
+        if typeof(value) == TYPE_BOOL:
+            return {"success": true, "value": value, "valueType": "boolean"}
+        return {"success": false, "message": "Property " + property_name + " expects a boolean.", "suggestion": "Use true or false."}
+
+    if property_name == "offset" or property_name == "zoom":
+        if dry_run_is_number_array(value, 2):
+            return {"success": true, "value": [value[0], value[1]], "valueType": "Vector2"}
+        return {"success": false, "message": "Property " + property_name + " expects a 2D vector array.", "suggestion": "Use [x, y]."}
+
+    if property_name == "volume_db":
+        if dry_run_is_number_value(value):
+            return {"success": true, "value": value, "valueType": "number"}
+        return {"success": false, "message": "Property volume_db expects a number.", "suggestion": "Use a numeric decibel value."}
+
+    if property_name == "modulate" or property_name == "self_modulate":
+        if not (node is CanvasItem):
+            return {"success": false, "message": "Property " + property_name + " is only supported for CanvasItem nodes.", "suggestion": "Use color modulation only on Node2D, Control, or other CanvasItem nodes."}
+        var color_value = update_node_properties_color_array(value)
+        if color_value != null:
+            return {"success": true, "value": color_value, "valueType": "Color"}
+        return {"success": false, "message": "Property " + property_name + " expects a color array.", "suggestion": "Use [r, g, b] or [r, g, b, a]."}
+
+    return {"success": false, "message": "Property is not supported by this dry-run.", "suggestion": "Use one of the documented safe properties."}
+
+func update_node_properties_values_equal(a, b):
+    if typeof(a) == TYPE_ARRAY and typeof(b) == TYPE_ARRAY:
+        if a.size() != b.size():
+            return false
+        for index in range(a.size()):
+            if not update_node_properties_values_equal(a[index], b[index]):
+                return false
+        return true
+    if dry_run_is_number_value(a) and dry_run_is_number_value(b):
+        return abs(float(a) - float(b)) <= 0.000001
+    return a == b
+
+func update_node_properties_finish_result(project_path, scene_path, update_count, issues, plan, include_plan, include_layout_before, layout_data, limits):
+    var counts = dry_align_issue_counts(issues)
+    var severity = dry_align_severity_from_counts(counts)
+    return {
+        "success": true,
+        "projectPath": project_path,
+        "scenePath": scene_path,
+        "valid": counts["errorCount"] == 0,
+        "severity": severity,
+        "summary": {
+            "updateCount": update_count,
+            "plannedChangeCount": plan.size(),
+            "errorCount": counts["errorCount"],
+            "warningCount": counts["warningCount"],
+            "infoCount": counts["infoCount"]
+        },
+        "issues": issues,
+        "plan": plan if include_plan else [],
+        "layoutBefore": dry_align_compact_layout_before(layout_data["nodes"], layout_data["sceneBounds"], "visual") if include_layout_before else null,
+        "limits": limits
+    }
+
+func dry_run_update_node_properties(params):
+    if not params.has("scene_path"):
+        print(JSON.stringify(update_node_properties_error("MISSING_SCENE_PATH", "scene_path is required.")))
+        return
+    if not params.has("updates") or typeof(params.updates) != TYPE_ARRAY or params.updates.is_empty():
+        print(JSON.stringify(update_node_properties_error("INVALID_UPDATE", "updates must be a non-empty array.")))
+        return
+
+    var scene_path = normalize_resource_scene_path(params.scene_path)
+    var project_path = params.project_path if params.has("project_path") else ProjectSettings.globalize_path("res://")
+    var updates = params.updates
+    var include_plan = params.include_plan if params.has("include_plan") else true
+    var include_current_values = params.include_current_values if params.has("include_current_values") else true
+    var include_layout_before = params.include_layout_before if params.has("include_layout_before") else false
+    var validate_properties = params.validate_properties if params.has("validate_properties") else true
+    var max_updates = int(params.max_updates) if params.has("max_updates") else 100
+    var max_depth = int(params.max_depth) if params.has("max_depth") else 100
+    var max_updates_requested = params.max_updates_requested if params.has("max_updates_requested") else null
+    var max_updates_clamped = params.max_updates_clamped if params.has("max_updates_clamped") else false
+    var max_depth_requested = params.max_depth_requested if params.has("max_depth_requested") else null
+    var max_depth_clamped = params.max_depth_clamped if params.has("max_depth_clamped") else false
+
+    if max_updates < 1:
+        print(JSON.stringify(update_node_properties_error("INVALID_MAX_UPDATES", "maxUpdates must be a number between 1 and 1000.")))
+        return
+    if max_depth < 1:
+        print(JSON.stringify(update_node_properties_error("INVALID_MAX_DEPTH", "maxDepth must be a number between 1 and 200.")))
+        return
+    if max_updates > 1000:
+        max_updates = 1000
+        max_updates_clamped = true
+    if max_depth > 200:
+        max_depth = 200
+        max_depth_clamped = true
+
+    var limits = {
+        "maxUpdatesRequested": max_updates_requested,
+        "maxUpdatesApplied": max_updates,
+        "maxUpdatesClamped": max_updates_clamped,
+        "maxDepthRequested": max_depth_requested,
+        "maxDepthApplied": max_depth,
+        "maxDepthClamped": max_depth_clamped
+    }
+
+    if not FileAccess.file_exists(scene_path):
+        print(JSON.stringify(update_node_properties_error("SCENE_PATH_NOT_FOUND", "Scene file does not exist: " + scene_path)))
+        return
+
+    var scene_resource = ResourceLoader.load(scene_path)
+    if scene_resource == null or not (scene_resource is PackedScene):
+        print(JSON.stringify(update_node_properties_error("SCENE_LOAD_FAILED", "Failed to load scene as PackedScene: " + scene_path)))
+        return
+
+    var scene_root = scene_resource.instantiate()
+    if scene_root == null:
+        print(JSON.stringify(update_node_properties_error("SCENE_INSTANTIATE_FAILED", "Failed to instantiate scene: " + scene_path)))
+        return
+
+    var issues = []
+    var plan = []
+    var plan_index_by_key = {}
+    var seen_update_keys = {}
+    var layout_data = dry_align_build_layout(scene_root, max_depth)
+    var node_by_path = layout_data["nodeByPath"]
+    var safe_properties = update_node_properties_safe_properties()
+    var dangerous_properties = update_node_properties_dangerous_properties()
+
+    if updates.size() > max_updates:
+        update_node_properties_add_issue(
+            issues,
+            "error",
+            "UPDATE_TOO_LARGE",
+            "Number of update objects exceeds maxUpdates.",
+            -1,
+            null,
+            null,
+            null,
+            "Reduce updates or increase maxUpdates up to the supported cap."
+        )
+
+    var process_count = min(updates.size(), max_updates)
+    for update_index in range(process_count):
+        var update = updates[update_index]
+        if typeof(update) != TYPE_DICTIONARY:
+            update_node_properties_add_issue(issues, "error", "INVALID_UPDATE", "Each update must be an object.", update_index)
+            continue
+
+        var raw_node_path = dry_run_get_value(update, ["nodePath", "node_path"], null)
+        var normalized_node_path = dry_run_normalize_scene_node_path(raw_node_path)
+        if normalized_node_path.has("error"):
+            update_node_properties_add_issue(issues, "error", "INVALID_NODE_PATH", normalized_node_path["error"], update_index, str(raw_node_path), null, null, "Use read_scene_tree or get_scene_layout to inspect valid node paths.")
+            continue
+
+        var node_path = normalized_node_path["path"]
+        if not node_by_path.has(node_path):
+            update_node_properties_add_issue(issues, "error", "NODE_NOT_FOUND", "Target node was not found in the scene.", update_index, node_path, null, null, "Use read_scene_tree or get_scene_layout to inspect valid node paths.")
+            continue
+
+        var node = node_by_path[node_path]
+        var node_type = node.get_class()
+        var properties = dry_run_get_value(update, ["properties"], null)
+        if typeof(properties) != TYPE_DICTIONARY:
+            update_node_properties_add_issue(issues, "error", "INVALID_UPDATE", "properties is required and must be an object.", update_index, node_path, node_type)
+            continue
+        if properties.is_empty():
+            update_node_properties_add_issue(issues, "error", "INVALID_UPDATE", "properties must not be empty.", update_index, node_path, node_type)
+            continue
+
+        for raw_property_name in properties.keys():
+            var property_name = str(raw_property_name).strip_edges()
+            var value = properties[raw_property_name]
+            if property_name.is_empty():
+                update_node_properties_add_issue(issues, "warning", "UNKNOWN_PROPERTY", "Empty property name was skipped.", update_index, node_path, node_type, property_name, "Use a documented safe property name.")
+                continue
+
+            if dangerous_properties.has(property_name):
+                update_node_properties_add_issue(issues, "error", "UNSUPPORTED_PROPERTY", "Property " + property_name + " is not supported by this dry-run.", update_index, node_path, node_type, property_name, "Use explicit future tools for scripts, resources, ownership, groups, signals, metadata, or process settings.")
+                continue
+
+            if not safe_properties.has(property_name):
+                update_node_properties_add_issue(issues, "warning", "UNKNOWN_PROPERTY", "Unknown property was skipped by the update planner.", update_index, node_path, node_type, property_name, "Only the documented safe property allowlist is planned.")
+                continue
+
+            var has_property = create_scene_blueprint_node_has_property(node, property_name)
+            if validate_properties and not has_property:
+                update_node_properties_add_issue(issues, "error", "PROPERTY_NOT_AVAILABLE_ON_NODE", "Property is not available on this node.", update_index, node_path, node_type, property_name, "Use properties supported by the target node type.")
+                continue
+
+            var validated = update_node_properties_validate_value(node, property_name, value)
+            if not validated["success"]:
+                update_node_properties_add_issue(issues, "error", "INVALID_PROPERTY_VALUE", validated["message"], update_index, node_path, node_type, property_name, validated["suggestion"] if validated.has("suggestion") else null)
+                continue
+
+            var current_value = null
+            var current_value_available = false
+            if include_current_values:
+                if has_property:
+                    var converted_current = update_node_properties_convert_current_value(node.get(property_name))
+                    current_value = converted_current["value"]
+                    current_value_available = converted_current["success"]
+                    if not current_value_available:
+                        update_node_properties_add_issue(issues, "warning", "CURRENT_VALUE_UNAVAILABLE", "Current property value could not be converted safely.", update_index, node_path, node_type, property_name, "The proposed value is still included in the plan.")
+                else:
+                    update_node_properties_add_issue(issues, "warning", "CURRENT_VALUE_UNAVAILABLE", "Current property value is unavailable because the property was not found on the node.", update_index, node_path, node_type, property_name, "Enable validateProperties to reject unavailable properties.")
+
+            var proposed_value = validated["value"]
+            if include_current_values and current_value_available and update_node_properties_values_equal(current_value, proposed_value):
+                update_node_properties_add_issue(issues, "info", "NO_OP_PROPERTY_UPDATE", "Proposed value matches the current value; no change was planned.", update_index, node_path, node_type, property_name)
+                continue
+
+            var key = node_path + "\u001f" + property_name
+            if seen_update_keys.has(key):
+                update_node_properties_add_issue(issues, "warning", "DUPLICATE_PROPERTY_UPDATE", "The same node/property was updated multiple times; the last proposed value is kept in the final plan.", update_index, node_path, node_type, property_name)
+            seen_update_keys[key] = true
+
+            var plan_entry = {
+                "updateIndex": update_index,
+                "nodePath": node_path,
+                "nodeType": node_type,
+                "property": property_name,
+                "proposedValue": proposed_value,
+                "valueType": validated["valueType"],
+                "reason": "Safe property update planned."
+            }
+            if include_current_values:
+                plan_entry["currentValue"] = current_value
+
+            if plan_index_by_key.has(key):
+                plan[plan_index_by_key[key]] = plan_entry
+            else:
+                plan_index_by_key[key] = plan.size()
+                plan.append(plan_entry)
+
+    var result = update_node_properties_finish_result(project_path, scene_path, updates.size(), issues, plan, include_plan, include_layout_before, layout_data, limits)
+    print(JSON.stringify(result))
+    scene_root.free()
 
 func is_nearly_zero(value):
     return abs(value) <= 0.0001

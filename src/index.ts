@@ -163,7 +163,9 @@ class GodotServer {
     'include_layout_before': 'includeLayoutBefore',
     'include_layout_after': 'includeLayoutAfter',
     'include_asset_info': 'includeAssetInfo',
+    'include_current_values': 'includeCurrentValues',
     'max_operations': 'maxOperations',
+    'max_updates': 'maxUpdates',
     'asset_path': 'assetPath',
     'asset_paths': 'assetPaths',
     'asset_property': 'assetProperty',
@@ -454,6 +456,31 @@ class GodotServer {
    */
   private createPlaceAssetInSceneErrorResponse(error: string, message: string): any {
     console.error(`[SERVER] place_asset_in_scene error response: ${error}: ${message}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error,
+              message,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  /**
+   * Create a dry_run_update_node_properties-specific JSON error response while preserving MCP text content style.
+   */
+  private createDryRunUpdateNodePropertiesErrorResponse(error: string, message: string): any {
+    console.error(`[SERVER] dry_run_update_node_properties error response: ${error}: ${message}`);
 
     return {
       content: [
@@ -1866,6 +1893,52 @@ class GodotServer {
           },
         },
         {
+          name: 'dry_run_update_node_properties',
+          description: 'Plan safe updates to existing scene node properties read-only without modifying or saving files',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Absolute path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Existing Godot scene path such as res://scenes/Room.tscn or scenes/Room.tscn',
+              },
+              updates: {
+                type: 'array',
+                description: 'Non-empty array of node property update objects',
+              },
+              includePlan: {
+                type: 'boolean',
+                description: 'Whether to return the normalized property update plan (default: true)',
+              },
+              includeCurrentValues: {
+                type: 'boolean',
+                description: 'Whether to include current property values when safely serializable (default: true)',
+              },
+              includeLayoutBefore: {
+                type: 'boolean',
+                description: 'Whether to include compact layout data before the proposed updates (default: false)',
+              },
+              validateProperties: {
+                type: 'boolean',
+                description: 'Whether to verify properties exist on target nodes before planning them (default: true)',
+              },
+              maxUpdates: {
+                type: 'number',
+                description: 'Maximum update objects to evaluate (default: 100, max: 1000)',
+              },
+              maxDepth: {
+                type: 'number',
+                description: 'Maximum scene tree depth to inspect (default: 100, max: 200)',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'updates'],
+          },
+        },
+        {
           name: 'dry_run_scene_blueprint',
           description: 'Validate and simulate a scene blueprint read-only without creating or modifying files',
           inputSchema: {
@@ -2217,6 +2290,8 @@ class GodotServer {
           return await this.handleDryRunPlaceAssetInScene(request.params.arguments);
         case 'place_asset_in_scene':
           return await this.handlePlaceAssetInScene(request.params.arguments);
+        case 'dry_run_update_node_properties':
+          return await this.handleDryRunUpdateNodeProperties(request.params.arguments);
         case 'dry_run_scene_blueprint':
           return await this.handleDryRunSceneBlueprint(request.params.arguments);
         case 'create_scene_from_blueprint':
@@ -5139,6 +5214,276 @@ class GodotServer {
       return this.createPlaceAssetInSceneErrorResponse(
         'PLACE_ASSET_IN_SCENE_FAILED',
         `Failed to place asset in scene: ${error?.message || 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * Handle the dry_run_update_node_properties tool
+   */
+  private async handleDryRunUpdateNodeProperties(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || typeof args.projectPath !== 'string') {
+      return this.createDryRunUpdateNodePropertiesErrorResponse(
+        'MISSING_PROJECT_PATH',
+        'projectPath is required and must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    if (!args.scenePath || typeof args.scenePath !== 'string') {
+      return this.createDryRunUpdateNodePropertiesErrorResponse(
+        'MISSING_SCENE_PATH',
+        'scenePath is required and must be a Godot scene path such as res://scenes/Room.tscn or scenes/Room.tscn.'
+      );
+    }
+
+    if (args.projectPath.includes('\0')) {
+      return this.createDryRunUpdateNodePropertiesErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must not contain null bytes.'
+      );
+    }
+
+    if (!isAbsolute(args.projectPath)) {
+      return this.createDryRunUpdateNodePropertiesErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    const scenePathResult = this.normalizeScenePath(args.scenePath);
+    if (scenePathResult.error) {
+      return this.createDryRunUpdateNodePropertiesErrorResponse(
+        'UNSAFE_SCENE_PATH',
+        scenePathResult.error
+      );
+    }
+
+    const sceneExtension = extname(scenePathResult.relativePath).toLowerCase();
+    if (!['.tscn', '.scn'].includes(sceneExtension)) {
+      return this.createDryRunUpdateNodePropertiesErrorResponse(
+        'SCENE_PATH_NOT_SCENE_FILE',
+        'scenePath must point to a .tscn or .scn scene file.'
+      );
+    }
+
+    if (args.updates === undefined) {
+      return this.createDryRunUpdateNodePropertiesErrorResponse(
+        'MISSING_UPDATES',
+        'updates is required and must be a non-empty array of node property update objects.'
+      );
+    }
+
+    if (!Array.isArray(args.updates)) {
+      return this.createDryRunUpdateNodePropertiesErrorResponse(
+        'INVALID_UPDATES',
+        'updates must be a non-empty array of node property update objects.'
+      );
+    }
+
+    if (args.updates.length === 0) {
+      return this.createDryRunUpdateNodePropertiesErrorResponse(
+        'INVALID_UPDATES',
+        'updates must contain at least one node property update object.'
+      );
+    }
+
+    const normalizedUpdates = args.updates.map((update: any) => {
+      if (typeof update !== 'object' || update === null || Array.isArray(update)) {
+        return update;
+      }
+
+      return {
+        ...update,
+        nodePath: typeof update.nodePath === 'string' ? update.nodePath : update.node_path,
+      };
+    });
+
+    for (let index = 0; index < normalizedUpdates.length; index += 1) {
+      const update = normalizedUpdates[index];
+      if (typeof update !== 'object' || update === null || Array.isArray(update)) {
+        return this.createDryRunUpdateNodePropertiesErrorResponse(
+          'INVALID_UPDATES',
+          `updates[${index}] must be an object.`
+        );
+      }
+
+      if (typeof update.nodePath !== 'string') {
+        return this.createDryRunUpdateNodePropertiesErrorResponse(
+          'INVALID_UPDATES',
+          `updates[${index}].nodePath is required and must be a string.`
+        );
+      }
+
+      if (typeof update.properties !== 'object' || update.properties === null || Array.isArray(update.properties)) {
+        return this.createDryRunUpdateNodePropertiesErrorResponse(
+          'INVALID_UPDATES',
+          `updates[${index}].properties is required and must be an object.`
+        );
+      }
+    }
+
+    const maxUpdatesRequested = args.maxUpdates !== undefined ? args.maxUpdates : null;
+    let maxUpdatesApplied = 100;
+    let maxUpdatesClamped = false;
+    if (args.maxUpdates !== undefined) {
+      if (typeof args.maxUpdates !== 'number' || !Number.isFinite(args.maxUpdates) || args.maxUpdates < 1) {
+        return this.createDryRunUpdateNodePropertiesErrorResponse(
+          'INVALID_MAX_UPDATES',
+          'maxUpdates must be a number between 1 and 1000.'
+        );
+      }
+
+      if (args.maxUpdates > 1000) {
+        maxUpdatesApplied = 1000;
+        maxUpdatesClamped = true;
+      } else {
+        maxUpdatesApplied = Math.floor(args.maxUpdates);
+      }
+    }
+
+    const maxDepthRequested = args.maxDepth !== undefined ? args.maxDepth : null;
+    let maxDepthApplied = 100;
+    let maxDepthClamped = false;
+    if (args.maxDepth !== undefined) {
+      if (typeof args.maxDepth !== 'number' || !Number.isFinite(args.maxDepth) || args.maxDepth < 1) {
+        return this.createDryRunUpdateNodePropertiesErrorResponse(
+          'INVALID_MAX_DEPTH',
+          'maxDepth must be a number between 1 and 200.'
+        );
+      }
+
+      if (args.maxDepth > 200) {
+        maxDepthApplied = 200;
+        maxDepthClamped = true;
+      } else {
+        maxDepthApplied = Math.floor(args.maxDepth);
+      }
+    }
+
+    const booleanOptions = ['includePlan', 'includeCurrentValues', 'includeLayoutBefore', 'validateProperties'];
+    for (const option of booleanOptions) {
+      if (args[option] !== undefined && typeof args[option] !== 'boolean') {
+        return this.createDryRunUpdateNodePropertiesErrorResponse(
+          'DRY_RUN_UPDATE_NODE_PROPERTIES_FAILED',
+          `${option} must be a boolean.`
+        );
+      }
+    }
+
+    const includePlan = args.includePlan !== undefined ? args.includePlan : true;
+    const includeCurrentValues = args.includeCurrentValues !== undefined ? args.includeCurrentValues : true;
+    const includeLayoutBefore = args.includeLayoutBefore !== undefined ? args.includeLayoutBefore : false;
+    const validateProperties = args.validateProperties !== undefined ? args.validateProperties : true;
+
+    try {
+      const normalizedProjectPath = resolve(args.projectPath);
+      if (!existsSync(normalizedProjectPath)) {
+        return this.createDryRunUpdateNodePropertiesErrorResponse(
+          'PROJECT_PATH_NOT_FOUND',
+          `Project path does not exist: ${args.projectPath}`
+        );
+      }
+
+      const projectStats = statSync(normalizedProjectPath);
+      if (!projectStats.isDirectory()) {
+        return this.createDryRunUpdateNodePropertiesErrorResponse(
+          'PROJECT_PATH_NOT_DIRECTORY',
+          `Project path is not a directory: ${args.projectPath}`
+        );
+      }
+
+      const projectRoot = realpathSync(normalizedProjectPath);
+      const projectFile = join(projectRoot, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createDryRunUpdateNodePropertiesErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          `Not a valid Godot project: ${args.projectPath}. The directory must contain a project.godot file.`
+        );
+      }
+
+      const sceneFilePath = resolve(projectRoot, scenePathResult.relativePath);
+      if (!this.isPathInside(projectRoot, sceneFilePath)) {
+        return this.createDryRunUpdateNodePropertiesErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must stay inside the Godot project directory.'
+        );
+      }
+
+      if (!existsSync(sceneFilePath)) {
+        return this.createDryRunUpdateNodePropertiesErrorResponse(
+          'SCENE_PATH_NOT_FOUND',
+          `Scene file does not exist: ${scenePathResult.resourcePath}`
+        );
+      }
+
+      const sceneFileStats = lstatSync(sceneFilePath);
+      if (sceneFileStats.isSymbolicLink()) {
+        return this.createDryRunUpdateNodePropertiesErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must not be a symbolic link.'
+        );
+      }
+
+      if (!sceneFileStats.isFile()) {
+        return this.createDryRunUpdateNodePropertiesErrorResponse(
+          'SCENE_PATH_NOT_FOUND',
+          `Scene path is not a file: ${scenePathResult.resourcePath}`
+        );
+      }
+
+      const realSceneFilePath = realpathSync(sceneFilePath);
+      if (!this.isPathInside(projectRoot, realSceneFilePath)) {
+        return this.createDryRunUpdateNodePropertiesErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must stay inside the Godot project directory.'
+        );
+      }
+
+      const params = {
+        projectPath: projectRoot.replace(/\\/g, '/'),
+        scenePath: scenePathResult.resourcePath,
+        updates: normalizedUpdates,
+        includePlan,
+        includeCurrentValues,
+        includeLayoutBefore,
+        validateProperties,
+        maxUpdates: maxUpdatesApplied,
+        maxUpdatesRequested,
+        maxUpdatesClamped,
+        maxDepth: maxDepthApplied,
+        maxDepthRequested,
+        maxDepthClamped,
+      };
+
+      const { stdout, stderr } = await this.executeOperation('dry_run_update_node_properties', params, projectRoot);
+      const parsedResult = this.extractLastJsonObject(stdout);
+
+      if (!parsedResult) {
+        const stderrText = stderr?.trim();
+        return this.createDryRunUpdateNodePropertiesErrorResponse(
+          'DRY_RUN_UPDATE_NODE_PROPERTIES_FAILED',
+          stderrText
+            ? `Godot did not return valid JSON for dry_run_update_node_properties. Stderr: ${stderrText}`
+            : 'Godot did not return valid JSON for dry_run_update_node_properties.'
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(parsedResult, null, 2),
+          },
+        ],
+        ...(parsedResult.success === false ? { isError: true } : {}),
+      };
+    } catch (error: any) {
+      return this.createDryRunUpdateNodePropertiesErrorResponse(
+        'DRY_RUN_UPDATE_NODE_PROPERTIES_FAILED',
+        `Failed to dry-run node property updates: ${error?.message || 'Unknown error'}`
       );
     }
   }
