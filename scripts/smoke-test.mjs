@@ -25,6 +25,7 @@ const expectedTools = [
   'inspect_scene_edit_context',
   'scan_assets',
   'get_asset_info',
+  'find_asset_usages',
   'read_scene_tree',
   'get_scene_layout',
   'capture_scene_preview',
@@ -178,6 +179,20 @@ function writeFixtureProject(projectRoot) {
   ].join('\n');
   writeFileSync(path.join(projectRoot, 'scenes', 'Main.tscn'), mainScene);
 
+  const usageProbeScene = [
+    '[gd_scene load_steps=3 format=3]',
+    '',
+    '[ext_resource type="Texture2D" path="res://assets/props/chair.png" id="1_chair"]',
+    '[ext_resource type="Texture2D" path="res://assets/missing.png" id="2_missing"]',
+    '',
+    '[node name="UsageProbe" type="Node2D"]',
+    '',
+    '[node name="ReferencedSprite" type="Sprite2D" parent="."]',
+    'texture = ExtResource("1_chair")',
+    '',
+  ].join('\n');
+  writeFileSync(path.join(projectRoot, 'scenes', 'UsageProbe.tscn'), usageProbeScene);
+
   const tableScene = [
     '[gd_scene format=3]',
     '',
@@ -187,6 +202,7 @@ function writeFixtureProject(projectRoot) {
   writeFileSync(path.join(projectRoot, 'assets', 'prefabs', 'Table.tscn'), tableScene);
 
   writeFileSync(path.join(projectRoot, 'assets', 'props', 'chair.png'), Buffer.from(tinyPngBase64, 'base64'));
+  writeFileSync(path.join(projectRoot, 'assets', 'props', 'unused.png'), Buffer.from(tinyPngBase64, 'base64'));
 }
 
 function writeNoAssetsProject(projectRoot) {
@@ -492,6 +508,25 @@ async function runAlwaysSmoke({ godotPathForServer }) {
       'CONFIRMATION_REQUIRED'
     );
     logPass('cleanup_generated_previews confirmation required');
+
+    await expectStructuredError(client, 'find_asset_usages', { projectPath: missingProject }, 'PROJECT_PATH_NOT_FOUND');
+    logPass('find_asset_usages invalid projectPath');
+
+    await expectStructuredError(
+      client,
+      'find_asset_usages',
+      { projectPath: process.cwd(), assetPath: '../outside.png' },
+      'UNSAFE_ASSET_PATH'
+    );
+    logPass('find_asset_usages unsafe assetPath');
+
+    await expectStructuredError(
+      client,
+      'find_asset_usages',
+      { projectPath: process.cwd(), maxResults: 0 },
+      'INVALID_MAX_RESULTS'
+    );
+    logPass('find_asset_usages invalid maxResults');
   } finally {
     await client.close();
   }
@@ -538,6 +573,44 @@ async function runIntegrationSmoke({ godotPath }) {
     assert.ok(assetInfo.parsed?.assets?.[0]?.exists);
     assert.equal(assetInfo.parsed?.assets?.[0]?.assetType, 'texture');
     logPass('get_asset_info');
+
+    const usageBefore = snapshotProjectFiles(projectRoot);
+    const assetUsages = await client.callTool('find_asset_usages', {
+      projectPath: projectRoot,
+      assetPath: 'assets/props/chair.png',
+    });
+    assert.equal(assetUsages.parsed?.success, true, JSON.stringify(assetUsages.parsed, null, 2));
+    assert.ok(
+      assetUsages.parsed?.matches?.some((match) => match.filePath === 'res://scenes/UsageProbe.tscn' && match.reference === 'res://assets/props/chair.png'),
+      'asset usage query should find UsageProbe.tscn'
+    );
+
+    const sceneUsages = await client.callTool('find_asset_usages', {
+      projectPath: projectRoot,
+      scenePath: 'scenes/UsageProbe.tscn',
+    });
+    assert.equal(sceneUsages.parsed?.success, true, JSON.stringify(sceneUsages.parsed, null, 2));
+    assert.ok(
+      sceneUsages.parsed?.sceneReferences?.references?.some((reference) => reference.assetPath === 'res://assets/props/chair.png' && reference.exists === true),
+      'scene usage query should list existing chair texture reference'
+    );
+    assert.ok(
+      sceneUsages.parsed?.sceneReferences?.missingReferences?.some((reference) => reference.reference === 'res://assets/missing.png'),
+      'scene usage query should report missing reference'
+    );
+
+    const projectUsages = await client.callTool('find_asset_usages', {
+      projectPath: projectRoot,
+      includeUnusedAssets: true,
+    });
+    assert.equal(projectUsages.parsed?.success, true, JSON.stringify(projectUsages.parsed, null, 2));
+    assert.ok(projectUsages.parsed?.referenceIndex?.uniqueAssetsReferenced >= 2, 'project-wide usage query should return reference index');
+    assert.ok(
+      projectUsages.parsed?.unusedAssets?.some((asset) => asset.assetPath === 'res://assets/props/unused.png'),
+      'project-wide usage query should include unused fixture asset'
+    );
+    assertNoDiff(diffSnapshots(usageBefore, snapshotProjectFiles(projectRoot)), 'find_asset_usages');
+    logPass('find_asset_usages');
 
     const readTree = await client.callTool('read_scene_tree', { projectPath: projectRoot, scenePath: 'scenes/Main.tscn', maxDepth: 20 });
     assert.equal(readTree.parsed?.success, true);

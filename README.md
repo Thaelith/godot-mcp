@@ -288,7 +288,7 @@ Current coverage includes:
 
 - tool registration for the expanded toolchain
 - `inspect_project_capabilities` and `inspect_scene_edit_context`
-- `scan_assets`, `get_asset_info`, `read_scene_tree`, `get_scene_layout`, `capture_scene_preview`, `capture_asset_preview`, `list_generated_previews`, `cleanup_generated_previews`, and `validate_scene`
+- `scan_assets`, `get_asset_info`, `find_asset_usages`, `read_scene_tree`, `get_scene_layout`, `capture_scene_preview`, `capture_asset_preview`, `list_generated_previews`, `cleanup_generated_previews`, and `validate_scene`
 - `dry_run_place_asset_in_scene`, `dry_run_align_nodes`, `dry_run_update_node_properties`, and `dry_run_scene_patch`
 - `place_asset_in_scene`, `align_nodes`, `update_node_properties`, and `apply_scene_patch`
 - `create_scene_checkpoint`, `list_scene_checkpoints`, and `restore_scene_checkpoint`
@@ -374,11 +374,11 @@ Output example:
     "latestCreatedAt": "2026-06-15T12:00:00Z"
   },
   "toolCapabilities": {
-    "readOnlyInspection": ["scan_assets", "get_asset_info", "read_scene_tree", "validate_scene", "get_scene_layout", "capture_scene_preview", "capture_asset_preview", "list_generated_previews", "list_scene_checkpoints", "inspect_project_capabilities"],
+    "readOnlyInspection": ["scan_assets", "get_asset_info", "find_asset_usages", "read_scene_tree", "validate_scene", "get_scene_layout", "capture_scene_preview", "capture_asset_preview", "list_generated_previews", "list_scene_checkpoints", "inspect_project_capabilities"],
     "dryRunPlanning": ["dry_run_scene_blueprint", "dry_run_align_nodes", "dry_run_place_asset_in_scene", "dry_run_update_node_properties", "dry_run_scene_patch"],
     "writers": ["create_scene_from_blueprint", "align_nodes", "place_asset_in_scene", "update_node_properties", "apply_scene_patch"],
     "safety": ["create_scene_checkpoint", "restore_scene_checkpoint"],
-    "recommendedTransactionFlow": ["inspect_project_capabilities", "scan_assets", "get_asset_info", "capture_asset_preview", "list_generated_previews", "read_scene_tree", "get_scene_layout", "dry_run_scene_patch", "apply_scene_patch", "capture_scene_preview", "validate_scene"]
+    "recommendedTransactionFlow": ["inspect_project_capabilities", "scan_assets", "get_asset_info", "find_asset_usages", "capture_asset_preview", "list_generated_previews", "read_scene_tree", "get_scene_layout", "dry_run_scene_patch", "apply_scene_patch", "capture_scene_preview", "validate_scene"]
   },
   "recommendations": [
     "Start with read_scene_tree and get_scene_layout for the main scene (res://scenes/Main.tscn).",
@@ -533,7 +533,7 @@ Output example:
     "Use dry_run_scene_patch before apply_scene_patch."
   ],
   "toolWorkflow": {
-    "safeEditFlow": ["inspect_scene_edit_context", "get_asset_info", "capture_asset_preview", "dry_run_scene_patch", "apply_scene_patch", "capture_scene_preview", "list_generated_previews", "validate_scene"],
+    "safeEditFlow": ["inspect_scene_edit_context", "get_asset_info", "find_asset_usages", "capture_asset_preview", "dry_run_scene_patch", "apply_scene_patch", "capture_scene_preview", "list_generated_previews", "validate_scene"],
     "rollbackFlow": ["list_scene_checkpoints", "restore_scene_checkpoint"]
   },
   "limits": {
@@ -1059,6 +1059,98 @@ npx @modelcontextprotocol/inspector build/index.js
 ```
 
 Then call `get_asset_info` from the inspector with a local Godot project path and one or more existing asset paths.
+
+### `find_asset_usages`
+
+Scans Godot text-like project files read-only to find `res://` asset references. Use it to answer where an asset is used, which assets a scene references, which references are missing, and which discovered assets appear unused by scene/resource files.
+
+Find where one asset is used:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "assetPath": "res://assets/props/chair.png",
+  "searchRoot": "res://",
+  "includeScenes": true,
+  "includeResources": true,
+  "includeScripts": false,
+  "includeProjectFile": true,
+  "includeMissingReferences": true,
+  "maxResults": 500,
+  "maxFilesScanned": 50000
+}
+```
+
+List assets referenced by one scene:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Main.tscn"
+}
+```
+
+Project-wide reference summary with unused candidates:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "includeUnusedAssets": true
+}
+```
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "query": {
+    "assetPath": "res://assets/props/chair.png",
+    "scenePath": null,
+    "searchRoot": "res://"
+  },
+  "summary": {
+    "filesScanned": 42,
+    "textFilesScanned": 8,
+    "matchesFound": 3,
+    "missingReferenceCount": 1,
+    "unusedAssetCandidate": false,
+    "truncated": false
+  },
+  "matches": [
+    {
+      "filePath": "res://scenes/Main.tscn",
+      "fileType": "scene",
+      "reference": "res://assets/props/chair.png",
+      "line": 12,
+      "context": "path=\"res://assets/props/chair.png\"",
+      "usageKind": "ext_resource"
+    }
+  ],
+  "sceneReferences": null,
+  "missingReferences": [],
+  "unusedAssets": null,
+  "referenceIndex": null,
+  "unresolvedUidReferences": [],
+  "limits": {
+    "maxResultsRequested": null,
+    "maxResultsApplied": 500,
+    "maxResultsClamped": false,
+    "maxFilesScannedRequested": null,
+    "maxFilesScannedApplied": 50000,
+    "maxFilesScannedClamped": false
+  }
+}
+```
+
+In project-wide mode, `referenceIndex` summarizes total references, unique referenced assets, and top referenced assets with compact `referencedBy` lists. When `includeUnusedAssets` is true, `unusedAssets` returns a heuristic list of asset files under the scan root that were not referenced by scanned scene/resource/project/script files.
+
+**Safety model:** this tool does not run Godot, import/reimport assets, execute scripts, parse script logic, or modify files. It skips `.git`, `.godot`, `.godot_mcp`, `.import`, `node_modules`, `build`, `dist`, and cache folders, refuses symlinks, stays inside `projectPath`, reads only selected Godot text-like files, and caps reads at 2 MiB per file.
+
+**Reference detection:** the first version focuses on path-based `res://` references in `.tscn`, text `.scn`, `.tres`, text `.res`, `project.godot`, and `.gd` only when `includeScripts` is true. It labels simple usage kinds such as `ext_resource`, `load_call`, `preload_call`, `project_setting`, `script_reference`, and `resource_path`. `uid://` references are reported as unresolved UID references when encountered, but full UID resolution is best-effort and not performed by this scanner.
+
+**Limitations:** binary `.scn` and `.res` files may be skipped as unreadable text. Unused assets are heuristic: dynamically loaded paths, editor-only import metadata, addon conventions, and UID-only references may not be reflected. Context snippets are compact and not full file contents.
 
 ## Scene Inspection
 

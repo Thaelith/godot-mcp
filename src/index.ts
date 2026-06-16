@@ -155,6 +155,7 @@ class GodotServer {
     'max_asset_folders': 'maxAssetFolders',
     'max_assets': 'maxAssets',
     'asset_root': 'assetRoot',
+    'search_root': 'searchRoot',
     'create_pre_restore_checkpoint': 'createPreRestoreCheckpoint',
     'pre_restore_checkpoint_name': 'preRestoreCheckpointName',
     'validate_after_restore': 'validateAfterRestore',
@@ -179,6 +180,7 @@ class GodotServer {
     'include_extensions': 'includeExtensions',
     'exclude_dirs': 'excludeDirs',
     'max_results': 'maxResults',
+    'max_files_scanned': 'maxFilesScanned',
     'max_depth': 'maxDepth',
     'max_wait_frames': 'maxWaitFrames',
     'max_image_bytes': 'maxImageBytes',
@@ -192,6 +194,9 @@ class GodotServer {
     'include_collision_bounds': 'includeCollisionBounds',
     'include_control_rects': 'includeControlRects',
     'include_resources': 'includeResources',
+    'include_project_file': 'includeProjectFile',
+    'include_unused_assets': 'includeUnusedAssets',
+    'include_missing_references': 'includeMissingReferences',
     'include_children': 'includeChildren',
     'include_warnings': 'includeWarnings',
     'bounds_source': 'boundsSource',
@@ -771,6 +776,31 @@ class GodotServer {
    */
   private cleanupGeneratedPreviewsErrorResponse(error: string, message: string): any {
     console.error(`[SERVER] cleanup_generated_previews error response: ${error}: ${message}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error,
+              message,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  /**
+   * Create a find_asset_usages-specific JSON error response while preserving MCP text content style.
+   */
+  private findAssetUsagesErrorResponse(error: string, message: string): any {
+    console.error(`[SERVER] find_asset_usages error response: ${error}: ${message}`);
 
     return {
       content: [
@@ -2372,6 +2402,71 @@ class GodotServer {
     return skippedNames.has(directoryName) || normalized === '.godot_mcp/checkpoints' || normalized.startsWith('.godot_mcp/checkpoints/');
   }
 
+  private findAssetUsageFileType(
+    relativePath: string,
+    includeScenes: boolean,
+    includeResources: boolean,
+    includeScripts: boolean,
+    includeProjectFile: boolean
+  ): 'scene' | 'resource' | 'script' | 'project' | null {
+    const normalized = relativePath.replace(/\\/g, '/');
+    const lowerPath = normalized.toLowerCase();
+    const extension = extname(lowerPath);
+
+    if (lowerPath === 'project.godot') {
+      return includeProjectFile ? 'project' : null;
+    }
+
+    if (includeScenes && ['.tscn', '.scn'].includes(extension)) {
+      return 'scene';
+    }
+
+    if (includeResources && ['.tres', '.res'].includes(extension)) {
+      return 'resource';
+    }
+
+    if (includeScripts && extension === '.gd') {
+      return 'script';
+    }
+
+    return null;
+  }
+
+  private findAssetUsageKind(line: string, fileType: string): string {
+    if (/^\s*\[ext_resource\b/i.test(line) || /\bExtResource\b/i.test(line)) {
+      return 'ext_resource';
+    }
+    if (/\bpreload\s*\(/i.test(line)) {
+      return 'preload_call';
+    }
+    if (/\bload\s*\(/i.test(line)) {
+      return 'load_call';
+    }
+    if (fileType === 'project') {
+      return 'project_setting';
+    }
+    if (fileType === 'script') {
+      return 'script_reference';
+    }
+    if (line.includes('res://')) {
+      return 'resource_path';
+    }
+    return 'unknown';
+  }
+
+  private compactAssetUsageContext(line: string): string {
+    const normalized = line.trim().replace(/\s+/g, ' ');
+    if (normalized.length <= 160) {
+      return normalized;
+    }
+    return `${normalized.slice(0, 157)}...`;
+  }
+
+  private isAssetUsageCandidate(relativePath: string): boolean {
+    const assetType = this.getAssetType(extname(relativePath).toLowerCase());
+    return ['texture', 'scene', 'model', 'audio', 'font', 'resource'].includes(assetType);
+  }
+
   private collectProjectInspectionFiles(projectRoot: string, mainScene: string | null): {
     sceneItems: any[];
     assetSummary: {
@@ -2706,6 +2801,7 @@ class GodotServer {
       readOnlyInspection: [
         'scan_assets',
         'get_asset_info',
+        'find_asset_usages',
         'read_scene_tree',
         'validate_scene',
         'get_scene_layout',
@@ -2737,6 +2833,7 @@ class GodotServer {
         'inspect_project_capabilities',
         'scan_assets',
         'get_asset_info',
+        'find_asset_usages',
         'capture_asset_preview',
         'list_generated_previews',
         'read_scene_tree',
@@ -3294,6 +3391,7 @@ class GodotServer {
       safeEditFlow: [
         'inspect_scene_edit_context',
         'get_asset_info',
+        'find_asset_usages',
         'capture_asset_preview',
         'dry_run_scene_patch',
         'apply_scene_patch',
@@ -4237,6 +4335,64 @@ class GodotServer {
               maxResults: {
                 type: 'number',
                 description: 'Maximum number of assets to return (default: 50, max: 200)',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'find_asset_usages',
+          description: 'Find res:// asset references across Godot scene/resource/project files in a safe read-only scan',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Absolute path to the Godot project directory',
+              },
+              assetPath: {
+                type: 'string',
+                description: 'Optional asset path to find usages for, such as res://assets/props/chair.png',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Optional scene path whose asset references should be listed',
+              },
+              searchRoot: {
+                type: 'string',
+                description: 'Project-relative root folder to scan (default: res://)',
+              },
+              includeScenes: {
+                type: 'boolean',
+                description: 'Whether to scan .tscn/.scn files (default: true)',
+              },
+              includeResources: {
+                type: 'boolean',
+                description: 'Whether to scan .tres/.res files when text-readable (default: true)',
+              },
+              includeScripts: {
+                type: 'boolean',
+                description: 'Whether to scan .gd files for load/preload paths without parsing logic (default: false)',
+              },
+              includeProjectFile: {
+                type: 'boolean',
+                description: 'Whether to scan project.godot (default: true)',
+              },
+              includeUnusedAssets: {
+                type: 'boolean',
+                description: 'Whether to return heuristic unused asset candidates (default: false)',
+              },
+              includeMissingReferences: {
+                type: 'boolean',
+                description: 'Whether to report missing res:// targets (default: true)',
+              },
+              maxResults: {
+                type: 'number',
+                description: 'Maximum result entries per returned list where applicable (default: 500, max: 5000)',
+              },
+              maxFilesScanned: {
+                type: 'number',
+                description: 'Maximum files to scan before truncating (default: 50000, max: 200000)',
               },
             },
             required: ['projectPath'],
@@ -5257,6 +5413,8 @@ class GodotServer {
           return await this.handleScanAssets(request.params.arguments);
         case 'get_asset_info':
           return await this.handleGetAssetInfo(request.params.arguments);
+        case 'find_asset_usages':
+          return await this.handleFindAssetUsages(request.params.arguments);
         case 'read_scene_tree':
           return await this.handleReadSceneTree(request.params.arguments);
         case 'get_scene_layout':
@@ -7979,6 +8137,597 @@ class GodotServer {
       return this.cleanupGeneratedPreviewsErrorResponse(
         'CLEANUP_GENERATED_PREVIEWS_FAILED',
         `Failed to cleanup generated previews: ${error?.message || 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * Handle the find_asset_usages tool
+   */
+  private async handleFindAssetUsages(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    const maxResultsRequested = args.maxResults !== undefined ? args.maxResults : null;
+    let maxResultsApplied = 500;
+    let maxResultsClamped = false;
+    if (args.maxResults !== undefined) {
+      if (typeof args.maxResults !== 'number' || !Number.isFinite(args.maxResults) || args.maxResults < 1) {
+        return this.findAssetUsagesErrorResponse(
+          'INVALID_MAX_RESULTS',
+          'maxResults must be a number between 1 and 5000.'
+        );
+      }
+
+      if (args.maxResults > 5000) {
+        maxResultsApplied = 5000;
+        maxResultsClamped = true;
+      } else {
+        maxResultsApplied = Math.floor(args.maxResults);
+      }
+    }
+
+    const maxFilesScannedRequested = args.maxFilesScanned !== undefined ? args.maxFilesScanned : null;
+    let maxFilesScannedApplied = 50000;
+    let maxFilesScannedClamped = false;
+    if (args.maxFilesScanned !== undefined) {
+      if (typeof args.maxFilesScanned !== 'number' || !Number.isFinite(args.maxFilesScanned) || args.maxFilesScanned < 1) {
+        return this.findAssetUsagesErrorResponse(
+          'INVALID_MAX_FILES_SCANNED',
+          'maxFilesScanned must be a number between 1 and 200000.'
+        );
+      }
+
+      if (args.maxFilesScanned > 200000) {
+        maxFilesScannedApplied = 200000;
+        maxFilesScannedClamped = true;
+      } else {
+        maxFilesScannedApplied = Math.floor(args.maxFilesScanned);
+      }
+    }
+
+    const booleanOptions = [
+      'includeScenes',
+      'includeResources',
+      'includeScripts',
+      'includeProjectFile',
+      'includeUnusedAssets',
+      'includeMissingReferences',
+    ];
+    for (const option of booleanOptions) {
+      if (args[option] !== undefined && typeof args[option] !== 'boolean') {
+        return this.findAssetUsagesErrorResponse(
+          'FIND_ASSET_USAGES_FAILED',
+          `${option} must be a boolean.`
+        );
+      }
+    }
+
+    const includeScenes = args.includeScenes !== undefined ? args.includeScenes : true;
+    const includeResources = args.includeResources !== undefined ? args.includeResources : true;
+    const includeScripts = args.includeScripts !== undefined ? args.includeScripts : false;
+    const includeProjectFile = args.includeProjectFile !== undefined ? args.includeProjectFile : true;
+    const includeUnusedAssets = args.includeUnusedAssets !== undefined ? args.includeUnusedAssets : false;
+    const includeMissingReferences = args.includeMissingReferences !== undefined ? args.includeMissingReferences : true;
+
+    if (!args.projectPath || typeof args.projectPath !== 'string') {
+      return this.findAssetUsagesErrorResponse(
+        'MISSING_PROJECT_PATH',
+        'projectPath is required and must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    if (args.projectPath.includes('\0')) {
+      return this.findAssetUsagesErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must not contain null bytes.'
+      );
+    }
+
+    if (!isAbsolute(args.projectPath)) {
+      return this.findAssetUsagesErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    let assetPathResult: { relativePath: string; resourcePath: string; error?: string } | null = null;
+    if (args.assetPath !== undefined) {
+      if (typeof args.assetPath !== 'string') {
+        return this.findAssetUsagesErrorResponse(
+          'UNSAFE_ASSET_PATH',
+          'assetPath must be a string when provided.'
+        );
+      }
+
+      assetPathResult = this.normalizeAssetPath(args.assetPath);
+      if (assetPathResult.error) {
+        return this.findAssetUsagesErrorResponse('UNSAFE_ASSET_PATH', assetPathResult.error);
+      }
+    }
+
+    let scenePathResult: { relativePath: string; resourcePath: string; error?: string } | null = null;
+    if (args.scenePath !== undefined) {
+      if (typeof args.scenePath !== 'string') {
+        return this.findAssetUsagesErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must be a string when provided.'
+        );
+      }
+
+      scenePathResult = this.normalizeScenePath(args.scenePath);
+      if (scenePathResult.error) {
+        return this.findAssetUsagesErrorResponse('UNSAFE_SCENE_PATH', scenePathResult.error);
+      }
+
+      const sceneExtension = extname(scenePathResult.relativePath).toLowerCase();
+      if (!['.tscn', '.scn'].includes(sceneExtension)) {
+        return this.findAssetUsagesErrorResponse(
+          'SCENE_PATH_NOT_SCENE_FILE',
+          'scenePath must point to a .tscn or .scn scene file.'
+        );
+      }
+    }
+
+    const rawSearchRoot = args.searchRoot === undefined ? 'res://' : args.searchRoot;
+    if (typeof rawSearchRoot !== 'string' || !rawSearchRoot.trim()) {
+      return this.findAssetUsagesErrorResponse(
+        'UNSAFE_SEARCH_ROOT',
+        'searchRoot must be a non-empty project-relative folder path when provided.'
+      );
+    }
+
+    const searchRootResult = this.normalizeScanRoot(rawSearchRoot);
+    if (searchRootResult.error) {
+      return this.findAssetUsagesErrorResponse(
+        'UNSAFE_SEARCH_ROOT',
+        searchRootResult.error.replace(/root path/g, 'searchRoot')
+      );
+    }
+
+    if (searchRootResult.relativeRoot && this.shouldSkipProjectInspectionDirectory(searchRootResult.relativeRoot)) {
+      return this.findAssetUsagesErrorResponse(
+        'UNSAFE_SEARCH_ROOT',
+        'searchRoot must not point to generated, cache, dependency, or VCS directories.'
+      );
+    }
+
+    try {
+      const normalizedProjectPath = resolve(args.projectPath);
+      if (!existsSync(normalizedProjectPath)) {
+        return this.findAssetUsagesErrorResponse(
+          'PROJECT_PATH_NOT_FOUND',
+          `Project path does not exist: ${args.projectPath}`
+        );
+      }
+
+      const projectStats = lstatSync(normalizedProjectPath);
+      if (projectStats.isSymbolicLink()) {
+        return this.findAssetUsagesErrorResponse(
+          'PROJECT_PATH_IS_SYMLINK',
+          'projectPath must not be a symbolic link.'
+        );
+      }
+
+      if (!projectStats.isDirectory()) {
+        return this.findAssetUsagesErrorResponse(
+          'PROJECT_PATH_NOT_DIRECTORY',
+          `Project path is not a directory: ${args.projectPath}`
+        );
+      }
+
+      const projectRoot = realpathSync(normalizedProjectPath);
+      const projectFile = join(projectRoot, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.findAssetUsagesErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          `Not a valid Godot project: ${args.projectPath}. The directory must contain a project.godot file.`
+        );
+      }
+
+      const projectFileStats = lstatSync(projectFile);
+      if (projectFileStats.isSymbolicLink() || !projectFileStats.isFile()) {
+        return this.findAssetUsagesErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          'project.godot must be a regular file and must not be a symbolic link.'
+        );
+      }
+
+      const searchRootPath = searchRootResult.relativeRoot
+        ? resolve(projectRoot, searchRootResult.relativeRoot)
+        : projectRoot;
+      if (!this.isPathInside(projectRoot, searchRootPath)) {
+        return this.findAssetUsagesErrorResponse(
+          'UNSAFE_SEARCH_ROOT',
+          'searchRoot must stay inside the Godot project directory.'
+        );
+      }
+
+      if (!existsSync(searchRootPath)) {
+        return this.findAssetUsagesErrorResponse(
+          'SEARCH_ROOT_NOT_FOUND',
+          `searchRoot does not exist: ${searchRootResult.scanRoot}`
+        );
+      }
+
+      const searchRootStats = lstatSync(searchRootPath);
+      if (searchRootStats.isSymbolicLink()) {
+        return this.findAssetUsagesErrorResponse(
+          'SEARCH_ROOT_IS_SYMLINK',
+          'searchRoot must not be a symbolic link.'
+        );
+      }
+
+      if (!searchRootStats.isDirectory()) {
+        return this.findAssetUsagesErrorResponse(
+          'UNSAFE_SEARCH_ROOT',
+          'searchRoot must point to a project-local directory.'
+        );
+      }
+
+      const realSearchRootPath = realpathSync(searchRootPath);
+      if (!this.isPathInside(projectRoot, realSearchRootPath)) {
+        return this.findAssetUsagesErrorResponse(
+          'UNSAFE_SEARCH_ROOT',
+          'Resolved searchRoot must stay inside the Godot project directory.'
+        );
+      }
+
+      if (scenePathResult) {
+        const sceneFilePath = resolve(projectRoot, scenePathResult.relativePath);
+        if (!this.isPathInside(projectRoot, sceneFilePath)) {
+          return this.findAssetUsagesErrorResponse(
+            'UNSAFE_SCENE_PATH',
+            'scenePath must stay inside the Godot project directory.'
+          );
+        }
+
+        if (existsSync(sceneFilePath)) {
+          const sceneFileStats = lstatSync(sceneFilePath);
+          if (sceneFileStats.isSymbolicLink()) {
+            return this.findAssetUsagesErrorResponse(
+              'UNSAFE_SCENE_PATH',
+              'scenePath must not be a symbolic link.'
+            );
+          }
+        }
+      }
+
+      const matches: any[] = [];
+      const sceneReferences: any[] = [];
+      const sceneMissingReferences: any[] = [];
+      const missingReferences: any[] = [];
+      const unresolvedUidReferences: any[] = [];
+      const discoveredAssets: any[] = [];
+      const discoveredAssetPaths = new Set<string>();
+      const referencedAssets = new Set<string>();
+      const referenceCounts = new Map<string, { count: number; referencedBy: Set<string> }>();
+      const seenReferenceLines = new Set<string>();
+      const seenMissingLines = new Set<string>();
+      const seenUidLines = new Set<string>();
+      const textFileSizeLimitBytes = 2 * 1024 * 1024;
+      const maxDepth = 16;
+      let filesScanned = 0;
+      let textFilesScanned = 0;
+      let matchesFound = 0;
+      let missingReferenceCount = 0;
+      let totalReferences = 0;
+      let truncated = false;
+
+      const addMatch = (record: any) => {
+        matchesFound += 1;
+        if (matches.length < maxResultsApplied) {
+          matches.push(record);
+        } else {
+          truncated = true;
+        }
+      };
+
+      const addMissing = (record: any) => {
+        missingReferenceCount += 1;
+        if (includeMissingReferences && missingReferences.length < maxResultsApplied) {
+          missingReferences.push(record);
+        } else if (includeMissingReferences) {
+          truncated = true;
+        }
+
+        if (scenePathResult && record.filePath === scenePathResult.resourcePath) {
+          if (sceneMissingReferences.length < maxResultsApplied) {
+            sceneMissingReferences.push(record);
+          } else {
+            truncated = true;
+          }
+        }
+      };
+
+      const addSceneReference = (record: any) => {
+        if (sceneReferences.length < maxResultsApplied) {
+          sceneReferences.push(record);
+        } else {
+          truncated = true;
+        }
+      };
+
+      const scanFile = (filePath: string, relativeFilePath: string, fileType: 'scene' | 'resource' | 'script' | 'project') => {
+        let fileStats;
+        try {
+          fileStats = lstatSync(filePath);
+          if (fileStats.isSymbolicLink() || !fileStats.isFile() || fileStats.size > textFileSizeLimitBytes) {
+            return;
+          }
+        } catch {
+          return;
+        }
+
+        const contents = this.readUtf8FilePrefix(filePath, textFileSizeLimitBytes);
+        if (!contents || contents.includes('\0')) {
+          return;
+        }
+
+        textFilesScanned += 1;
+        const fileResourcePath = `res://${relativeFilePath}`;
+        const lines = contents.split(/\r?\n/);
+
+        for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+          const line = lines[lineIndex];
+          const context = this.compactAssetUsageContext(line);
+          const usageKind = this.findAssetUsageKind(line, fileType);
+          const lineNumber = lineIndex + 1;
+
+          for (const uidMatch of line.matchAll(/uid:\/\/[A-Za-z0-9_]+/g)) {
+            const uid = uidMatch[0];
+            const uidKey = `${fileResourcePath}|${uid}|${lineNumber}`;
+            if (seenUidLines.has(uidKey)) {
+              continue;
+            }
+            seenUidLines.add(uidKey);
+            if (unresolvedUidReferences.length < maxResultsApplied) {
+              unresolvedUidReferences.push({
+                filePath: fileResourcePath,
+                uid,
+                line: lineNumber,
+                context,
+              });
+            } else {
+              truncated = true;
+            }
+          }
+
+          for (const referenceMatch of line.matchAll(/res:\/\/[^\s"'<>()[\]{},]+/g)) {
+            const rawReference = referenceMatch[0].replace(/[.;]+$/g, '');
+            const normalizedReference = this.normalizeAssetPath(rawReference);
+            if (normalizedReference.error) {
+              continue;
+            }
+
+            const reference = normalizedReference.resourcePath;
+            const referenceKey = `${fileResourcePath}|${reference}|${lineNumber}|${usageKind}`;
+            if (seenReferenceLines.has(referenceKey)) {
+              continue;
+            }
+            seenReferenceLines.add(referenceKey);
+
+            totalReferences += 1;
+            referencedAssets.add(reference);
+            const countEntry = referenceCounts.get(reference) || { count: 0, referencedBy: new Set<string>() };
+            countEntry.count += 1;
+            countEntry.referencedBy.add(fileResourcePath);
+            referenceCounts.set(reference, countEntry);
+
+            const baseRecord = {
+              filePath: fileResourcePath,
+              fileType,
+              reference,
+              line: lineNumber,
+              context,
+              usageKind,
+            };
+
+            if (
+              assetPathResult &&
+              reference === assetPathResult.resourcePath &&
+              (!scenePathResult || fileResourcePath === scenePathResult.resourcePath)
+            ) {
+              addMatch(baseRecord);
+            }
+
+            if (scenePathResult && fileResourcePath === scenePathResult.resourcePath) {
+              addSceneReference({
+                assetPath: reference,
+                exists: existsSync(resolve(projectRoot, normalizedReference.relativePath)),
+                line: lineNumber,
+                usageKind,
+              });
+            }
+
+            const targetPath = resolve(projectRoot, normalizedReference.relativePath);
+            if (!this.isPathInside(projectRoot, targetPath) || !existsSync(targetPath)) {
+              const missingKey = `${fileResourcePath}|${reference}|${lineNumber}`;
+              if (!seenMissingLines.has(missingKey)) {
+                seenMissingLines.add(missingKey);
+                addMissing({
+                  filePath: fileResourcePath,
+                  reference,
+                  line: lineNumber,
+                  context,
+                });
+              }
+            }
+          }
+        }
+      };
+
+      const walkDirectory = (directoryPath: string, relativeDirectory: string, depth: number) => {
+        if (truncated || depth > maxDepth) {
+          return;
+        }
+
+        let entries;
+        try {
+          entries = readdirSync(directoryPath, { withFileTypes: true })
+            .sort((a, b) => a.name.localeCompare(b.name));
+        } catch (error) {
+          this.logDebug(`Skipping unreadable asset usage directory ${directoryPath}: ${error}`);
+          return;
+        }
+
+        for (const entry of entries) {
+          if (truncated || entry.isSymbolicLink()) {
+            continue;
+          }
+
+          const entryPath = join(directoryPath, entry.name);
+          const entryRelativePath = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
+          const normalizedEntryRelativePath = entryRelativePath.replace(/\\/g, '/');
+
+          if (entry.isDirectory()) {
+            if (this.shouldSkipProjectInspectionDirectory(normalizedEntryRelativePath)) {
+              continue;
+            }
+
+            try {
+              const directoryStats = lstatSync(entryPath);
+              if (directoryStats.isSymbolicLink() || !directoryStats.isDirectory()) {
+                continue;
+              }
+              const realDirectoryPath = realpathSync(entryPath);
+              if (!this.isPathInside(projectRoot, realDirectoryPath)) {
+                continue;
+              }
+            } catch {
+              continue;
+            }
+
+            walkDirectory(entryPath, normalizedEntryRelativePath, depth + 1);
+            continue;
+          }
+
+          if (!entry.isFile()) {
+            continue;
+          }
+
+          filesScanned += 1;
+          if (filesScanned > maxFilesScannedApplied) {
+            filesScanned = maxFilesScannedApplied;
+            truncated = true;
+            return;
+          }
+
+          if (includeUnusedAssets && this.isAssetUsageCandidate(normalizedEntryRelativePath)) {
+            const assetResourcePath = `res://${normalizedEntryRelativePath}`;
+            if (!discoveredAssetPaths.has(assetResourcePath)) {
+              discoveredAssetPaths.add(assetResourcePath);
+              discoveredAssets.push({
+                assetPath: assetResourcePath,
+                assetType: this.getAssetType(extname(normalizedEntryRelativePath).toLowerCase()),
+              });
+            }
+          }
+
+          const fileType = this.findAssetUsageFileType(
+            normalizedEntryRelativePath,
+            includeScenes,
+            includeResources,
+            includeScripts,
+            includeProjectFile
+          );
+          if (!fileType) {
+            continue;
+          }
+
+          const filePath = resolve(projectRoot, normalizedEntryRelativePath);
+          if (!this.isPathInside(projectRoot, filePath)) {
+            continue;
+          }
+
+          scanFile(filePath, normalizedEntryRelativePath, fileType);
+        }
+      };
+
+      walkDirectory(realSearchRootPath, searchRootResult.relativeRoot, 0);
+
+      const topReferencedAssets = Array.from(referenceCounts.entries())
+        .map(([assetPath, value]) => ({
+          assetPath,
+          referenceCount: value.count,
+          referencedBy: Array.from(value.referencedBy).sort().slice(0, 20),
+        }))
+        .sort((a, b) => {
+          const countCompare = b.referenceCount - a.referenceCount;
+          return countCompare !== 0 ? countCompare : a.assetPath.localeCompare(b.assetPath);
+        })
+        .slice(0, maxResultsApplied);
+
+      let unusedAssets: any[] | null = null;
+      if (includeUnusedAssets) {
+        const unused = discoveredAssets
+          .filter(asset => !referencedAssets.has(asset.assetPath))
+          .sort((a, b) => a.assetPath.localeCompare(b.assetPath));
+        if (unused.length > maxResultsApplied) {
+          truncated = true;
+        }
+        unusedAssets = unused.slice(0, maxResultsApplied);
+      }
+
+      const referenceIndex = !assetPathResult && !scenePathResult
+        ? {
+            totalReferences,
+            uniqueAssetsReferenced: referenceCounts.size,
+            topReferencedAssets,
+          }
+        : null;
+
+      const sceneReferencesResult = scenePathResult
+        ? {
+            scenePath: scenePathResult.resourcePath,
+            references: sceneReferences,
+            missingReferences: sceneMissingReferences,
+          }
+        : null;
+
+      const result = {
+        success: true,
+        projectPath: projectRoot.replace(/\\/g, '/'),
+        query: {
+          assetPath: assetPathResult ? assetPathResult.resourcePath : null,
+          scenePath: scenePathResult ? scenePathResult.resourcePath : null,
+          searchRoot: searchRootResult.scanRoot,
+        },
+        summary: {
+          filesScanned,
+          textFilesScanned,
+          matchesFound: assetPathResult ? matchesFound : totalReferences,
+          missingReferenceCount,
+          unusedAssetCandidate: assetPathResult ? matchesFound === 0 : null,
+          truncated,
+        },
+        matches: assetPathResult ? matches : [],
+        sceneReferences: sceneReferencesResult,
+        missingReferences: includeMissingReferences ? missingReferences : [],
+        unusedAssets,
+        referenceIndex,
+        unresolvedUidReferences,
+        limits: {
+          maxResultsRequested,
+          maxResultsApplied,
+          maxResultsClamped,
+          maxFilesScannedRequested,
+          maxFilesScannedApplied,
+          maxFilesScannedClamped,
+        },
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.findAssetUsagesErrorResponse(
+        'FIND_ASSET_USAGES_FAILED',
+        `Failed to find asset usages: ${error?.message || 'Unknown error'}`
       );
     }
   }
