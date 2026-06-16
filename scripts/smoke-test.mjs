@@ -26,6 +26,7 @@ const expectedTools = [
   'scan_assets',
   'get_asset_info',
   'find_asset_usages',
+  'inspect_asset_edit_context',
   'read_scene_tree',
   'get_scene_layout',
   'capture_scene_preview',
@@ -527,6 +528,25 @@ async function runAlwaysSmoke({ godotPathForServer }) {
       'INVALID_MAX_RESULTS'
     );
     logPass('find_asset_usages invalid maxResults');
+
+    await expectStructuredError(client, 'inspect_asset_edit_context', { projectPath: missingProject, assetPath: 'assets/props/chair.png' }, 'PROJECT_PATH_NOT_FOUND');
+    logPass('inspect_asset_edit_context invalid projectPath');
+
+    await expectStructuredError(
+      client,
+      'inspect_asset_edit_context',
+      { projectPath: process.cwd(), assetPath: '../outside.png' },
+      'UNSAFE_ASSET_PATH'
+    );
+    logPass('inspect_asset_edit_context unsafe assetPath');
+
+    await expectStructuredError(
+      client,
+      'inspect_asset_edit_context',
+      { projectPath: process.cwd(), assetPath: 'assets/props/chair.png', maxUsages: 0 },
+      'INVALID_MAX_USAGES'
+    );
+    logPass('inspect_asset_edit_context invalid maxUsages');
   } finally {
     await client.close();
   }
@@ -611,6 +631,23 @@ async function runIntegrationSmoke({ godotPath }) {
     );
     assertNoDiff(diffSnapshots(usageBefore, snapshotProjectFiles(projectRoot)), 'find_asset_usages');
     logPass('find_asset_usages');
+
+    const assetContextBefore = snapshotProjectFiles(projectRoot);
+    const assetContext = await client.callTool('inspect_asset_edit_context', {
+      projectPath: projectRoot,
+      assetPath: 'assets/props/chair.png',
+    });
+    assert.equal(assetContext.parsed?.success, true, JSON.stringify(assetContext.parsed, null, 2));
+    assert.equal(assetContext.parsed?.asset?.assetType, 'texture');
+    assert.equal(assetContext.parsed?.asset?.suggestedNode, 'Sprite2D');
+    assert.ok(
+      assetContext.parsed?.usages?.matches?.some((match) => match.filePath === 'res://scenes/UsageProbe.tscn'),
+      'asset context should include usage match'
+    );
+    assert.equal(assetContext.parsed?.generatedPreviews?.success, true);
+    assert.equal(assetContext.parsed?.placementHints?.recommendedNodeType, 'Sprite2D');
+    assertNoDiff(diffSnapshots(assetContextBefore, snapshotProjectFiles(projectRoot)), 'inspect_asset_edit_context');
+    logPass('inspect_asset_edit_context');
 
     const readTree = await client.callTool('read_scene_tree', { projectPath: projectRoot, scenePath: 'scenes/Main.tscn', maxDepth: 20 });
     assert.equal(readTree.parsed?.success, true);
@@ -699,6 +736,18 @@ async function runIntegrationSmoke({ godotPath }) {
     assert.equal(sha256File(sceneAssetPath), originalSceneAssetHash, 'capture_asset_preview should not modify the asset file');
     assertOnlyAllowedDiff(diffSnapshots(assetPreviewBefore, snapshotProjectFiles(projectRoot)), ['.godot_mcp/previews'], 'capture_asset_preview');
     logPass('capture_asset_preview');
+
+    const assetContextWithPreviewBefore = snapshotProjectFiles(projectRoot);
+    const assetContextWithPreview = await client.callTool('inspect_asset_edit_context', {
+      projectPath: projectRoot,
+      assetPath: 'assets/prefabs/Table.tscn',
+    });
+    assert.equal(assetContextWithPreview.parsed?.success, true, JSON.stringify(assetContextWithPreview.parsed, null, 2));
+    assert.equal(assetContextWithPreview.parsed?.asset?.assetType, 'scene');
+    assert.ok(assetContextWithPreview.parsed?.generatedPreviews?.previewCount > 0, 'asset context should list generated asset preview');
+    assert.equal(assetContextWithPreview.parsed?.generatedPreviews?.latestPreviewPath, assetPreview.parsed.previewPath);
+    assertNoDiff(diffSnapshots(assetContextWithPreviewBefore, snapshotProjectFiles(projectRoot)), 'inspect_asset_edit_context generated previews');
+    logPass('inspect_asset_edit_context generated previews');
 
     const malformedPreviewDir = path.join(projectRoot, '.godot_mcp', 'previews');
     mkdirSync(malformedPreviewDir, { recursive: true });

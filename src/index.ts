@@ -145,6 +145,10 @@ class GodotServer {
     'include_missing_metadata': 'includeMissingMetadata',
     'include_scenes': 'includeScenes',
     'include_asset_summary': 'includeAssetSummary',
+    'include_asset_info': 'includeAssetInfo',
+    'include_usages': 'includeUsages',
+    'include_generated_previews': 'includeGeneratedPreviews',
+    'include_placement_hints': 'includePlacementHints',
     'include_checkpoint_summary': 'includeCheckpointSummary',
     'include_tool_capabilities': 'includeToolCapabilities',
     'include_recommendations': 'includeRecommendations',
@@ -154,6 +158,8 @@ class GodotServer {
     'max_scenes': 'maxScenes',
     'max_asset_folders': 'maxAssetFolders',
     'max_assets': 'maxAssets',
+    'max_usages': 'maxUsages',
+    'max_previews': 'maxPreviews',
     'asset_root': 'assetRoot',
     'search_root': 'searchRoot',
     'create_pre_restore_checkpoint': 'createPreRestoreCheckpoint',
@@ -206,7 +212,6 @@ class GodotServer {
     'include_validation_before': 'includeValidationBefore',
     'include_validation_after': 'includeValidationAfter',
     'include_checkpoints': 'includeCheckpoints',
-    'include_asset_info': 'includeAssetInfo',
     'include_current_values': 'includeCurrentValues',
     'max_operations': 'maxOperations',
     'max_updates': 'maxUpdates',
@@ -215,7 +220,6 @@ class GodotServer {
     'asset_property': 'assetProperty',
     'include_dependencies': 'includeDependencies',
     'include_scene_preview': 'includeScenePreview',
-    'include_placement_hints': 'includePlacementHints',
     'allow_overwrite': 'allowOverwrite',
     'validate_assets': 'validateAssets',
     'validate_node_types': 'validateNodeTypes',
@@ -676,6 +680,31 @@ class GodotServer {
    */
   private inspectSceneEditContextErrorResponse(error: string, message: string): any {
     console.error(`[SERVER] inspect_scene_edit_context error response: ${error}: ${message}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error,
+              message,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  /**
+   * Create an inspect_asset_edit_context-specific JSON error response while preserving MCP text content style.
+   */
+  private inspectAssetEditContextErrorResponse(error: string, message: string): any {
+    console.error(`[SERVER] inspect_asset_edit_context error response: ${error}: ${message}`);
 
     return {
       content: [
@@ -2467,6 +2496,109 @@ class GodotServer {
     return ['texture', 'scene', 'model', 'audio', 'font', 'resource'].includes(assetType);
   }
 
+  private buildAssetEditPlacementHints(assetType: AssetType): any {
+    const compatibleTools = [
+      'dry_run_place_asset_in_scene',
+      'place_asset_in_scene',
+      'dry_run_scene_patch',
+      'apply_scene_patch',
+    ];
+
+    switch (assetType) {
+      case 'texture':
+        return {
+          recommendedNodeType: 'Sprite2D',
+          alternateNodeTypes: ['TextureRect'],
+          recommendedAssetProperty: 'texture',
+          compatibleTools,
+          previewTool: 'capture_asset_preview',
+          supportsVisualPreview: true,
+          supportedByPlaceAsset: true,
+          safeToPlaceDirectly: true,
+          notes: ['Use Sprite2D for world/canvas placement or TextureRect for UI placement.'],
+          warnings: [],
+        };
+      case 'scene':
+        return {
+          recommendedNodeType: 'PackedScene instance',
+          alternateNodeTypes: [],
+          recommendedAssetProperty: 'instance',
+          compatibleTools,
+          previewTool: 'capture_asset_preview',
+          supportsVisualPreview: true,
+          supportedByPlaceAsset: true,
+          safeToPlaceDirectly: true,
+          notes: ['Use assetProperty instance to plan or apply a scene instance placement.'],
+          warnings: ['Scene instance bounds may be approximate until inspected after placement.'],
+        };
+      case 'model':
+        return {
+          recommendedNodeType: 'MeshInstance3D or PackedScene instance',
+          alternateNodeTypes: ['Node3D'],
+          recommendedAssetProperty: 'mesh or instance',
+          compatibleTools,
+          previewTool: 'capture_asset_preview',
+          supportsVisualPreview: true,
+          supportedByPlaceAsset: true,
+          safeToPlaceDirectly: true,
+          notes: ['Model support depends on how Godot loads the model resource.'],
+          warnings: ['Model preview and placement bounds may be approximate.'],
+        };
+      case 'audio':
+        return {
+          recommendedNodeType: 'AudioStreamPlayer2D',
+          alternateNodeTypes: ['AudioStreamPlayer3D', 'AudioStreamPlayer'],
+          recommendedAssetProperty: 'stream',
+          compatibleTools,
+          previewTool: null,
+          supportsVisualPreview: false,
+          supportedByPlaceAsset: true,
+          safeToPlaceDirectly: true,
+          notes: ['Choose 2D, 3D, or non-positional audio node based on the target scene.'],
+          warnings: ['Audio assets do not have visual previews in capture_asset_preview.'],
+        };
+      case 'font':
+        return {
+          recommendedNodeType: 'Label',
+          alternateNodeTypes: ['Button', 'RichTextLabel'],
+          recommendedAssetProperty: 'font',
+          compatibleTools,
+          previewTool: 'capture_asset_preview',
+          supportsVisualPreview: true,
+          supportedByPlaceAsset: true,
+          safeToPlaceDirectly: false,
+          notes: ['Font assignment support is limited; prefer planning with dry-run tools first.'],
+          warnings: ['Font placement may require UI-specific node properties.'],
+        };
+      case 'resource':
+        return {
+          recommendedNodeType: null,
+          alternateNodeTypes: [],
+          recommendedAssetProperty: 'explicit assetProperty required',
+          compatibleTools,
+          previewTool: null,
+          supportsVisualPreview: false,
+          supportedByPlaceAsset: false,
+          safeToPlaceDirectly: false,
+          notes: ['Generic resources need an explicit safe node/property combination.'],
+          warnings: ['Generic resource placement is not inferred automatically.'],
+        };
+      default:
+        return {
+          recommendedNodeType: null,
+          alternateNodeTypes: [],
+          recommendedAssetProperty: null,
+          compatibleTools: [],
+          previewTool: null,
+          supportsVisualPreview: false,
+          supportedByPlaceAsset: false,
+          safeToPlaceDirectly: false,
+          notes: [],
+          warnings: ['This asset type is not supported by safe placement tools in this version.'],
+        };
+    }
+  }
+
   private collectProjectInspectionFiles(projectRoot: string, mainScene: string | null): {
     sceneItems: any[];
     assetSummary: {
@@ -2802,6 +2934,7 @@ class GodotServer {
         'scan_assets',
         'get_asset_info',
         'find_asset_usages',
+        'inspect_asset_edit_context',
         'read_scene_tree',
         'validate_scene',
         'get_scene_layout',
@@ -2834,6 +2967,7 @@ class GodotServer {
         'scan_assets',
         'get_asset_info',
         'find_asset_usages',
+        'inspect_asset_edit_context',
         'capture_asset_preview',
         'list_generated_previews',
         'read_scene_tree',
@@ -3392,6 +3526,7 @@ class GodotServer {
         'inspect_scene_edit_context',
         'get_asset_info',
         'find_asset_usages',
+        'inspect_asset_edit_context',
         'capture_asset_preview',
         'dry_run_scene_patch',
         'apply_scene_patch',
@@ -4396,6 +4531,60 @@ class GodotServer {
               },
             },
             required: ['projectPath'],
+          },
+        },
+        {
+          name: 'inspect_asset_edit_context',
+          description: 'Return compact read-only asset metadata, usages, generated previews, placement hints, and recommendations',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Absolute path to the Godot project directory',
+              },
+              assetPath: {
+                type: 'string',
+                description: 'Existing Godot asset path such as res://assets/props/chair.png or assets/props/chair.png',
+              },
+              includeAssetInfo: {
+                type: 'boolean',
+                description: 'Whether to include compact Node-side asset metadata (default: true)',
+              },
+              includeUsages: {
+                type: 'boolean',
+                description: 'Whether to include find_asset_usages-style references for this asset (default: true)',
+              },
+              includeGeneratedPreviews: {
+                type: 'boolean',
+                description: 'Whether to list generated previews for this asset (default: true)',
+              },
+              includePlacementHints: {
+                type: 'boolean',
+                description: 'Whether to include safe placement workflow hints (default: true)',
+              },
+              includeRecommendations: {
+                type: 'boolean',
+                description: 'Whether to include concise next-step recommendations (default: true)',
+              },
+              includeScripts: {
+                type: 'boolean',
+                description: 'Whether usage scanning should include .gd files without parsing script logic (default: false)',
+              },
+              maxUsages: {
+                type: 'number',
+                description: 'Maximum usage matches to return (default: 100, max: 1000)',
+              },
+              maxPreviews: {
+                type: 'number',
+                description: 'Maximum generated preview entries to return (default: 20, max: 200)',
+              },
+              maxFilesScanned: {
+                type: 'number',
+                description: 'Maximum files to scan for usages (default: 50000, max: 200000)',
+              },
+            },
+            required: ['projectPath', 'assetPath'],
           },
         },
         {
@@ -5415,6 +5604,8 @@ class GodotServer {
           return await this.handleGetAssetInfo(request.params.arguments);
         case 'find_asset_usages':
           return await this.handleFindAssetUsages(request.params.arguments);
+        case 'inspect_asset_edit_context':
+          return await this.handleInspectAssetEditContext(request.params.arguments);
         case 'read_scene_tree':
           return await this.handleReadSceneTree(request.params.arguments);
         case 'get_scene_layout':
@@ -8728,6 +8919,440 @@ class GodotServer {
       return this.findAssetUsagesErrorResponse(
         'FIND_ASSET_USAGES_FAILED',
         `Failed to find asset usages: ${error?.message || 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * Handle the inspect_asset_edit_context tool
+   */
+  private async handleInspectAssetEditContext(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    const maxUsagesRequested = args.maxUsages !== undefined ? args.maxUsages : null;
+    let maxUsagesApplied = 100;
+    let maxUsagesClamped = false;
+    if (args.maxUsages !== undefined) {
+      if (typeof args.maxUsages !== 'number' || !Number.isFinite(args.maxUsages) || args.maxUsages < 1) {
+        return this.inspectAssetEditContextErrorResponse(
+          'INVALID_MAX_USAGES',
+          'maxUsages must be a number between 1 and 1000.'
+        );
+      }
+
+      if (args.maxUsages > 1000) {
+        maxUsagesApplied = 1000;
+        maxUsagesClamped = true;
+      } else {
+        maxUsagesApplied = Math.floor(args.maxUsages);
+      }
+    }
+
+    const maxPreviewsRequested = args.maxPreviews !== undefined ? args.maxPreviews : null;
+    let maxPreviewsApplied = 20;
+    let maxPreviewsClamped = false;
+    if (args.maxPreviews !== undefined) {
+      if (typeof args.maxPreviews !== 'number' || !Number.isFinite(args.maxPreviews) || args.maxPreviews < 1) {
+        return this.inspectAssetEditContextErrorResponse(
+          'INVALID_MAX_PREVIEWS',
+          'maxPreviews must be a number between 1 and 200.'
+        );
+      }
+
+      if (args.maxPreviews > 200) {
+        maxPreviewsApplied = 200;
+        maxPreviewsClamped = true;
+      } else {
+        maxPreviewsApplied = Math.floor(args.maxPreviews);
+      }
+    }
+
+    const maxFilesScannedRequested = args.maxFilesScanned !== undefined ? args.maxFilesScanned : null;
+    let maxFilesScannedApplied = 50000;
+    let maxFilesScannedClamped = false;
+    if (args.maxFilesScanned !== undefined) {
+      if (typeof args.maxFilesScanned !== 'number' || !Number.isFinite(args.maxFilesScanned) || args.maxFilesScanned < 1) {
+        return this.inspectAssetEditContextErrorResponse(
+          'INVALID_MAX_FILES_SCANNED',
+          'maxFilesScanned must be a number between 1 and 200000.'
+        );
+      }
+
+      if (args.maxFilesScanned > 200000) {
+        maxFilesScannedApplied = 200000;
+        maxFilesScannedClamped = true;
+      } else {
+        maxFilesScannedApplied = Math.floor(args.maxFilesScanned);
+      }
+    }
+
+    const booleanOptions = [
+      'includeAssetInfo',
+      'includeUsages',
+      'includeGeneratedPreviews',
+      'includePlacementHints',
+      'includeRecommendations',
+      'includeScripts',
+    ];
+    for (const option of booleanOptions) {
+      if (args[option] !== undefined && typeof args[option] !== 'boolean') {
+        return this.inspectAssetEditContextErrorResponse(
+          'INSPECT_ASSET_EDIT_CONTEXT_FAILED',
+          `${option} must be a boolean.`
+        );
+      }
+    }
+
+    const includeAssetInfo = args.includeAssetInfo !== undefined ? args.includeAssetInfo : true;
+    const includeUsages = args.includeUsages !== undefined ? args.includeUsages : true;
+    const includeGeneratedPreviews = args.includeGeneratedPreviews !== undefined ? args.includeGeneratedPreviews : true;
+    const includePlacementHints = args.includePlacementHints !== undefined ? args.includePlacementHints : true;
+    const includeRecommendations = args.includeRecommendations !== undefined ? args.includeRecommendations : true;
+    const includeScripts = args.includeScripts !== undefined ? args.includeScripts : false;
+
+    if (!args.projectPath || typeof args.projectPath !== 'string') {
+      return this.inspectAssetEditContextErrorResponse(
+        'MISSING_PROJECT_PATH',
+        'projectPath is required and must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    if (args.projectPath.includes('\0')) {
+      return this.inspectAssetEditContextErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must not contain null bytes.'
+      );
+    }
+
+    if (!isAbsolute(args.projectPath)) {
+      return this.inspectAssetEditContextErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    if (!args.assetPath || typeof args.assetPath !== 'string') {
+      return this.inspectAssetEditContextErrorResponse(
+        'MISSING_ASSET_PATH',
+        'assetPath is required and must be a Godot project-relative asset path.'
+      );
+    }
+
+    const assetPathResult = this.normalizeAssetPath(args.assetPath);
+    if (assetPathResult.error) {
+      return this.inspectAssetEditContextErrorResponse('UNSAFE_ASSET_PATH', assetPathResult.error);
+    }
+
+    try {
+      const normalizedProjectPath = resolve(args.projectPath);
+      if (!existsSync(normalizedProjectPath)) {
+        return this.inspectAssetEditContextErrorResponse(
+          'PROJECT_PATH_NOT_FOUND',
+          `Project path does not exist: ${args.projectPath}`
+        );
+      }
+
+      const projectStats = lstatSync(normalizedProjectPath);
+      if (projectStats.isSymbolicLink()) {
+        return this.inspectAssetEditContextErrorResponse(
+          'PROJECT_PATH_IS_SYMLINK',
+          'projectPath must not be a symbolic link.'
+        );
+      }
+
+      if (!projectStats.isDirectory()) {
+        return this.inspectAssetEditContextErrorResponse(
+          'PROJECT_PATH_NOT_DIRECTORY',
+          `Project path is not a directory: ${args.projectPath}`
+        );
+      }
+
+      const projectRoot = realpathSync(normalizedProjectPath);
+      const projectFile = join(projectRoot, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.inspectAssetEditContextErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          `Not a valid Godot project: ${args.projectPath}. The directory must contain a project.godot file.`
+        );
+      }
+
+      const projectFileStats = lstatSync(projectFile);
+      if (projectFileStats.isSymbolicLink() || !projectFileStats.isFile()) {
+        return this.inspectAssetEditContextErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          'project.godot must be a regular file and must not be a symbolic link.'
+        );
+      }
+
+      const assetFilePath = resolve(projectRoot, assetPathResult.relativePath);
+      if (!this.isPathInside(projectRoot, assetFilePath)) {
+        return this.inspectAssetEditContextErrorResponse(
+          'UNSAFE_ASSET_PATH',
+          'assetPath must stay inside the Godot project directory.'
+        );
+      }
+
+      if (!existsSync(assetFilePath)) {
+        return this.inspectAssetEditContextErrorResponse(
+          'ASSET_PATH_NOT_FOUND',
+          `Asset file does not exist: ${assetPathResult.resourcePath}`
+        );
+      }
+
+      const assetStats = lstatSync(assetFilePath);
+      if (assetStats.isSymbolicLink()) {
+        return this.inspectAssetEditContextErrorResponse(
+          'ASSET_PATH_IS_SYMLINK',
+          'assetPath must not be a symbolic link.'
+        );
+      }
+
+      if (!assetStats.isFile()) {
+        return this.inspectAssetEditContextErrorResponse(
+          'ASSET_PATH_NOT_FILE',
+          `assetPath exists but is not a regular file: ${assetPathResult.resourcePath}`
+        );
+      }
+
+      const realAssetFilePath = realpathSync(assetFilePath);
+      if (!this.isPathInside(projectRoot, realAssetFilePath)) {
+        return this.inspectAssetEditContextErrorResponse(
+          'UNSAFE_ASSET_PATH',
+          'Resolved assetPath must stay inside the Godot project directory.'
+        );
+      }
+
+      const extension = extname(assetPathResult.relativePath).toLowerCase();
+      const fileName = basename(assetPathResult.relativePath);
+      const assetName = parse(fileName).name;
+      const relativeDirectory = dirname(assetPathResult.relativePath).replace(/\\/g, '/');
+      const assetType = this.getAssetType(extension);
+      const category = this.inferAssetCategory(assetType, extension, relativeDirectory, assetName);
+      const placementHints = includePlacementHints ? this.buildAssetEditPlacementHints(assetType) : null;
+      const asset = {
+        exists: true,
+        assetType,
+        category,
+        fileName,
+        extension,
+        sizeBytes: assetStats.size,
+        modifiedTime: assetStats.mtime.toISOString(),
+        suggestedNode: this.getSuggestedNode(assetType),
+      };
+
+      let assetInfo: any = { enabled: false };
+      if (includeAssetInfo) {
+        const metadata: any = {
+          sizeBytes: assetStats.size,
+          modifiedTime: assetStats.mtime.toISOString(),
+          nodeSideOnly: true,
+        };
+
+        if (extension === '.png' && assetStats.size >= 24) {
+          try {
+            const header = Buffer.alloc(24);
+            const fileDescriptor = openSync(assetFilePath, 'r');
+            try {
+              const bytesRead = readSync(fileDescriptor, header, 0, 24, 0);
+              if (
+                bytesRead === 24 &&
+                header[0] === 0x89 &&
+                header.toString('ascii', 1, 4) === 'PNG' &&
+                header.toString('ascii', 12, 16) === 'IHDR'
+              ) {
+                metadata.width = header.readUInt32BE(16);
+                metadata.height = header.readUInt32BE(20);
+                metadata.size = [metadata.width, metadata.height];
+              }
+            } finally {
+              closeSync(fileDescriptor);
+            }
+          } catch {
+            metadata.imageDimensionsUnavailable = true;
+          }
+        }
+
+        assetInfo = {
+          enabled: true,
+          success: true,
+          metadata,
+          placementHints: placementHints || this.buildAssetEditPlacementHints(assetType),
+          message: 'Detailed Godot resource metadata is available from get_asset_info when needed.',
+        };
+      }
+
+      let usages: any = { enabled: false };
+      if (includeUsages) {
+        try {
+          const usageResponse = await this.handleFindAssetUsages({
+            projectPath: projectRoot,
+            assetPath: assetPathResult.resourcePath,
+            includeScripts,
+            maxResults: maxUsagesApplied,
+            maxFilesScanned: maxFilesScannedApplied,
+          });
+          const usageText = usageResponse?.content?.find((item: any) => item.type === 'text')?.text;
+          const parsedUsage = typeof usageText === 'string' ? JSON.parse(usageText) : null;
+          if (!parsedUsage || parsedUsage.success === false) {
+            usages = this.sectionError(
+              true,
+              parsedUsage?.error || 'FIND_ASSET_USAGES_FAILED',
+              parsedUsage?.message || 'Asset usage scan failed.'
+            );
+          } else {
+            usages = {
+              enabled: true,
+              success: true,
+              matchesFound: parsedUsage.summary?.matchesFound ?? 0,
+              matches: Array.isArray(parsedUsage.matches) ? parsedUsage.matches.slice(0, maxUsagesApplied) : [],
+              missingReferences: Array.isArray(parsedUsage.missingReferences)
+                ? parsedUsage.missingReferences.slice(0, maxUsagesApplied)
+                : [],
+              unresolvedUidReferences: Array.isArray(parsedUsage.unresolvedUidReferences)
+                ? parsedUsage.unresolvedUidReferences.slice(0, maxUsagesApplied)
+                : [],
+              filesScanned: parsedUsage.summary?.filesScanned ?? null,
+              truncated: Boolean(parsedUsage.summary?.truncated),
+            };
+          }
+        } catch (error: any) {
+          usages = this.sectionError(
+            true,
+            'FIND_ASSET_USAGES_FAILED',
+            `Asset usage scan failed: ${error?.message || 'Unknown error'}`
+          );
+        }
+      }
+
+      let generatedPreviews: any = { enabled: false };
+      if (includeGeneratedPreviews) {
+        try {
+          const previewRootRelative = '.godot_mcp/previews';
+          const previewRootPath = resolve(projectRoot, previewRootRelative);
+          if (!existsSync(previewRootPath)) {
+            generatedPreviews = {
+              enabled: true,
+              success: true,
+              previewCount: 0,
+              latestPreviewPath: null,
+              items: [],
+            };
+          } else {
+            const ancestorValidation = this.validatePreviewOutputAncestors(projectRoot, previewRootRelative);
+            if (ancestorValidation.error) {
+              generatedPreviews = this.sectionError(
+                true,
+                ancestorValidation.error === 'OUTPUT_DIR_IS_SYMLINK' ? 'PREVIEW_ROOT_IS_SYMLINK' : 'UNSAFE_PREVIEW_ROOT',
+                (ancestorValidation.message || 'Preview root is not safe.').replace(/outputDir/g, 'previewRoot')
+              );
+            } else {
+              const previewRootStats = lstatSync(previewRootPath);
+              if (previewRootStats.isSymbolicLink() || !previewRootStats.isDirectory()) {
+                generatedPreviews = this.sectionError(true, 'UNSAFE_PREVIEW_ROOT', 'Preview root is not a safe directory.');
+              } else {
+                const realPreviewRootPath = realpathSync(previewRootPath);
+                const listed = this.listPreviewDirectory(
+                  projectRoot,
+                  realPreviewRootPath,
+                  realPreviewRootPath,
+                  previewRootRelative,
+                  true,
+                  false,
+                  true
+                );
+                if (listed.error) {
+                  generatedPreviews = this.sectionError(true, listed.error, listed.message || 'Generated preview listing failed.');
+                } else {
+                  const items = listed.items
+                    .filter(item => item.kind === 'asset' && item.sourcePath === assetPathResult.resourcePath)
+                    .sort((a, b) => {
+                      const timeCompare = (b.sortTime || 0) - (a.sortTime || 0);
+                      return timeCompare !== 0
+                        ? timeCompare
+                        : String(b.previewPath).localeCompare(String(a.previewPath));
+                    });
+                  const returnedItems = items
+                    .slice(0, maxPreviewsApplied)
+                    .map(({ sortTime: _sortTime, ...item }) => item);
+                  generatedPreviews = {
+                    enabled: true,
+                    success: true,
+                    previewCount: items.length,
+                    latestPreviewPath: returnedItems[0]?.previewPath ?? null,
+                    items: returnedItems,
+                    truncated: items.length > returnedItems.length,
+                  };
+                }
+              }
+            }
+          }
+        } catch (error: any) {
+          generatedPreviews = this.sectionError(
+            true,
+            'LIST_GENERATED_PREVIEWS_FAILED',
+            `Generated preview listing failed: ${error?.message || 'Unknown error'}`
+          );
+        }
+      }
+
+      let recommendations: string[] = [];
+      if (includeRecommendations) {
+        if (placementHints?.supportsVisualPreview && (!generatedPreviews.success || generatedPreviews.previewCount === 0)) {
+          recommendations.push('Run capture_asset_preview before choosing this asset visually.');
+        }
+        if (includeAssetInfo) {
+          recommendations.push('Use get_asset_info if detailed Godot resource metadata is needed before placement.');
+        }
+        if (usages?.success && usages.matchesFound === 0) {
+          recommendations.push('This asset appears unused by path-based scan; verify before deleting or replacing it.');
+        } else if (usages?.success && usages.matchesFound > 3) {
+          recommendations.push('Be careful replacing or moving this asset; it has multiple path references.');
+        }
+        if (usages?.success && Array.isArray(usages.missingReferences) && usages.missingReferences.length > 0) {
+          recommendations.push('Review missing references before applying scene patches.');
+        }
+        if (placementHints && !placementHints.supportedByPlaceAsset) {
+          recommendations.push('This asset type is not directly supported by place_asset_in_scene in this version.');
+        } else {
+          recommendations.push('Use dry_run_scene_patch before apply_scene_patch when placing or using this asset.');
+        }
+      }
+
+      const result = {
+        success: true,
+        projectPath: projectRoot.replace(/\\/g, '/'),
+        assetPath: assetPathResult.resourcePath,
+        asset,
+        assetInfo,
+        usages,
+        generatedPreviews,
+        placementHints,
+        recommendations,
+        limits: {
+          maxUsagesRequested,
+          maxUsagesApplied,
+          maxUsagesClamped,
+          maxPreviewsRequested,
+          maxPreviewsApplied,
+          maxPreviewsClamped,
+          maxFilesScannedRequested,
+          maxFilesScannedApplied,
+          maxFilesScannedClamped,
+        },
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.inspectAssetEditContextErrorResponse(
+        'INSPECT_ASSET_EDIT_CONTEXT_FAILED',
+        `Failed to inspect asset edit context: ${error?.message || 'Unknown error'}`
       );
     }
   }

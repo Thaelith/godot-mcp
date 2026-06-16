@@ -288,7 +288,7 @@ Current coverage includes:
 
 - tool registration for the expanded toolchain
 - `inspect_project_capabilities` and `inspect_scene_edit_context`
-- `scan_assets`, `get_asset_info`, `find_asset_usages`, `read_scene_tree`, `get_scene_layout`, `capture_scene_preview`, `capture_asset_preview`, `list_generated_previews`, `cleanup_generated_previews`, and `validate_scene`
+- `scan_assets`, `get_asset_info`, `find_asset_usages`, `inspect_asset_edit_context`, `read_scene_tree`, `get_scene_layout`, `capture_scene_preview`, `capture_asset_preview`, `list_generated_previews`, `cleanup_generated_previews`, and `validate_scene`
 - `dry_run_place_asset_in_scene`, `dry_run_align_nodes`, `dry_run_update_node_properties`, and `dry_run_scene_patch`
 - `place_asset_in_scene`, `align_nodes`, `update_node_properties`, and `apply_scene_patch`
 - `create_scene_checkpoint`, `list_scene_checkpoints`, and `restore_scene_checkpoint`
@@ -374,11 +374,11 @@ Output example:
     "latestCreatedAt": "2026-06-15T12:00:00Z"
   },
   "toolCapabilities": {
-    "readOnlyInspection": ["scan_assets", "get_asset_info", "find_asset_usages", "read_scene_tree", "validate_scene", "get_scene_layout", "capture_scene_preview", "capture_asset_preview", "list_generated_previews", "list_scene_checkpoints", "inspect_project_capabilities"],
+    "readOnlyInspection": ["scan_assets", "get_asset_info", "find_asset_usages", "inspect_asset_edit_context", "read_scene_tree", "validate_scene", "get_scene_layout", "capture_scene_preview", "capture_asset_preview", "list_generated_previews", "list_scene_checkpoints", "inspect_project_capabilities"],
     "dryRunPlanning": ["dry_run_scene_blueprint", "dry_run_align_nodes", "dry_run_place_asset_in_scene", "dry_run_update_node_properties", "dry_run_scene_patch"],
     "writers": ["create_scene_from_blueprint", "align_nodes", "place_asset_in_scene", "update_node_properties", "apply_scene_patch"],
     "safety": ["create_scene_checkpoint", "restore_scene_checkpoint"],
-    "recommendedTransactionFlow": ["inspect_project_capabilities", "scan_assets", "get_asset_info", "find_asset_usages", "capture_asset_preview", "list_generated_previews", "read_scene_tree", "get_scene_layout", "dry_run_scene_patch", "apply_scene_patch", "capture_scene_preview", "validate_scene"]
+    "recommendedTransactionFlow": ["inspect_project_capabilities", "scan_assets", "get_asset_info", "find_asset_usages", "inspect_asset_edit_context", "capture_asset_preview", "list_generated_previews", "read_scene_tree", "get_scene_layout", "dry_run_scene_patch", "apply_scene_patch", "capture_scene_preview", "validate_scene"]
   },
   "recommendations": [
     "Start with read_scene_tree and get_scene_layout for the main scene (res://scenes/Main.tscn).",
@@ -533,7 +533,7 @@ Output example:
     "Use dry_run_scene_patch before apply_scene_patch."
   ],
   "toolWorkflow": {
-    "safeEditFlow": ["inspect_scene_edit_context", "get_asset_info", "find_asset_usages", "capture_asset_preview", "dry_run_scene_patch", "apply_scene_patch", "capture_scene_preview", "list_generated_previews", "validate_scene"],
+    "safeEditFlow": ["inspect_scene_edit_context", "get_asset_info", "find_asset_usages", "inspect_asset_edit_context", "capture_asset_preview", "dry_run_scene_patch", "apply_scene_patch", "capture_scene_preview", "list_generated_previews", "validate_scene"],
     "rollbackFlow": ["list_scene_checkpoints", "restore_scene_checkpoint"]
   },
   "limits": {
@@ -1151,6 +1151,100 @@ In project-wide mode, `referenceIndex` summarizes total references, unique refer
 **Reference detection:** the first version focuses on path-based `res://` references in `.tscn`, text `.scn`, `.tres`, text `.res`, `project.godot`, and `.gd` only when `includeScripts` is true. It labels simple usage kinds such as `ext_resource`, `load_call`, `preload_call`, `project_setting`, `script_reference`, and `resource_path`. `uid://` references are reported as unresolved UID references when encountered, but full UID resolution is best-effort and not performed by this scanner.
 
 **Limitations:** binary `.scn` and `.res` files may be skipped as unreadable text. Unused assets are heuristic: dynamically loaded paths, editor-only import metadata, addon conventions, and UID-only references may not be reflected. Context snippets are compact and not full file contents.
+
+### `inspect_asset_edit_context`
+
+Returns a compact read-only context bundle for one asset so an AI can decide whether and how to use it in scene edits. It combines Node-side asset metadata, usage discovery, generated preview listing, placement hints, and recommendations without creating previews or running writer tools.
+
+Input example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "assetPath": "res://assets/props/chair.png",
+  "includeAssetInfo": true,
+  "includeUsages": true,
+  "includeGeneratedPreviews": true,
+  "includePlacementHints": true,
+  "includeRecommendations": true,
+  "includeScripts": false,
+  "maxUsages": 100,
+  "maxPreviews": 20,
+  "maxFilesScanned": 50000
+}
+```
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "assetPath": "res://assets/props/chair.png",
+  "asset": {
+    "exists": true,
+    "assetType": "texture",
+    "category": "prop",
+    "fileName": "chair.png",
+    "extension": ".png",
+    "sizeBytes": 1234,
+    "modifiedTime": "2026-06-16T12:00:00.000Z",
+    "suggestedNode": "Sprite2D"
+  },
+  "assetInfo": {
+    "enabled": true,
+    "success": true,
+    "metadata": {
+      "sizeBytes": 1234,
+      "modifiedTime": "2026-06-16T12:00:00.000Z",
+      "nodeSideOnly": true
+    },
+    "placementHints": {
+      "recommendedNodeType": "Sprite2D",
+      "recommendedAssetProperty": "texture"
+    }
+  },
+  "usages": {
+    "enabled": true,
+    "success": true,
+    "matchesFound": 3,
+    "matches": [],
+    "missingReferences": [],
+    "truncated": false
+  },
+  "generatedPreviews": {
+    "enabled": true,
+    "success": true,
+    "previewCount": 1,
+    "latestPreviewPath": "res://.godot_mcp/previews/assets/chair_preview.png",
+    "items": []
+  },
+  "placementHints": {
+    "recommendedNodeType": "Sprite2D",
+    "recommendedAssetProperty": "texture",
+    "compatibleTools": ["dry_run_place_asset_in_scene", "place_asset_in_scene", "dry_run_scene_patch", "apply_scene_patch"],
+    "previewTool": "capture_asset_preview",
+    "supportsVisualPreview": true,
+    "supportedByPlaceAsset": true,
+    "safeToPlaceDirectly": true
+  },
+  "recommendations": [
+    "Use dry_run_scene_patch before apply_scene_patch when placing or using this asset."
+  ]
+}
+```
+
+**Asset info behavior:** the tool returns filesystem-backed metadata and asset classification without loading the resource in Godot. For PNG files it can extract basic dimensions from the file header. If detailed Godot resource metadata is needed, call `get_asset_info`.
+
+**Usage behavior:** when enabled, it reuses the same path-based scanning approach as `find_asset_usages`, including `includeScripts` and `maxFilesScanned`. Usage matches are capped by `maxUsages`.
+
+**Generated preview behavior:** when enabled, it lists existing generated previews for the exact asset path using the same metadata-backed filtering as `list_generated_previews`. It does not call `capture_asset_preview`, embed images, or create files.
+
+**Placement hints behavior:** hints are inferred from asset type. Textures recommend `Sprite2D`/`texture`, scenes recommend `instance`, models recommend `MeshInstance3D` or scene instance behavior, audio recommends audio stream players, fonts are limited UI placement candidates, and script/data/generic unsupported assets are flagged as unsafe for direct placement.
+
+**Safety model:** this tool is read-only. It does not write files, create previews, delete previews, run Godot, import/reimport assets, execute scripts, parse script logic, attach scripts, or call writer tools. Invalid project and asset paths fail the whole call; subsection read issues are returned as compact section errors.
+
+**Workflow fit:** use `scan_assets` to find candidates, `inspect_asset_edit_context` to understand one candidate, `capture_asset_preview` if no preview exists, `dry_run_place_asset_in_scene` or `dry_run_scene_patch` to plan, and writer tools only after dry-run validation.
 
 ## Scene Inspection
 
