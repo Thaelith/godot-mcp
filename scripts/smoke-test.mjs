@@ -29,6 +29,7 @@ const expectedTools = [
   'get_scene_layout',
   'capture_scene_preview',
   'capture_asset_preview',
+  'list_generated_previews',
   'validate_scene',
   'dry_run_place_asset_in_scene',
   'place_asset_in_scene',
@@ -450,6 +451,22 @@ async function runAlwaysSmoke({ godotPathForServer }) {
       'INVALID_MAX_IMAGE_BYTES'
     );
     logPass('capture_asset_preview invalid maxImageBytes');
+
+    await expectStructuredError(
+      client,
+      'list_generated_previews',
+      { projectPath: missingProject },
+      'PROJECT_PATH_NOT_FOUND'
+    );
+    logPass('list_generated_previews invalid projectPath');
+
+    await expectStructuredError(
+      client,
+      'list_generated_previews',
+      { projectPath: process.cwd(), maxResults: 0 },
+      'INVALID_MAX_RESULTS'
+    );
+    logPass('list_generated_previews invalid maxResults');
   } finally {
     await client.close();
   }
@@ -584,6 +601,45 @@ async function runIntegrationSmoke({ godotPath }) {
     assert.equal(sha256File(sceneAssetPath), originalSceneAssetHash, 'capture_asset_preview should not modify the asset file');
     assertOnlyAllowedDiff(diffSnapshots(assetPreviewBefore, snapshotProjectFiles(projectRoot)), ['.godot_mcp/previews'], 'capture_asset_preview');
     logPass('capture_asset_preview');
+
+    const malformedPreviewDir = path.join(projectRoot, '.godot_mcp', 'previews');
+    mkdirSync(malformedPreviewDir, { recursive: true });
+    writeFileSync(path.join(malformedPreviewDir, 'bad_metadata.png'), Buffer.from(tinyPngBase64, 'base64'));
+    writeFileSync(path.join(malformedPreviewDir, 'bad_metadata.json'), '{ not valid json');
+    const listPreviewsBefore = snapshotProjectFiles(projectRoot);
+
+    const generatedPreviews = await client.callTool('list_generated_previews', { projectPath: projectRoot });
+    assert.equal(generatedPreviews.parsed?.success, true, JSON.stringify(generatedPreviews.parsed, null, 2));
+    assert.ok(generatedPreviews.parsed?.summary?.scenePreviewCount >= 1, 'should list at least one scene preview');
+    assert.ok(generatedPreviews.parsed?.summary?.assetPreviewCount >= 1, 'should list at least one asset preview');
+    assert.ok(generatedPreviews.parsed?.previews?.some((item) => item.metadataError), 'malformed metadata should be reported per item');
+
+    const scenePreviews = await client.callTool('list_generated_previews', { projectPath: projectRoot, kind: 'scene' });
+    assert.equal(scenePreviews.parsed?.success, true, JSON.stringify(scenePreviews.parsed, null, 2));
+    assert.ok(scenePreviews.parsed?.previews?.length >= 1, 'scene preview filter should return previews');
+    assert.ok(scenePreviews.parsed.previews.every((item) => item.kind === 'scene'), 'kind=scene should only return scene previews');
+
+    const assetPreviews = await client.callTool('list_generated_previews', { projectPath: projectRoot, kind: 'asset' });
+    assert.equal(assetPreviews.parsed?.success, true, JSON.stringify(assetPreviews.parsed, null, 2));
+    assert.ok(assetPreviews.parsed?.previews?.length >= 1, 'asset preview filter should return previews');
+    assert.ok(assetPreviews.parsed.previews.every((item) => item.kind === 'asset'), 'kind=asset should only return asset previews');
+
+    const sceneSourcePreviews = await client.callTool('list_generated_previews', {
+      projectPath: projectRoot,
+      sourcePath: 'scenes/Main.tscn',
+    });
+    assert.equal(sceneSourcePreviews.parsed?.success, true, JSON.stringify(sceneSourcePreviews.parsed, null, 2));
+    assert.ok(sceneSourcePreviews.parsed?.previews?.some((item) => item.sourcePath === 'res://scenes/Main.tscn'));
+
+    const assetSourcePreviews = await client.callTool('list_generated_previews', {
+      projectPath: projectRoot,
+      sourcePath: 'assets/prefabs/Table.tscn',
+    });
+    assert.equal(assetSourcePreviews.parsed?.success, true, JSON.stringify(assetSourcePreviews.parsed, null, 2));
+    assert.ok(assetSourcePreviews.parsed?.previews?.some((item) => item.sourcePath === 'res://assets/prefabs/Table.tscn'));
+
+    assertNoDiff(diffSnapshots(listPreviewsBefore, snapshotProjectFiles(projectRoot)), 'list_generated_previews');
+    logPass('list_generated_previews');
 
     const beforeCheckpointSnapshot = snapshotProjectFiles(projectRoot);
     const checkpoint = await client.callTool('create_scene_checkpoint', {

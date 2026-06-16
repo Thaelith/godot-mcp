@@ -288,7 +288,7 @@ Current coverage includes:
 
 - tool registration for the expanded toolchain
 - `inspect_project_capabilities` and `inspect_scene_edit_context`
-- `scan_assets`, `get_asset_info`, `read_scene_tree`, `get_scene_layout`, `capture_scene_preview`, `capture_asset_preview`, and `validate_scene`
+- `scan_assets`, `get_asset_info`, `read_scene_tree`, `get_scene_layout`, `capture_scene_preview`, `capture_asset_preview`, `list_generated_previews`, and `validate_scene`
 - `dry_run_place_asset_in_scene`, `dry_run_align_nodes`, `dry_run_update_node_properties`, and `dry_run_scene_patch`
 - `place_asset_in_scene`, `align_nodes`, `update_node_properties`, and `apply_scene_patch`
 - `create_scene_checkpoint`, `list_scene_checkpoints`, and `restore_scene_checkpoint`
@@ -374,11 +374,11 @@ Output example:
     "latestCreatedAt": "2026-06-15T12:00:00Z"
   },
   "toolCapabilities": {
-    "readOnlyInspection": ["scan_assets", "get_asset_info", "read_scene_tree", "validate_scene", "get_scene_layout", "list_scene_checkpoints", "inspect_project_capabilities"],
+    "readOnlyInspection": ["scan_assets", "get_asset_info", "read_scene_tree", "validate_scene", "get_scene_layout", "capture_scene_preview", "capture_asset_preview", "list_generated_previews", "list_scene_checkpoints", "inspect_project_capabilities"],
     "dryRunPlanning": ["dry_run_scene_blueprint", "dry_run_align_nodes", "dry_run_place_asset_in_scene", "dry_run_update_node_properties", "dry_run_scene_patch"],
     "writers": ["create_scene_from_blueprint", "align_nodes", "place_asset_in_scene", "update_node_properties", "apply_scene_patch"],
     "safety": ["create_scene_checkpoint", "restore_scene_checkpoint"],
-    "recommendedTransactionFlow": ["inspect_project_capabilities", "scan_assets", "get_asset_info", "read_scene_tree", "get_scene_layout", "dry_run_scene_patch", "apply_scene_patch", "validate_scene"]
+    "recommendedTransactionFlow": ["inspect_project_capabilities", "scan_assets", "get_asset_info", "capture_asset_preview", "list_generated_previews", "read_scene_tree", "get_scene_layout", "dry_run_scene_patch", "apply_scene_patch", "capture_scene_preview", "validate_scene"]
   },
   "recommendations": [
     "Start with read_scene_tree and get_scene_layout for the main scene (res://scenes/Main.tscn).",
@@ -533,7 +533,7 @@ Output example:
     "Use dry_run_scene_patch before apply_scene_patch."
   ],
   "toolWorkflow": {
-    "safeEditFlow": ["inspect_scene_edit_context", "get_asset_info", "dry_run_scene_patch", "apply_scene_patch", "validate_scene"],
+    "safeEditFlow": ["inspect_scene_edit_context", "get_asset_info", "capture_asset_preview", "dry_run_scene_patch", "apply_scene_patch", "capture_scene_preview", "list_generated_previews", "validate_scene"],
     "rollbackFlow": ["list_scene_checkpoints", "restore_scene_checkpoint"]
   },
   "limits": {
@@ -711,6 +711,79 @@ The MCP response always returns JSON text first. When `includeImageContent` is t
 **Rendering and import limitations:** asset previews use Godot with an offscreen `SubViewport`, so they require a working rendering backend. Model previews use an approximate default camera/light. Scene previews depend on the asset's own setup or default viewport transform. Fresh texture files may not be importable by `ResourceLoader`; for safe local PNGs under the size cap, the TypeScript side can fall back to copying the original PNG into the preview directory and returns `TEXTURE_IMPORT_UNAVAILABLE`.
 
 **Workflow fit:** use `scan_assets` to find candidates, `get_asset_info` for dimensions/type/dependencies, `capture_asset_preview` to inspect the visual asset, then `dry_run_place_asset_in_scene` or `dry_run_scene_patch` before applying placement.
+
+### `list_generated_previews`
+
+Lists previously generated preview PNGs under a safe project-local preview directory. This is a read-only companion to `capture_scene_preview` and `capture_asset_preview`: it does not run Godot, create previews, embed image content, modify metadata, delete files, or touch scenes/assets.
+
+Input example:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "previewRoot": "res://.godot_mcp/previews",
+  "kind": "all",
+  "sourcePath": "res://scenes/Main.tscn",
+  "includeMetadata": true,
+  "includeMissingMetadata": true,
+  "maxResults": 100,
+  "sortOrder": "desc"
+}
+```
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "previewRoot": "res://.godot_mcp/previews",
+  "kind": "scene",
+  "sourcePath": "res://scenes/Main.tscn",
+  "totalFound": 1,
+  "returned": 1,
+  "truncated": false,
+  "previews": [
+    {
+      "previewPath": "res://.godot_mcp/previews/main_after_patch.png",
+      "metadataPath": "res://.godot_mcp/previews/main_after_patch.json",
+      "kind": "scene",
+      "sourcePath": "res://scenes/Main.tscn",
+      "createdAt": "2026-06-16T12:00:00Z",
+      "width": 1280,
+      "height": 720,
+      "transparent": false,
+      "sizeBytes": 12345,
+      "modifiedTime": "2026-06-16T12:00:00Z",
+      "hasMetadata": true,
+      "metadata": {
+        "scenePath": "res://scenes/Main.tscn",
+        "previewPath": "res://.godot_mcp/previews/main_after_patch.png"
+      },
+      "metadataError": null
+    }
+  ],
+  "summary": {
+    "scenePreviewCount": 1,
+    "assetPreviewCount": 0,
+    "unknownPreviewCount": 0,
+    "metadataIncluded": true,
+    "missingMetadataIncluded": true,
+    "maxResultsRequested": null,
+    "maxResultsApplied": 100,
+    "maxResultsClamped": false,
+    "sortOrder": "desc"
+  }
+}
+```
+
+**Filtering:** `kind` can be `all`, `scene`, or `asset`. `sourcePath` accepts `res://...` or project-relative paths and filters only previews whose adjacent metadata names the exact `scenePath` or `assetPath`. Missing-metadata previews are included only when no `sourcePath` filter is provided.
+
+**Metadata behavior:** when `includeMetadata` is true, the tool reads only adjacent `.json` files next to preview PNGs and refuses metadata larger than 64 KiB. Missing metadata is included or excluded with `includeMissingMetadata`. Malformed metadata does not fail the whole tool; the item is returned with `metadata: null` and a concise `metadataError` when missing metadata is allowed.
+
+**Safety model:** `projectPath`, `previewRoot`, and optional `sourcePath` must stay inside the Godot project. Symlink project roots, preview roots, preview directories, and preview files are rejected. The tool only scans `.png` files under `previewRoot`, bounded to the root and known child folders such as `assets/`, and never embeds image bytes.
+
+**Workflow fit:** after generating scene or asset previews, call `list_generated_previews` to find the latest preview path for an AI review step or to choose a preview file to open outside MCP. Use `capture_scene_preview` or `capture_asset_preview` again when visual content is needed directly in the MCP response.
 
 ## Asset Catalog
 
