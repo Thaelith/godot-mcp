@@ -28,4 +28,6 @@ jobs:
       # Full Godot integration smoke tests run locally when Godot is available.
       # CI intentionally covers build plus the no-Godot MCP smoke checks.
       - name: Smoke tests
+        env:
+          SMOKE_GODOT_MODE: none
         run: npm run smoke

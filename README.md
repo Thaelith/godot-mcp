@@ -273,6 +273,16 @@ Godot integration tests require a working Godot executable. Set it explicitly wh
 GODOT_PATH=/path/to/godot npm run smoke
 ```
 
+Smoke tests support explicit Godot modes through `SMOKE_GODOT_MODE`:
+
+```bash
+SMOKE_GODOT_MODE=auto npm run smoke
+SMOKE_GODOT_MODE=none npm run smoke
+SMOKE_GODOT_MODE=required GODOT_PATH=/path/to/godot npm run smoke
+```
+
+`auto` is the default and preserves local auto-detection: full integration runs when Godot is found, otherwise only no-Godot checks run. `none` skips Godot detection entirely and always runs the deterministic no-Godot checks. `required` fails if no working Godot executable is available, then runs the full integration suite when detection succeeds.
+
 On Windows PowerShell:
 
 ```powershell
@@ -280,9 +290,9 @@ $env:GODOT_PATH = "C:\path\to\Godot.exe"
 npm run smoke
 ```
 
-If Godot is not available, the suite still verifies the server starts, required tools are registered, and TypeScript-side safety errors are returned for invalid project and unsafe scene paths. It prints `Godot not found; skipped integration tests` in that mode. When Godot is found, it runs the full integration flow.
+If Godot is not available, the suite still verifies the server starts, required tools are registered, and TypeScript-side safety errors are returned for invalid project and unsafe scene paths. In `none` mode it prints `Godot mode: none; skipping integration tests.` When Godot is found in `auto` mode, or required in `required` mode, it runs the full integration flow.
 
-GitHub Actions runs `npm run smoke` on Ubuntu with Node.js 20 without installing Godot, so the standard CI workflow covers the build and no-Godot MCP smoke checks on push and pull requests. A separate optional **Godot Integration** workflow can be run manually from GitHub Actions; it installs pinned Godot 4.6.2 stable, sets `GODOT_PATH`, runs the full integration smoke suite under `xvfb-run`, and exercises preview capture. Run the same full integration smoke tests locally with Godot installed or `GODOT_PATH` set before changing writer, layout, checkpoint, or patch behavior.
+GitHub Actions runs `npm run smoke` on Ubuntu with Node.js 20 and `SMOKE_GODOT_MODE=none`, so the standard CI workflow intentionally covers the build and no-Godot MCP smoke checks on push and pull requests. A separate optional **Godot Integration** workflow can be run manually from GitHub Actions; it installs pinned Godot 4.6.2 stable, sets `GODOT_PATH`, runs with `SMOKE_GODOT_MODE=required` under `xvfb-run`, and exercises preview capture. Run the same full integration smoke tests locally with `SMOKE_GODOT_MODE=required` and Godot installed or `GODOT_PATH` set before changing writer, layout, checkpoint, or patch behavior.
 
 Current coverage includes:
 

@@ -19,6 +19,8 @@ import { fileURLToPath } from 'node:url';
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const buildEntry = path.join(repoRoot, 'build', 'index.js');
 const requestTimeoutMs = Number(process.env.SMOKE_TIMEOUT_MS || 30000);
+const smokeGodotMode = (process.env.SMOKE_GODOT_MODE || 'auto').toLowerCase();
+const allowedGodotModes = new Set(['auto', 'none', 'required']);
 
 const expectedTools = [
   'inspect_project_capabilities',
@@ -278,6 +280,8 @@ class McpStdioClient {
     };
     if (godotPath) {
       env.GODOT_PATH = godotPath;
+    } else {
+      delete env.GODOT_PATH;
     }
 
     this.child = spawn(process.execPath, [buildEntry], {
@@ -1020,13 +1024,41 @@ async function main() {
     throw new Error(`Build output not found at ${buildEntry}. Run npm run build first.`);
   }
 
+  if (!allowedGodotModes.has(smokeGodotMode)) {
+    throw new Error(`Invalid SMOKE_GODOT_MODE="${process.env.SMOKE_GODOT_MODE}". Expected one of: auto, none, required.`);
+  }
+
+  if (smokeGodotMode === 'none') {
+    logInfo('Godot mode: none; skipping integration tests.');
+    await runAlwaysSmoke({ godotPathForServer: null });
+    console.log('Smoke tests completed.');
+    return;
+  }
+
+  if (smokeGodotMode === 'required' && process.env.GODOT_PATH && !commandWorks(process.env.GODOT_PATH, ['--version'])) {
+    throw new Error(`SMOKE_GODOT_MODE=required but GODOT_PATH is not a working Godot executable: ${process.env.GODOT_PATH}`);
+  }
+
   const godotPath = detectGodotPath();
+  if (smokeGodotMode === 'required') {
+    if (!godotPath) {
+      throw new Error('SMOKE_GODOT_MODE=required but no working Godot executable was found. Set GODOT_PATH or install Godot on PATH.');
+    }
+    logInfo(`Godot detected at ${godotPath}`);
+    logInfo('Godot mode: required; running full integration tests.');
+    await runAlwaysSmoke({ godotPathForServer: godotPath });
+    await runIntegrationSmoke({ godotPath });
+    console.log('Smoke tests completed.');
+    return;
+  }
+
   if (godotPath) {
-    logInfo(`Godot found at ${godotPath}; running full integration tests`);
+    logInfo(`Godot detected at ${godotPath}`);
+    logInfo('Godot mode: auto; running full integration tests.');
     await runAlwaysSmoke({ godotPathForServer: godotPath });
     await runIntegrationSmoke({ godotPath });
   } else {
-    logInfo('Godot not found; skipped integration tests');
+    logInfo('Godot mode: auto; Godot not found; skipped integration tests.');
     await runAlwaysSmoke({ godotPathForServer: null });
   }
 

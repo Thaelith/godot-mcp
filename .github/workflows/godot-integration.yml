@@ -49,4 +49,6 @@ jobs:
           echo "GODOT_PATH=${GODOT_BIN}" >> "${GITHUB_ENV}"
 
       - name: Full smoke tests
+        env:
+          SMOKE_GODOT_MODE: required
         run: xvfb-run -a npm run smoke
