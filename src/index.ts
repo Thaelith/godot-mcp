@@ -161,6 +161,11 @@ class GodotServer {
     'sort_order': 'sortOrder',
     'preview_root': 'previewRoot',
     'source_path': 'sourcePath',
+    'keep_latest': 'keepLatest',
+    'older_than_days': 'olderThanDays',
+    'dry_run': 'dryRun',
+    'max_deletes': 'maxDeletes',
+    'require_confirmation': 'requireConfirmation',
     'output_path': 'outputPath',
     'output_dir': 'outputDir',
     'file_name': 'fileName',
@@ -741,6 +746,31 @@ class GodotServer {
    */
   private listGeneratedPreviewsErrorResponse(error: string, message: string): any {
     console.error(`[SERVER] list_generated_previews error response: ${error}: ${message}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error,
+              message,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  /**
+   * Create a cleanup_generated_previews-specific JSON error response while preserving MCP text content style.
+   */
+  private cleanupGeneratedPreviewsErrorResponse(error: string, message: string): any {
+    console.error(`[SERVER] cleanup_generated_previews error response: ${error}: ${message}`);
 
     return {
       content: [
@@ -4077,6 +4107,65 @@ class GodotServer {
           },
         },
         {
+          name: 'cleanup_generated_previews',
+          description: 'Dry-run or safely delete old generated preview PNGs and their adjacent metadata under res://.godot_mcp/previews',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Absolute path to the Godot project directory',
+              },
+              previewRoot: {
+                type: 'string',
+                description: 'Project-relative preview root to prune (default: res://.godot_mcp/previews)',
+              },
+              kind: {
+                type: 'string',
+                enum: ['all', 'scene', 'asset'],
+                description: 'Preview kind filter (default: all)',
+              },
+              sourcePath: {
+                type: 'string',
+                description: 'Optional scene or asset path to filter by when metadata exists',
+              },
+              keepLatest: {
+                type: 'number',
+                description: 'Number of newest previews to keep after filtering (default: 20, max: 1000)',
+              },
+              olderThanDays: {
+                type: 'number',
+                description: 'Only delete candidates older than this many days when provided (minimum: 0)',
+              },
+              dryRun: {
+                type: 'boolean',
+                description: 'Whether to only report cleanup candidates without deleting files (default: true)',
+              },
+              includeMetadata: {
+                type: 'boolean',
+                description: 'Whether to parse adjacent metadata JSON while planning cleanup (default: true)',
+              },
+              includeMissingMetadata: {
+                type: 'boolean',
+                description: 'Whether previews with missing or malformed metadata can be candidates (default: true)',
+              },
+              maxDeletes: {
+                type: 'number',
+                description: 'Maximum preview PNGs to delete or report as candidates (default: 100, max: 1000)',
+              },
+              requireConfirmation: {
+                type: 'boolean',
+                description: 'Whether dryRun=false requires confirmation DELETE_GENERATED_PREVIEWS (default: true)',
+              },
+              confirmation: {
+                type: 'string',
+                description: 'Required confirmation string when dryRun=false and requireConfirmation=true',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
           name: 'scan_assets',
           description: 'Scan a Godot project for usable assets and return a structured read-only catalog',
           inputSchema: {
@@ -5162,6 +5251,8 @@ class GodotServer {
           return await this.handleCaptureAssetPreview(request.params.arguments);
         case 'list_generated_previews':
           return await this.handleListGeneratedPreviews(request.params.arguments);
+        case 'cleanup_generated_previews':
+          return await this.handleCleanupGeneratedPreviews(request.params.arguments);
         case 'scan_assets':
           return await this.handleScanAssets(request.params.arguments);
         case 'get_asset_info':
@@ -7446,6 +7537,448 @@ class GodotServer {
       return this.listGeneratedPreviewsErrorResponse(
         'LIST_GENERATED_PREVIEWS_FAILED',
         `Failed to list generated previews: ${error?.message || 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * Handle the cleanup_generated_previews tool
+   */
+  private async handleCleanupGeneratedPreviews(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    const keepLatestRequested = args.keepLatest !== undefined ? args.keepLatest : null;
+    let keepLatestApplied = 20;
+    let keepLatestClamped = false;
+    if (args.keepLatest !== undefined) {
+      if (typeof args.keepLatest !== 'number' || !Number.isFinite(args.keepLatest) || args.keepLatest < 0) {
+        return this.cleanupGeneratedPreviewsErrorResponse(
+          'INVALID_KEEP_LATEST',
+          'keepLatest must be a number between 0 and 1000.'
+        );
+      }
+
+      if (args.keepLatest > 1000) {
+        keepLatestApplied = 1000;
+        keepLatestClamped = true;
+      } else {
+        keepLatestApplied = Math.floor(args.keepLatest);
+      }
+    }
+
+    const olderThanDays = args.olderThanDays !== undefined && args.olderThanDays !== null
+      ? args.olderThanDays
+      : null;
+    if (
+      olderThanDays !== null &&
+      (typeof olderThanDays !== 'number' || !Number.isFinite(olderThanDays) || olderThanDays < 0)
+    ) {
+      return this.cleanupGeneratedPreviewsErrorResponse(
+        'INVALID_OLDER_THAN_DAYS',
+        'olderThanDays must be a number greater than or equal to 0 when provided.'
+      );
+    }
+
+    const maxDeletesRequested = args.maxDeletes !== undefined ? args.maxDeletes : null;
+    let maxDeletesApplied = 100;
+    let maxDeletesClamped = false;
+    if (args.maxDeletes !== undefined) {
+      if (typeof args.maxDeletes !== 'number' || !Number.isFinite(args.maxDeletes) || args.maxDeletes < 1) {
+        return this.cleanupGeneratedPreviewsErrorResponse(
+          'INVALID_MAX_DELETES',
+          'maxDeletes must be a number between 1 and 1000.'
+        );
+      }
+
+      if (args.maxDeletes > 1000) {
+        maxDeletesApplied = 1000;
+        maxDeletesClamped = true;
+      } else {
+        maxDeletesApplied = Math.floor(args.maxDeletes);
+      }
+    }
+
+    const kindFilter = args.kind !== undefined ? args.kind : 'all';
+    if (typeof kindFilter !== 'string' || !['all', 'scene', 'asset'].includes(kindFilter)) {
+      return this.cleanupGeneratedPreviewsErrorResponse(
+        'INVALID_KIND',
+        'kind must be one of all, scene, or asset.'
+      );
+    }
+
+    const booleanOptions = ['dryRun', 'includeMetadata', 'includeMissingMetadata', 'requireConfirmation'];
+    for (const option of booleanOptions) {
+      if (args[option] !== undefined && typeof args[option] !== 'boolean') {
+        return this.cleanupGeneratedPreviewsErrorResponse(
+          'CLEANUP_GENERATED_PREVIEWS_FAILED',
+          `${option} must be a boolean.`
+        );
+      }
+    }
+
+    const dryRun = args.dryRun !== undefined ? args.dryRun : true;
+    const includeMetadata = args.includeMetadata !== undefined ? args.includeMetadata : true;
+    const includeMissingMetadata = args.includeMissingMetadata !== undefined ? args.includeMissingMetadata : true;
+    const requireConfirmation = args.requireConfirmation !== undefined ? args.requireConfirmation : true;
+
+    if (!args.projectPath || typeof args.projectPath !== 'string') {
+      return this.cleanupGeneratedPreviewsErrorResponse(
+        'MISSING_PROJECT_PATH',
+        'projectPath is required and must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    if (args.projectPath.includes('\0')) {
+      return this.cleanupGeneratedPreviewsErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must not contain null bytes.'
+      );
+    }
+
+    if (!isAbsolute(args.projectPath)) {
+      return this.cleanupGeneratedPreviewsErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    if (!dryRun && requireConfirmation && args.confirmation !== 'DELETE_GENERATED_PREVIEWS') {
+      return this.cleanupGeneratedPreviewsErrorResponse(
+        'CONFIRMATION_REQUIRED',
+        'dryRun=false requires confirmation to equal DELETE_GENERATED_PREVIEWS.'
+      );
+    }
+
+    const previewRootResult = this.normalizePreviewOutputDir(args.previewRoot, 'res://.godot_mcp/previews');
+    if (previewRootResult.error) {
+      return this.cleanupGeneratedPreviewsErrorResponse(
+        'UNSAFE_PREVIEW_ROOT',
+        previewRootResult.error.replace(/outputDir/g, 'previewRoot')
+      );
+    }
+
+    const normalizedPreviewRoot = previewRootResult.relativePath.replace(/\\/g, '/').toLowerCase();
+    if (
+      normalizedPreviewRoot !== '.godot_mcp/previews' &&
+      !normalizedPreviewRoot.startsWith('.godot_mcp/previews/')
+    ) {
+      return this.cleanupGeneratedPreviewsErrorResponse(
+        'UNSAFE_PREVIEW_ROOT',
+        'previewRoot for cleanup must be res://.godot_mcp/previews or a folder under it.'
+      );
+    }
+
+    let sourcePathResult: { relativePath: string; resourcePath: string; error?: string } | null = null;
+    if (args.sourcePath !== undefined) {
+      if (typeof args.sourcePath !== 'string') {
+        return this.cleanupGeneratedPreviewsErrorResponse(
+          'UNSAFE_SOURCE_PATH',
+          'sourcePath must be a string when provided.'
+        );
+      }
+
+      sourcePathResult = this.normalizeAssetPath(args.sourcePath);
+      if (sourcePathResult.error) {
+        return this.cleanupGeneratedPreviewsErrorResponse(
+          'UNSAFE_SOURCE_PATH',
+          sourcePathResult.error.replace(/assetPath/g, 'sourcePath')
+        );
+      }
+    }
+
+    try {
+      const normalizedProjectPath = resolve(args.projectPath);
+      if (!existsSync(normalizedProjectPath)) {
+        return this.cleanupGeneratedPreviewsErrorResponse(
+          'PROJECT_PATH_NOT_FOUND',
+          `Project path does not exist: ${args.projectPath}`
+        );
+      }
+
+      const projectStats = lstatSync(normalizedProjectPath);
+      if (projectStats.isSymbolicLink()) {
+        return this.cleanupGeneratedPreviewsErrorResponse(
+          'PROJECT_PATH_IS_SYMLINK',
+          'projectPath must not be a symbolic link.'
+        );
+      }
+
+      if (!projectStats.isDirectory()) {
+        return this.cleanupGeneratedPreviewsErrorResponse(
+          'PROJECT_PATH_NOT_DIRECTORY',
+          `Project path is not a directory: ${args.projectPath}`
+        );
+      }
+
+      const projectRoot = realpathSync(normalizedProjectPath);
+      const projectFile = join(projectRoot, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.cleanupGeneratedPreviewsErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          `Not a valid Godot project: ${args.projectPath}. The directory must contain a project.godot file.`
+        );
+      }
+
+      const projectFileStats = lstatSync(projectFile);
+      if (projectFileStats.isSymbolicLink() || !projectFileStats.isFile()) {
+        return this.cleanupGeneratedPreviewsErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          'project.godot must be a regular file and must not be a symbolic link.'
+        );
+      }
+
+      const previewRootPath = resolve(projectRoot, previewRootResult.relativePath);
+      if (!this.isPathInside(projectRoot, previewRootPath)) {
+        return this.cleanupGeneratedPreviewsErrorResponse(
+          'UNSAFE_PREVIEW_ROOT',
+          'previewRoot must stay inside the Godot project directory.'
+        );
+      }
+
+      const ancestorValidation = this.validatePreviewOutputAncestors(projectRoot, previewRootResult.relativePath);
+      if (ancestorValidation.error) {
+        return this.cleanupGeneratedPreviewsErrorResponse(
+          ancestorValidation.error === 'OUTPUT_DIR_IS_SYMLINK' ? 'PREVIEW_ROOT_IS_SYMLINK' : 'UNSAFE_PREVIEW_ROOT',
+          (ancestorValidation.message || 'previewRoot is not safe.').replace(/outputDir/g, 'previewRoot')
+        );
+      }
+
+      const summary = {
+        keepLatestRequested,
+        keepLatestApplied,
+        keepLatestClamped,
+        maxDeletesRequested,
+        maxDeletesApplied,
+        maxDeletesClamped,
+        olderThanDays,
+        requiresConfirmation: requireConfirmation,
+      };
+
+      const baseResult = {
+        success: true,
+        projectPath: projectRoot.replace(/\\/g, '/'),
+        previewRoot: previewRootResult.resourcePath,
+        dryRun,
+        kind: kindFilter,
+        sourcePath: sourcePathResult ? sourcePathResult.resourcePath : null,
+        totalFound: 0,
+        candidateCount: 0,
+        deletedCount: 0,
+        truncated: false,
+        candidates: [],
+        deleted: [],
+        skipped: [],
+        summary,
+      };
+
+      if (!existsSync(previewRootPath)) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify(baseResult, null, 2) }],
+        };
+      }
+
+      const previewRootStats = lstatSync(previewRootPath);
+      if (previewRootStats.isSymbolicLink()) {
+        return this.cleanupGeneratedPreviewsErrorResponse(
+          'PREVIEW_ROOT_IS_SYMLINK',
+          'previewRoot must not be a symbolic link.'
+        );
+      }
+
+      if (!previewRootStats.isDirectory()) {
+        return this.cleanupGeneratedPreviewsErrorResponse(
+          'UNSAFE_PREVIEW_ROOT',
+          'previewRoot exists but is not a directory.'
+        );
+      }
+
+      const realPreviewRootPath = realpathSync(previewRootPath);
+      if (!this.isPathInside(projectRoot, realPreviewRootPath)) {
+        return this.cleanupGeneratedPreviewsErrorResponse(
+          'UNSAFE_PREVIEW_ROOT',
+          'Resolved previewRoot must stay inside the Godot project directory.'
+        );
+      }
+
+      const listed = this.listPreviewDirectory(
+        projectRoot,
+        realPreviewRootPath,
+        realPreviewRootPath,
+        previewRootResult.relativePath,
+        includeMetadata,
+        includeMissingMetadata,
+        Boolean(sourcePathResult) || kindFilter !== 'all'
+      );
+
+      if (listed.error) {
+        return this.cleanupGeneratedPreviewsErrorResponse(listed.error, listed.message || 'Preview cleanup discovery failed.');
+      }
+
+      const normalizedSourceFilter = sourcePathResult ? sourcePathResult.resourcePath : null;
+      const filteredItems = listed.items.filter((item) => {
+        if (kindFilter !== 'all' && item.kind !== kindFilter) {
+          return false;
+        }
+
+        if (normalizedSourceFilter && item.sourcePath !== normalizedSourceFilter) {
+          return false;
+        }
+
+        return true;
+      });
+
+      filteredItems.sort((a, b) => {
+        const timeCompare = b.sortTime - a.sortTime;
+        if (timeCompare !== 0) {
+          return timeCompare;
+        }
+        return String(b.previewPath).localeCompare(String(a.previewPath));
+      });
+
+      const olderThanCutoff = olderThanDays === null
+        ? null
+        : Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
+
+      const deletionPool = filteredItems.slice(keepLatestApplied).filter((item) => {
+        if (olderThanCutoff === null) {
+          return true;
+        }
+        return (item.sortTime || 0) <= olderThanCutoff;
+      });
+
+      const candidateItems = deletionPool.slice(0, maxDeletesApplied).map((item) => {
+        const reasonParts = ['Older than keepLatest threshold.'];
+        if (olderThanDays !== null) {
+          reasonParts.push(`Older than ${olderThanDays} day${olderThanDays === 1 ? '' : 's'}.`);
+        }
+        const { sortTime: _sortTime, ...candidate } = item;
+        return {
+          ...candidate,
+          reason: reasonParts.join(' '),
+        };
+      });
+
+      const deleted: any[] = [];
+      const skipped: any[] = [];
+
+      if (!dryRun) {
+        for (const candidate of candidateItems) {
+          const previewRelativePath = typeof candidate.previewPath === 'string' && candidate.previewPath.startsWith('res://')
+            ? candidate.previewPath.slice('res://'.length).replace(/\\/g, '/')
+            : null;
+
+          if (!previewRelativePath || extname(previewRelativePath).toLowerCase() !== '.png') {
+            skipped.push({ previewPath: candidate.previewPath, reason: 'Preview path was not a safe PNG resource path.' });
+            continue;
+          }
+
+          const previewFilePath = resolve(projectRoot, previewRelativePath);
+          if (!this.isPathInside(projectRoot, previewFilePath) || !this.isPathInside(realPreviewRootPath, previewFilePath)) {
+            skipped.push({ previewPath: candidate.previewPath, reason: 'Preview path would escape the allowed preview root.' });
+            continue;
+          }
+
+          if (!existsSync(previewFilePath)) {
+            skipped.push({ previewPath: candidate.previewPath, reason: 'Preview file no longer exists.' });
+            continue;
+          }
+
+          const previewStats = lstatSync(previewFilePath);
+          if (previewStats.isSymbolicLink()) {
+            skipped.push({ previewPath: candidate.previewPath, reason: 'Preview file is a symbolic link.' });
+            continue;
+          }
+
+          if (!previewStats.isFile()) {
+            skipped.push({ previewPath: candidate.previewPath, reason: 'Preview path is not a regular file.' });
+            continue;
+          }
+
+          const realPreviewFilePath = realpathSync(previewFilePath);
+          if (!this.isPathInside(realPreviewRootPath, realPreviewFilePath)) {
+            skipped.push({ previewPath: candidate.previewPath, reason: 'Resolved preview file would escape the allowed preview root.' });
+            continue;
+          }
+
+          let metadataFilePath: string | null = null;
+          let metadataResourcePath: string | null = null;
+          let shouldDeleteMetadata = false;
+          if (typeof candidate.metadataPath === 'string' && candidate.metadataPath.startsWith('res://')) {
+            const metadataRelativePath = candidate.metadataPath.slice('res://'.length).replace(/\\/g, '/');
+            if (
+              extname(metadataRelativePath).toLowerCase() === '.json' &&
+              dirname(metadataRelativePath).replace(/\\/g, '/') === dirname(previewRelativePath).replace(/\\/g, '/') &&
+              basename(metadataRelativePath, '.json') === basename(previewRelativePath, '.png')
+            ) {
+              metadataFilePath = resolve(projectRoot, metadataRelativePath);
+              metadataResourcePath = candidate.metadataPath;
+            }
+          }
+
+          if (metadataFilePath && existsSync(metadataFilePath)) {
+            if (!this.isPathInside(projectRoot, metadataFilePath) || !this.isPathInside(realPreviewRootPath, metadataFilePath)) {
+              skipped.push({ previewPath: candidate.previewPath, metadataPath: metadataResourcePath, reason: 'Metadata path would escape the allowed preview root.' });
+              continue;
+            }
+
+            const metadataStats = lstatSync(metadataFilePath);
+            if (metadataStats.isSymbolicLink()) {
+              skipped.push({ previewPath: candidate.previewPath, metadataPath: metadataResourcePath, reason: 'Metadata file is a symbolic link.' });
+              continue;
+            }
+
+            if (!metadataStats.isFile()) {
+              skipped.push({ previewPath: candidate.previewPath, metadataPath: metadataResourcePath, reason: 'Metadata path is not a regular file.' });
+              continue;
+            }
+
+            const realMetadataFilePath = realpathSync(metadataFilePath);
+            if (!this.isPathInside(realPreviewRootPath, realMetadataFilePath)) {
+              skipped.push({ previewPath: candidate.previewPath, metadataPath: metadataResourcePath, reason: 'Resolved metadata file would escape the allowed preview root.' });
+              continue;
+            }
+            shouldDeleteMetadata = true;
+          }
+
+          unlinkSync(previewFilePath);
+          let deletedMetadata = false;
+          if (metadataFilePath && shouldDeleteMetadata) {
+            unlinkSync(metadataFilePath);
+            deletedMetadata = true;
+          }
+
+          deleted.push({
+            previewPath: candidate.previewPath,
+            metadataPath: metadataResourcePath,
+            deletedPreview: true,
+            deletedMetadata,
+          });
+        }
+      }
+
+      const result = {
+        ...baseResult,
+        totalFound: filteredItems.length,
+        candidateCount: candidateItems.length,
+        deletedCount: deleted.length,
+        truncated: deletionPool.length > candidateItems.length,
+        candidates: dryRun ? candidateItems : [],
+        deleted,
+        skipped,
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.cleanupGeneratedPreviewsErrorResponse(
+        'CLEANUP_GENERATED_PREVIEWS_FAILED',
+        `Failed to cleanup generated previews: ${error?.message || 'Unknown error'}`
       );
     }
   }

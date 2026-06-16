@@ -288,7 +288,7 @@ Current coverage includes:
 
 - tool registration for the expanded toolchain
 - `inspect_project_capabilities` and `inspect_scene_edit_context`
-- `scan_assets`, `get_asset_info`, `read_scene_tree`, `get_scene_layout`, `capture_scene_preview`, `capture_asset_preview`, `list_generated_previews`, and `validate_scene`
+- `scan_assets`, `get_asset_info`, `read_scene_tree`, `get_scene_layout`, `capture_scene_preview`, `capture_asset_preview`, `list_generated_previews`, `cleanup_generated_previews`, and `validate_scene`
 - `dry_run_place_asset_in_scene`, `dry_run_align_nodes`, `dry_run_update_node_properties`, and `dry_run_scene_patch`
 - `place_asset_in_scene`, `align_nodes`, `update_node_properties`, and `apply_scene_patch`
 - `create_scene_checkpoint`, `list_scene_checkpoints`, and `restore_scene_checkpoint`
@@ -784,6 +784,93 @@ Output example:
 **Safety model:** `projectPath`, `previewRoot`, and optional `sourcePath` must stay inside the Godot project. Symlink project roots, preview roots, preview directories, and preview files are rejected. The tool only scans `.png` files under `previewRoot`, bounded to the root and known child folders such as `assets/`, and never embeds image bytes.
 
 **Workflow fit:** after generating scene or asset previews, call `list_generated_previews` to find the latest preview path for an AI review step or to choose a preview file to open outside MCP. Use `capture_scene_preview` or `capture_asset_preview` again when visual content is needed directly in the MCP response.
+
+### `cleanup_generated_previews`
+
+Safely plans or prunes generated preview PNGs under `res://.godot_mcp/previews`. The default is `dryRun: true`, so the tool reports cleanup candidates without deleting anything unless deletion is explicitly requested and confirmed.
+
+Dry-run example keeping the latest 20 previews:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "previewRoot": "res://.godot_mcp/previews",
+  "keepLatest": 20,
+  "dryRun": true
+}
+```
+
+Delete old asset previews after confirmation:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "kind": "asset",
+  "keepLatest": 10,
+  "olderThanDays": 14,
+  "dryRun": false,
+  "confirmation": "DELETE_GENERATED_PREVIEWS"
+}
+```
+
+Prune previews for one scene or asset:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "sourcePath": "res://scenes/Main.tscn",
+  "keepLatest": 3,
+  "dryRun": true
+}
+```
+
+Output example:
+
+```json
+{
+  "success": true,
+  "projectPath": "C:/path/to/project",
+  "previewRoot": "res://.godot_mcp/previews",
+  "dryRun": true,
+  "kind": "all",
+  "sourcePath": null,
+  "totalFound": 40,
+  "candidateCount": 20,
+  "deletedCount": 0,
+  "truncated": false,
+  "candidates": [
+    {
+      "previewPath": "res://.godot_mcp/previews/assets/old.png",
+      "metadataPath": "res://.godot_mcp/previews/assets/old.json",
+      "kind": "asset",
+      "sourcePath": "res://assets/old.png",
+      "createdAt": "2026-06-01T12:00:00Z",
+      "sizeBytes": 12345,
+      "reason": "Older than keepLatest threshold."
+    }
+  ],
+  "deleted": [],
+  "skipped": [],
+  "summary": {
+    "keepLatestRequested": null,
+    "keepLatestApplied": 20,
+    "keepLatestClamped": false,
+    "maxDeletesRequested": null,
+    "maxDeletesApplied": 100,
+    "maxDeletesClamped": false,
+    "olderThanDays": null,
+    "requiresConfirmation": true
+  }
+}
+```
+
+When `dryRun` is false and `requireConfirmation` is true, `confirmation` must exactly equal `DELETE_GENERATED_PREVIEWS`. Confirmed cleanup deletes only candidate preview PNGs and adjacent metadata JSON files that share the same basename. It does not delete directories, checkpoints, scenes, assets, arbitrary JSON files, or non-PNG files.
+
+**Filtering and pruning:** cleanup uses the same bounded discovery and metadata rules as `list_generated_previews`. It filters by `kind` and optional metadata-backed `sourcePath`, sorts newest first by metadata `capturedAt` / `createdAt` or file modified time, keeps the newest `keepLatest`, optionally restricts candidates by `olderThanDays`, and caps deletion with `maxDeletes`.
+
+**Safety model:** cleanup is limited to `res://.godot_mcp/previews` or a folder under it. Symlink project roots, preview roots, preview directories, preview PNGs, and metadata files are refused or skipped. Every candidate path is revalidated immediately before deletion. In dry-run mode the tool is read-only and does not modify files.
+
+**Workflow fit:** use `list_generated_previews` to inspect generated previews, run `cleanup_generated_previews` first in dry-run mode, then repeat with `dryRun: false` and confirmation only when the candidate list is acceptable.
 
 ## Asset Catalog
 

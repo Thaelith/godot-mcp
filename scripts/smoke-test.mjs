@@ -30,6 +30,7 @@ const expectedTools = [
   'capture_scene_preview',
   'capture_asset_preview',
   'list_generated_previews',
+  'cleanup_generated_previews',
   'validate_scene',
   'dry_run_place_asset_in_scene',
   'place_asset_in_scene',
@@ -467,6 +468,30 @@ async function runAlwaysSmoke({ godotPathForServer }) {
       'INVALID_MAX_RESULTS'
     );
     logPass('list_generated_previews invalid maxResults');
+
+    await expectStructuredError(
+      client,
+      'cleanup_generated_previews',
+      { projectPath: missingProject },
+      'PROJECT_PATH_NOT_FOUND'
+    );
+    logPass('cleanup_generated_previews invalid projectPath');
+
+    await expectStructuredError(
+      client,
+      'cleanup_generated_previews',
+      { projectPath: process.cwd(), keepLatest: -1 },
+      'INVALID_KEEP_LATEST'
+    );
+    logPass('cleanup_generated_previews invalid keepLatest');
+
+    await expectStructuredError(
+      client,
+      'cleanup_generated_previews',
+      { projectPath: process.cwd(), dryRun: false },
+      'CONFIRMATION_REQUIRED'
+    );
+    logPass('cleanup_generated_previews confirmation required');
   } finally {
     await client.close();
   }
@@ -640,6 +665,41 @@ async function runIntegrationSmoke({ godotPath }) {
 
     assertNoDiff(diffSnapshots(listPreviewsBefore, snapshotProjectFiles(projectRoot)), 'list_generated_previews');
     logPass('list_generated_previews');
+
+    const cleanupDryRunBefore = snapshotProjectFiles(projectRoot);
+    const cleanupDryRun = await client.callTool('cleanup_generated_previews', {
+      projectPath: projectRoot,
+      keepLatest: 0,
+      dryRun: true,
+    });
+    assert.equal(cleanupDryRun.parsed?.success, true, JSON.stringify(cleanupDryRun.parsed, null, 2));
+    assert.equal(cleanupDryRun.parsed?.dryRun, true);
+    assert.ok(cleanupDryRun.parsed?.candidateCount >= 2, 'cleanup dry-run should return preview candidates');
+    assertNoDiff(diffSnapshots(cleanupDryRunBefore, snapshotProjectFiles(projectRoot)), 'cleanup_generated_previews dry-run');
+    logPass('cleanup_generated_previews dry-run');
+
+    const cleanupBefore = snapshotProjectFiles(projectRoot);
+    const cleanup = await client.callTool('cleanup_generated_previews', {
+      projectPath: projectRoot,
+      keepLatest: 0,
+      dryRun: false,
+      confirmation: 'DELETE_GENERATED_PREVIEWS',
+    });
+    assert.equal(cleanup.parsed?.success, true, JSON.stringify(cleanup.parsed, null, 2));
+    assert.equal(cleanup.parsed?.dryRun, false);
+    assert.ok(cleanup.parsed?.deletedCount >= 2, 'cleanup should delete generated preview files');
+    assert.ok(cleanup.parsed?.deleted?.some((item) => item.previewPath === preview.parsed.previewPath && item.deletedPreview));
+    assert.ok(cleanup.parsed?.deleted?.some((item) => item.metadataPath === preview.parsed.metadataPath && item.deletedMetadata));
+    assert.ok(cleanup.parsed?.deleted?.some((item) => item.previewPath === assetPreview.parsed.previewPath && item.deletedPreview));
+    assert.ok(cleanup.parsed?.deleted?.some((item) => item.metadataPath === assetPreview.parsed.metadataPath && item.deletedMetadata));
+    assert.equal(existsSync(godotResourceToFilePath(projectRoot, preview.parsed.previewPath)), false, 'scene preview PNG should be deleted');
+    assert.equal(existsSync(godotResourceToFilePath(projectRoot, preview.parsed.metadataPath)), false, 'scene preview metadata should be deleted');
+    assert.equal(existsSync(godotResourceToFilePath(projectRoot, assetPreview.parsed.previewPath)), false, 'asset preview PNG should be deleted');
+    assert.equal(existsSync(godotResourceToFilePath(projectRoot, assetPreview.parsed.metadataPath)), false, 'asset preview metadata should be deleted');
+    assert.equal(sha256File(scenePath), originalSceneHash, 'cleanup_generated_previews should not modify the scene file');
+    assert.equal(sha256File(sceneAssetPath), originalSceneAssetHash, 'cleanup_generated_previews should not modify asset files');
+    assertOnlyAllowedDiff(diffSnapshots(cleanupBefore, snapshotProjectFiles(projectRoot)), ['.godot_mcp/previews'], 'cleanup_generated_previews');
+    logPass('cleanup_generated_previews delete');
 
     const beforeCheckpointSnapshot = snapshotProjectFiles(projectRoot);
     const checkpoint = await client.callTool('create_scene_checkpoint', {
