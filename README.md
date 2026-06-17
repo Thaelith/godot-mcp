@@ -94,7 +94,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 
 The generated MCP tool reference is available in [docs/tools.md](docs/tools.md). It is generated from `src/tools/schemas.ts`, so it reflects the actual tool names, descriptions, required fields, property types, enums, and compact JSON skeletons registered by the server.
 
-Regenerate it after changing tool schemas:
+Regenerate `docs/tools.md` after changing tool schemas:
 
 ```bash
 npm run docs:tools
@@ -106,6 +106,10 @@ npm run docs:tools
 npm run build
 npm run check:docs
 ```
+
+## Workflow Recipes
+
+Practical AI scene-editing recipes are available in [docs/workflows.md](docs/workflows.md). Use `docs/tools.md` as the schema reference and `docs/workflows.md` as the usage guide for choosing tool order, running dry-runs before writes, managing previews, and restoring checkpoints.
 
 ## Requirements
 
