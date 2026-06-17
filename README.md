@@ -117,6 +117,12 @@ Workflow recipe examples can be checked against the registered tool schemas with
 npm run check:workflows
 ```
 
+Published package contents, including the linked docs, can be checked with:
+
+```bash
+npm run check:package
+```
+
 ## Requirements
 
 - [Godot Engine](https://godotengine.org/download) installed on your system
