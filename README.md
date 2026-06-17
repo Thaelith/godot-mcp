@@ -103,6 +103,7 @@ npm run docs:tools
 `docs/tools.md` should be updated in the same change as any schema edit. To verify the generated file is current, run:
 
 ```bash
+npm run build
 npm run check:docs
 ```
 
