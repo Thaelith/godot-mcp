@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+import path from 'node:path';
+
+const require = createRequire(import.meta.url);
 
 const requiredFiles = [
   'package.json',
@@ -23,23 +27,87 @@ const forbiddenFiles = new Set([
   '.package-preview.json',
 ]);
 
-let parsed;
-try {
-  const packArgs = ['pack', '--dry-run', '--json', '--ignore-scripts'];
-  const stdout = process.platform === 'win32'
-    ? execFileSync(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `npm ${packArgs.join(' ')}`], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-    : execFileSync('npm', packArgs, {
+const packArgs = ['pack', '--dry-run', '--json', '--ignore-scripts', '--silent'];
+
+function parseNpmPackJsonOutput(stdout) {
+  const trimmed = String(stdout || '').trim();
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // Fall back to extracting the JSON array when npm prefixes human-readable output.
+  }
+
+  const start = trimmed.indexOf('[');
+  const end = trimmed.lastIndexOf(']');
+
+  if (start !== -1 && end !== -1 && end > start) {
+    const jsonSlice = trimmed.slice(start, end + 1);
+    return JSON.parse(jsonSlice);
+  }
+
+  const preview = trimmed.slice(0, 500);
+  throw new Error(`Could not find npm pack JSON array in stdout. Stdout preview: ${preview}`);
+}
+
+function runNpmPackDryRun() {
+  const options = {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
-    });
-  parsed = JSON.parse(stdout);
+  };
+
+  if (process.env.npm_execpath) {
+    return execFileSync(process.execPath, [process.env.npm_execpath, ...packArgs], options);
+  }
+
+  return execFileSync('npm', packArgs, options);
+}
+
+async function getPackageInfoFromPacklistFallback() {
+  const npmExecPath = process.env.npm_execpath;
+  const npmRoot = npmExecPath ? path.resolve(path.dirname(npmExecPath), '..') : null;
+  const packlistModulePath = npmRoot ? path.join(npmRoot, 'node_modules', 'npm-packlist') : 'npm-packlist';
+  const arboristModulePath = npmRoot ? path.join(npmRoot, 'node_modules', '@npmcli', 'arborist') : '@npmcli/arborist';
+  const packlist = require(packlistModulePath);
+  const Arborist = require(arboristModulePath);
+  const arborist = new Arborist({ path: process.cwd() });
+  const tree = await arborist.loadActual();
+  const files = await packlist(tree);
+
+  return [{
+    files: files.map((filePath) => ({
+      path: filePath.replace(/\\/g, '/'),
+    })),
+  }];
+}
+
+let stdout;
+let parsed;
+try {
+  stdout = runNpmPackDryRun();
 } catch (error) {
-  const detail = error.stdout || error.stderr || error.message;
-  console.error(`Failed to inspect package contents: ${detail}`);
-  process.exit(1);
+  if (error.code === 'EPERM') {
+    console.log('WARNING npm pack dry run could not be spawned in this environment; using npm-packlist fallback.');
+    try {
+      parsed = await getPackageInfoFromPacklistFallback();
+    } catch (fallbackError) {
+      console.error(`Failed to inspect package contents with npm-packlist fallback: ${fallbackError.message}`);
+      process.exit(1);
+    }
+  } else {
+    const detail = error.stdout || error.stderr || error.message;
+    console.error(`Failed to run npm pack dry run: ${detail}`);
+    process.exit(1);
+  }
+}
+
+if (!parsed) {
+  try {
+    parsed = parseNpmPackJsonOutput(stdout);
+  } catch (error) {
+    console.error(`Failed to parse npm pack JSON output: ${error.message}`);
+    process.exit(1);
+  }
 }
 
 const packageInfo = Array.isArray(parsed) ? parsed[0] : null;
