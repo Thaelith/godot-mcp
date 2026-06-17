@@ -149,6 +149,9 @@ class GodotServer {
     'include_usages': 'includeUsages',
     'include_generated_previews': 'includeGeneratedPreviews',
     'include_placement_hints': 'includePlacementHints',
+    'include_context': 'includeContext',
+    'include_dry_run_payload': 'includeDryRunPayload',
+    'include_apply_payload': 'includeApplyPayload',
     'include_checkpoint_summary': 'includeCheckpointSummary',
     'include_tool_capabilities': 'includeToolCapabilities',
     'include_recommendations': 'includeRecommendations',
@@ -705,6 +708,31 @@ class GodotServer {
    */
   private inspectAssetEditContextErrorResponse(error: string, message: string): any {
     console.error(`[SERVER] inspect_asset_edit_context error response: ${error}: ${message}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error,
+              message,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  /**
+   * Create a suggest_scene_patch-specific JSON error response while preserving MCP text content style.
+   */
+  private suggestScenePatchErrorResponse(error: string, message: string): any {
+    console.error(`[SERVER] suggest_scene_patch error response: ${error}: ${message}`);
 
     return {
       content: [
@@ -2949,6 +2977,7 @@ class GodotServer {
         'dry_run_align_nodes',
         'dry_run_place_asset_in_scene',
         'dry_run_update_node_properties',
+        'suggest_scene_patch',
         'dry_run_scene_patch',
       ],
       writers: [
@@ -2973,6 +3002,7 @@ class GodotServer {
         'read_scene_tree',
         'get_scene_layout',
         'capture_scene_preview',
+        'suggest_scene_patch',
         'dry_run_scene_patch',
         'apply_scene_patch',
         'validate_scene',
@@ -3528,6 +3558,7 @@ class GodotServer {
         'find_asset_usages',
         'inspect_asset_edit_context',
         'capture_asset_preview',
+        'suggest_scene_patch',
         'dry_run_scene_patch',
         'apply_scene_patch',
         'capture_scene_preview',
@@ -4588,6 +4619,56 @@ class GodotServer {
           },
         },
         {
+          name: 'suggest_scene_patch',
+          description: 'Suggest a safe dry_run_scene_patch/apply_scene_patch payload from structured scene editing intent',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Absolute path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Existing Godot scene path such as res://scenes/Main.tscn or scenes/Main.tscn',
+              },
+              intent: {
+                type: 'object',
+                description: 'Structured intent object: place_asset, place_asset_relative, update_node, align_nodes, or composite',
+              },
+              includeContext: {
+                type: 'boolean',
+                description: 'Whether to gather compact read-only scene/asset context (default: true)',
+              },
+              includeDryRunPayload: {
+                type: 'boolean',
+                description: 'Whether to include a suggested dry_run_scene_patch payload (default: true)',
+              },
+              includeApplyPayload: {
+                type: 'boolean',
+                description: 'Whether to include a suggested apply_scene_patch payload (default: true)',
+              },
+              includeRecommendations: {
+                type: 'boolean',
+                description: 'Whether to include concise next-step recommendations (default: true)',
+              },
+              maxAssets: {
+                type: 'number',
+                description: 'Maximum assets to include in context (default: 50, max: 500)',
+              },
+              maxNodes: {
+                type: 'number',
+                description: 'Maximum scene nodes to include in context (default: 300, max: 2000)',
+              },
+              maxSteps: {
+                type: 'number',
+                description: 'Maximum suggested patch steps including checkpoint/validation (default: 20, max: 100)',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'intent'],
+          },
+        },
+        {
           name: 'read_scene_tree',
           description: 'Load a Godot scene read-only and return a structured scene tree description',
           inputSchema: {
@@ -5606,6 +5687,8 @@ class GodotServer {
           return await this.handleFindAssetUsages(request.params.arguments);
         case 'inspect_asset_edit_context':
           return await this.handleInspectAssetEditContext(request.params.arguments);
+        case 'suggest_scene_patch':
+          return await this.handleSuggestScenePatch(request.params.arguments);
         case 'read_scene_tree':
           return await this.handleReadSceneTree(request.params.arguments);
         case 'get_scene_layout':
@@ -9353,6 +9436,875 @@ class GodotServer {
       return this.inspectAssetEditContextErrorResponse(
         'INSPECT_ASSET_EDIT_CONTEXT_FAILED',
         `Failed to inspect asset edit context: ${error?.message || 'Unknown error'}`
+      );
+    }
+  }
+
+  private suggestPatchIssue(severity: 'error' | 'warning' | 'info', code: string, message: string, extra: any = {}): any {
+    return {
+      severity,
+      code,
+      message,
+      ...extra,
+    };
+  }
+
+  private summarizeSuggestPatchIssues(issues: any[]): { valid: boolean; severity: string; errorCount: number; warningCount: number; infoCount: number } {
+    const errorCount = issues.filter(issue => issue?.severity === 'error').length;
+    const warningCount = issues.filter(issue => issue?.severity === 'warning').length;
+    const infoCount = issues.filter(issue => issue?.severity === 'info').length;
+    return {
+      valid: errorCount === 0,
+      severity: errorCount > 0 ? 'error' : warningCount > 0 ? 'warning' : infoCount > 0 ? 'info' : 'ok',
+      errorCount,
+      warningCount,
+      infoCount,
+    };
+  }
+
+  private parseMcpTextJson(response: any): any | null {
+    const text = response?.content?.find((item: any) => item?.type === 'text')?.text;
+    if (typeof text !== 'string') {
+      return null;
+    }
+
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  }
+
+  private validateSuggestNodePath(value: unknown, label: string): { path: string; error?: string } {
+    if (typeof value !== 'string' || value.trim() === '') {
+      return { path: '', error: `${label} must be a non-empty scene node path.` };
+    }
+
+    if (value.includes('\0')) {
+      return { path: '', error: `${label} must not contain null bytes.` };
+    }
+
+    const trimmed = value.trim();
+    const slashNormalized = trimmed.replace(/\\/g, '/');
+    const normalizedPath = normalize(slashNormalized).replace(/\\/g, '/');
+    if (
+      slashNormalized.startsWith('res://') ||
+      slashNormalized.includes('://') ||
+      isAbsolute(trimmed) ||
+      /^[A-Za-z]:\//.test(slashNormalized) ||
+      normalizedPath === '.' ||
+      normalizedPath === '..' ||
+      normalizedPath.startsWith('../') ||
+      normalizedPath.includes('/../')
+    ) {
+      return { path: '', error: `${label} must be a scene node path, not a filesystem or resource path.` };
+    }
+
+    return { path: slashNormalized };
+  }
+
+  private validateSuggestNodeName(value: unknown): { name: string; error?: string } {
+    if (value === undefined || value === null) {
+      return { name: '' };
+    }
+    if (typeof value !== 'string' || value.trim() === '') {
+      return { name: '', error: 'nodeName must be a non-empty string when provided.' };
+    }
+
+    const name = value.trim();
+    if (name.includes('\0') || name.includes('/') || name.includes('\\') || name === '.' || name === '..') {
+      return { name: '', error: 'nodeName must be a single safe Godot node name.' };
+    }
+
+    return { name };
+  }
+
+  private collectSuggestIntentAssetPaths(intent: any, paths = new Set<string>()): Set<string> {
+    if (!intent || typeof intent !== 'object') {
+      return paths;
+    }
+
+    if (typeof intent.assetPath === 'string') {
+      const normalized = this.normalizeAssetPath(intent.assetPath);
+      if (!normalized.error) {
+        paths.add(normalized.resourcePath);
+      }
+    }
+
+    if (intent.type === 'composite' && Array.isArray(intent.steps)) {
+      for (const step of intent.steps) {
+        this.collectSuggestIntentAssetPaths(step, paths);
+      }
+    }
+
+    return paths;
+  }
+
+  private collectSceneTreeNodePaths(root: any): Set<string> {
+    const paths = new Set<string>();
+    const visit = (node: any) => {
+      if (!node || typeof node !== 'object') {
+        return;
+      }
+      if (typeof node.path === 'string' && node.path) {
+        paths.add(node.path);
+      }
+      if (Array.isArray(node.children)) {
+        for (const child of node.children) {
+          visit(child);
+        }
+      }
+    };
+    visit(root);
+    return paths;
+  }
+
+  private suggestPatchAssetDefaults(assetType: AssetType): { supported: boolean; nodeType?: string; assetProperty?: string } {
+    switch (assetType) {
+      case 'texture':
+        return { supported: true, nodeType: 'Sprite2D', assetProperty: 'texture' };
+      case 'scene':
+        return { supported: true, assetProperty: 'instance' };
+      case 'model':
+        return { supported: true, nodeType: 'MeshInstance3D', assetProperty: 'mesh' };
+      case 'audio':
+        return { supported: true, nodeType: 'AudioStreamPlayer2D', assetProperty: 'stream' };
+      case 'font':
+        return { supported: true, nodeType: 'Label', assetProperty: 'font' };
+      default:
+        return { supported: false };
+    }
+  }
+
+  private validateSuggestAsset(projectRoot: string, assetPath: unknown, issues: any[], intentType: string): any | null {
+    if (typeof assetPath !== 'string' || assetPath.trim() === '') {
+      issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', `${intentType} intent requires assetPath.`));
+      return null;
+    }
+
+    const assetPathResult = this.normalizeAssetPath(assetPath);
+    if (assetPathResult.error) {
+      issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', assetPathResult.error, { assetPath }));
+      return null;
+    }
+
+    const assetFilePath = resolve(projectRoot, assetPathResult.relativePath);
+    if (!this.isPathInside(projectRoot, assetFilePath)) {
+      issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', 'assetPath must stay inside the Godot project directory.', { assetPath: assetPathResult.resourcePath }));
+      return null;
+    }
+
+    if (!existsSync(assetFilePath)) {
+      issues.push(this.suggestPatchIssue('error', 'ASSET_NOT_FOUND', `Asset file does not exist: ${assetPathResult.resourcePath}`, { assetPath: assetPathResult.resourcePath }));
+      return null;
+    }
+
+    const assetStats = lstatSync(assetFilePath);
+    if (assetStats.isSymbolicLink() || !assetStats.isFile()) {
+      issues.push(this.suggestPatchIssue('error', 'ASSET_NOT_FOUND', `Asset path is not a regular file: ${assetPathResult.resourcePath}`, { assetPath: assetPathResult.resourcePath }));
+      return null;
+    }
+
+    const realAssetPath = realpathSync(assetFilePath);
+    if (!this.isPathInside(projectRoot, realAssetPath)) {
+      issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', 'Resolved assetPath must stay inside the Godot project directory.', { assetPath: assetPathResult.resourcePath }));
+      return null;
+    }
+
+    const assetType = this.getAssetType(extname(assetPathResult.relativePath).toLowerCase());
+    const defaults = this.suggestPatchAssetDefaults(assetType);
+    if (!defaults.supported) {
+      issues.push(this.suggestPatchIssue(
+        'error',
+        'UNSUPPORTED_ASSET_TYPE',
+        `Asset type ${assetType} is not supported by safe scene patch placement suggestions.`,
+        { assetPath: assetPathResult.resourcePath, assetType }
+      ));
+      return null;
+    }
+
+    return {
+      assetPath: assetPathResult.resourcePath,
+      assetType,
+      defaults,
+    };
+  }
+
+  private warnSuggestMissingNode(nodePaths: Set<string>, issues: any[], code: string, nodePath: string, message: string, extra: any = {}) {
+    if (nodePaths.size > 0 && !nodePaths.has(nodePath)) {
+      issues.push(this.suggestPatchIssue('warning', code, message, { nodePath, ...extra }));
+    }
+  }
+
+  private convertSuggestIntentToPatchSteps(intent: any, projectRoot: string, sceneNodePaths: Set<string>, issues: any[], depth = 0): any[] {
+    if (!intent || typeof intent !== 'object' || Array.isArray(intent)) {
+      issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', 'intent must be an object.'));
+      return [];
+    }
+
+    if (typeof intent.type !== 'string' || intent.type.trim() === '') {
+      issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', 'intent.type is required.'));
+      return [];
+    }
+
+    const intentType = intent.type.trim();
+    if (intentType === 'composite') {
+      if (depth > 4) {
+        issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', 'Nested composite intents are too deep.'));
+        return [];
+      }
+      if (!Array.isArray(intent.steps) || intent.steps.length === 0) {
+        issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', 'composite intent requires a non-empty steps array.'));
+        return [];
+      }
+      return intent.steps.flatMap((step: any) => this.convertSuggestIntentToPatchSteps(step, projectRoot, sceneNodePaths, issues, depth + 1));
+    }
+
+    if (intentType === 'place_asset' || intentType === 'place_asset_relative') {
+      const asset = this.validateSuggestAsset(projectRoot, intent.assetPath, issues, intentType);
+      if (!asset) {
+        return [];
+      }
+
+      const nodeNameResult = this.validateSuggestNodeName(intent.nodeName);
+      if (nodeNameResult.error) {
+        issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', nodeNameResult.error));
+        return [];
+      }
+
+      const step: any = {
+        type: 'place_asset',
+        assetPath: asset.assetPath,
+      };
+
+      if (typeof intent.parentPath === 'string' && intent.parentPath.trim() !== '') {
+        const parentPath = this.validateSuggestNodePath(intent.parentPath, 'parentPath');
+        if (parentPath.error) {
+          issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', parentPath.error));
+          return [];
+        }
+        step.parentPath = parentPath.path;
+        this.warnSuggestMissingNode(
+          sceneNodePaths,
+          issues,
+          'NODE_MAY_NOT_EXIST',
+          parentPath.path,
+          'The selected parent node was not found in the compact scene context.',
+          { field: 'parentPath' }
+        );
+      }
+
+      if (nodeNameResult.name) {
+        step.nodeName = nodeNameResult.name;
+      }
+      if (typeof intent.nodeType === 'string' && intent.nodeType.trim()) {
+        step.nodeType = intent.nodeType.trim();
+      } else if (asset.defaults.nodeType) {
+        step.nodeType = asset.defaults.nodeType;
+      }
+      if (typeof intent.assetProperty === 'string' && intent.assetProperty.trim()) {
+        step.assetProperty = intent.assetProperty.trim();
+      } else if (asset.defaults.assetProperty) {
+        step.assetProperty = asset.defaults.assetProperty;
+      }
+
+      if (intentType === 'place_asset_relative') {
+        const referencePath = this.validateSuggestNodePath(intent.referenceNodePath, 'referenceNodePath');
+        if (referencePath.error) {
+          issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', referencePath.error));
+          return [];
+        }
+        if (typeof intent.relation !== 'string' || intent.relation.trim() === '') {
+          issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', 'place_asset_relative intent requires relation.'));
+          return [];
+        }
+        step.placement = {
+          mode: 'relative',
+          referenceNodePath: referencePath.path,
+          relation: intent.relation.trim(),
+        };
+        if (intent.margin !== undefined) {
+          step.placement.margin = intent.margin;
+        }
+        this.warnSuggestMissingNode(
+          sceneNodePaths,
+          issues,
+          'REFERENCE_NODE_MAY_NOT_EXIST',
+          referencePath.path,
+          'The selected reference node was not found in the compact scene context.',
+          { field: 'referenceNodePath' }
+        );
+      } else if (intent.placement !== undefined) {
+        if (!intent.placement || typeof intent.placement !== 'object' || Array.isArray(intent.placement)) {
+          issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', 'placement must be an object when provided.'));
+          return [];
+        }
+        step.placement = intent.placement;
+      }
+
+      if (intent.properties !== undefined) {
+        if (!intent.properties || typeof intent.properties !== 'object' || Array.isArray(intent.properties)) {
+          issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', 'properties must be an object when provided.'));
+          return [];
+        }
+        step.properties = intent.properties;
+      }
+
+      if (step.parentPath && step.nodeName) {
+        sceneNodePaths.add(`${step.parentPath}/${step.nodeName}`);
+      }
+
+      return [step];
+    }
+
+    if (intentType === 'update_node') {
+      const nodePath = this.validateSuggestNodePath(intent.nodePath, 'nodePath');
+      if (nodePath.error) {
+        issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', nodePath.error));
+        return [];
+      }
+      if (!intent.properties || typeof intent.properties !== 'object' || Array.isArray(intent.properties) || Object.keys(intent.properties).length === 0) {
+        issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', 'update_node intent requires a non-empty properties object.'));
+        return [];
+      }
+      this.warnSuggestMissingNode(
+        sceneNodePaths,
+        issues,
+        'NODE_MAY_NOT_EXIST',
+        nodePath.path,
+        'The target node was not found in the compact scene context.',
+        { field: 'nodePath' }
+      );
+      return [
+        {
+          type: 'update_node_properties',
+          updates: [
+            {
+              nodePath: nodePath.path,
+              properties: intent.properties,
+            },
+          ],
+        },
+      ];
+    }
+
+    if (intentType === 'align_nodes') {
+      if (!Array.isArray(intent.operations) || intent.operations.length === 0) {
+        issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', 'align_nodes intent requires a non-empty operations array.'));
+        return [];
+      }
+
+      const operations = intent.operations.map((operation: any, operationIndex: number) => {
+        if (!operation || typeof operation !== 'object' || Array.isArray(operation)) {
+          issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', 'Each align_nodes operation must be an object.', { operationIndex }));
+          return operation;
+        }
+
+        const normalizedOperation = { ...operation };
+        if (typeof operation.nodePath === 'string') {
+          const nodePath = this.validateSuggestNodePath(operation.nodePath, 'nodePath');
+          if (nodePath.error) {
+            issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', nodePath.error, { operationIndex }));
+          } else {
+            normalizedOperation.nodePath = nodePath.path;
+            this.warnSuggestMissingNode(sceneNodePaths, issues, 'NODE_MAY_NOT_EXIST', nodePath.path, 'An alignment target node was not found in the compact scene context.', { operationIndex });
+          }
+        }
+        if (Array.isArray(operation.nodePaths)) {
+          normalizedOperation.nodePaths = operation.nodePaths.map((nodePathValue: any) => {
+            const nodePath = this.validateSuggestNodePath(nodePathValue, 'nodePaths[]');
+            if (nodePath.error) {
+              issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', nodePath.error, { operationIndex }));
+              return nodePathValue;
+            }
+            this.warnSuggestMissingNode(sceneNodePaths, issues, 'NODE_MAY_NOT_EXIST', nodePath.path, 'An alignment target node was not found in the compact scene context.', { operationIndex });
+            return nodePath.path;
+          });
+        }
+        if (typeof operation.referenceNodePath === 'string') {
+          const referenceNodePath = this.validateSuggestNodePath(operation.referenceNodePath, 'referenceNodePath');
+          if (referenceNodePath.error) {
+            issues.push(this.suggestPatchIssue('error', 'INVALID_INTENT', referenceNodePath.error, { operationIndex }));
+          } else {
+            normalizedOperation.referenceNodePath = referenceNodePath.path;
+            this.warnSuggestMissingNode(sceneNodePaths, issues, 'REFERENCE_NODE_MAY_NOT_EXIST', referenceNodePath.path, 'An alignment reference node was not found in the compact scene context.', { operationIndex });
+          }
+        }
+        return normalizedOperation;
+      });
+
+      const step: any = {
+        type: 'align_nodes',
+        operations,
+      };
+      if (typeof intent.boundsSource === 'string' && intent.boundsSource.trim()) {
+        step.boundsSource = intent.boundsSource.trim();
+      }
+      return [step];
+    }
+
+    issues.push(this.suggestPatchIssue('error', 'UNKNOWN_INTENT_TYPE', `Unsupported intent type: ${intentType}`, { intentType }));
+    return [];
+  }
+
+  private async handleSuggestScenePatch(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || typeof args.projectPath !== 'string') {
+      return this.suggestScenePatchErrorResponse(
+        'MISSING_PROJECT_PATH',
+        'projectPath is required and must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    if (!args.scenePath || typeof args.scenePath !== 'string') {
+      return this.suggestScenePatchErrorResponse(
+        'MISSING_SCENE_PATH',
+        'scenePath is required and must be a Godot scene path such as res://scenes/Main.tscn or scenes/Main.tscn.'
+      );
+    }
+
+    if (args.intent === undefined || args.intent === null) {
+      return this.suggestScenePatchErrorResponse(
+        'MISSING_INTENT',
+        'intent is required and must be a structured object.'
+      );
+    }
+
+    if (typeof args.intent !== 'object' || Array.isArray(args.intent)) {
+      return this.suggestScenePatchErrorResponse(
+        'INVALID_INTENT',
+        'intent must be a structured object.'
+      );
+    }
+
+    const booleanOptions = [
+      'includeContext',
+      'includeDryRunPayload',
+      'includeApplyPayload',
+      'includeRecommendations',
+    ];
+    for (const option of booleanOptions) {
+      if (args[option] !== undefined && typeof args[option] !== 'boolean') {
+        return this.suggestScenePatchErrorResponse(
+          'SUGGEST_SCENE_PATCH_FAILED',
+          `${option} must be a boolean.`
+        );
+      }
+    }
+
+    const maxAssetsRequested = args.maxAssets !== undefined ? args.maxAssets : null;
+    let maxAssetsApplied = 50;
+    let maxAssetsClamped = false;
+    if (args.maxAssets !== undefined) {
+      if (typeof args.maxAssets !== 'number' || !Number.isFinite(args.maxAssets) || args.maxAssets < 1) {
+        return this.suggestScenePatchErrorResponse('INVALID_MAX_ASSETS', 'maxAssets must be a number between 1 and 500.');
+      }
+      if (args.maxAssets > 500) {
+        maxAssetsApplied = 500;
+        maxAssetsClamped = true;
+      } else {
+        maxAssetsApplied = Math.floor(args.maxAssets);
+      }
+    }
+
+    const maxNodesRequested = args.maxNodes !== undefined ? args.maxNodes : null;
+    let maxNodesApplied = 300;
+    let maxNodesClamped = false;
+    if (args.maxNodes !== undefined) {
+      if (typeof args.maxNodes !== 'number' || !Number.isFinite(args.maxNodes) || args.maxNodes < 1) {
+        return this.suggestScenePatchErrorResponse('INVALID_MAX_NODES', 'maxNodes must be a number between 1 and 2000.');
+      }
+      if (args.maxNodes > 2000) {
+        maxNodesApplied = 2000;
+        maxNodesClamped = true;
+      } else {
+        maxNodesApplied = Math.floor(args.maxNodes);
+      }
+    }
+
+    const maxStepsRequested = args.maxSteps !== undefined ? args.maxSteps : null;
+    let maxStepsApplied = 20;
+    let maxStepsClamped = false;
+    if (args.maxSteps !== undefined) {
+      if (typeof args.maxSteps !== 'number' || !Number.isFinite(args.maxSteps) || args.maxSteps < 1) {
+        return this.suggestScenePatchErrorResponse('INVALID_MAX_STEPS', 'maxSteps must be a number between 1 and 100.');
+      }
+      if (args.maxSteps > 100) {
+        maxStepsApplied = 100;
+        maxStepsClamped = true;
+      } else {
+        maxStepsApplied = Math.floor(args.maxSteps);
+      }
+    }
+
+    if (args.projectPath.includes('\0')) {
+      return this.suggestScenePatchErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must not contain null bytes.'
+      );
+    }
+
+    if (!isAbsolute(args.projectPath)) {
+      return this.suggestScenePatchErrorResponse(
+        'PROJECT_PATH_NOT_ABSOLUTE',
+        'projectPath must be an absolute path to a Godot project directory.'
+      );
+    }
+
+    const scenePathResult = this.normalizeScenePath(args.scenePath);
+    if (scenePathResult.error) {
+      return this.suggestScenePatchErrorResponse('UNSAFE_SCENE_PATH', scenePathResult.error);
+    }
+
+    const sceneExtension = extname(scenePathResult.relativePath).toLowerCase();
+    if (!['.tscn', '.scn'].includes(sceneExtension)) {
+      return this.suggestScenePatchErrorResponse(
+        'SCENE_PATH_NOT_SCENE_FILE',
+        'scenePath must point to a .tscn or .scn scene file.'
+      );
+    }
+
+    const includeContext = args.includeContext !== undefined ? args.includeContext : true;
+    const includeDryRunPayload = args.includeDryRunPayload !== undefined ? args.includeDryRunPayload : true;
+    const includeApplyPayload = args.includeApplyPayload !== undefined ? args.includeApplyPayload : true;
+    const includeRecommendations = args.includeRecommendations !== undefined ? args.includeRecommendations : true;
+
+    try {
+      const normalizedProjectPath = resolve(args.projectPath);
+      if (!existsSync(normalizedProjectPath)) {
+        return this.suggestScenePatchErrorResponse(
+          'PROJECT_PATH_NOT_FOUND',
+          `Project path does not exist: ${args.projectPath}`
+        );
+      }
+
+      const projectStats = lstatSync(normalizedProjectPath);
+      if (projectStats.isSymbolicLink()) {
+        return this.suggestScenePatchErrorResponse(
+          'PROJECT_PATH_IS_SYMLINK',
+          'projectPath must not be a symbolic link.'
+        );
+      }
+      if (!projectStats.isDirectory()) {
+        return this.suggestScenePatchErrorResponse(
+          'PROJECT_PATH_NOT_DIRECTORY',
+          `Project path is not a directory: ${args.projectPath}`
+        );
+      }
+
+      const projectRoot = realpathSync(normalizedProjectPath);
+      const projectFile = join(projectRoot, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.suggestScenePatchErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          `Not a valid Godot project: ${args.projectPath}. The directory must contain a project.godot file.`
+        );
+      }
+
+      const projectFileStats = lstatSync(projectFile);
+      if (projectFileStats.isSymbolicLink() || !projectFileStats.isFile()) {
+        return this.suggestScenePatchErrorResponse(
+          'INVALID_GODOT_PROJECT',
+          'project.godot must be a regular file and must not be a symbolic link.'
+        );
+      }
+
+      const sceneFilePath = resolve(projectRoot, scenePathResult.relativePath);
+      if (!this.isPathInside(projectRoot, sceneFilePath)) {
+        return this.suggestScenePatchErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must stay inside the Godot project directory.'
+        );
+      }
+      if (!existsSync(sceneFilePath)) {
+        return this.suggestScenePatchErrorResponse(
+          'SCENE_PATH_NOT_FOUND',
+          `Scene file does not exist: ${scenePathResult.resourcePath}`
+        );
+      }
+
+      const sceneFileStats = lstatSync(sceneFilePath);
+      if (sceneFileStats.isSymbolicLink()) {
+        return this.suggestScenePatchErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'scenePath must not be a symbolic link.'
+        );
+      }
+      if (!sceneFileStats.isFile()) {
+        return this.suggestScenePatchErrorResponse(
+          'SCENE_PATH_NOT_FOUND',
+          `Scene path is not a file: ${scenePathResult.resourcePath}`
+        );
+      }
+      const realScenePath = realpathSync(sceneFilePath);
+      if (!this.isPathInside(projectRoot, realScenePath)) {
+        return this.suggestScenePatchErrorResponse(
+          'UNSAFE_SCENE_PATH',
+          'Resolved scenePath must stay inside the Godot project directory.'
+        );
+      }
+
+      const issues: any[] = [];
+      let sceneContext: any = { enabled: false };
+      let sceneNodePaths = new Set<string>();
+      const assetContexts: any[] = [];
+      const assetContextMap = new Map<string, any>();
+
+      if (includeContext) {
+        try {
+          const sceneContextResponse = await this.handleInspectSceneEditContext({
+            projectPath: projectRoot,
+            scenePath: scenePathResult.resourcePath,
+            includeSceneTree: true,
+            includeLayout: true,
+            includeValidation: true,
+            includeCheckpoints: true,
+            includeAssetSummary: true,
+            includeRecommendations: false,
+            maxDepth: 50,
+            maxNodes: maxNodesApplied,
+            maxAssets: maxAssetsApplied,
+          });
+          const parsedSceneContext = this.parseMcpTextJson(sceneContextResponse);
+          if (parsedSceneContext?.success) {
+            sceneContext = {
+              enabled: true,
+              success: true,
+              sceneTree: parsedSceneContext.sceneTree,
+              layout: parsedSceneContext.layout
+                ? {
+                    enabled: parsedSceneContext.layout.enabled,
+                    success: parsedSceneContext.layout.success,
+                    summary: parsedSceneContext.layout.summary,
+                    sceneBounds: parsedSceneContext.layout.sceneBounds,
+                  }
+                : null,
+              validation: parsedSceneContext.validation,
+              checkpointSummary: parsedSceneContext.checkpointSummary,
+              assetSummary: parsedSceneContext.assetSummary,
+            };
+            if (parsedSceneContext.sceneTree?.success) {
+              sceneNodePaths = this.collectSceneTreeNodePaths(parsedSceneContext.sceneTree.root);
+            }
+            if (parsedSceneContext.validation?.success && (parsedSceneContext.validation.summary?.errorCount || 0) > 0) {
+              issues.push(this.suggestPatchIssue(
+                'warning',
+                'SCENE_VALIDATION_HAS_ERRORS',
+                'The current scene validation reported errors; run validate_scene before applying complex patches.',
+                { errorCount: parsedSceneContext.validation.summary.errorCount }
+              ));
+            }
+          } else {
+            sceneContext = this.sectionError(
+              true,
+              parsedSceneContext?.error || 'INSPECT_SCENE_EDIT_CONTEXT_FAILED',
+              parsedSceneContext?.message || 'Scene context inspection failed.'
+            );
+          }
+        } catch (error: any) {
+          sceneContext = this.sectionError(
+            true,
+            'INSPECT_SCENE_EDIT_CONTEXT_FAILED',
+            `Scene context inspection failed: ${error?.message || 'Unknown error'}`
+          );
+        }
+
+        const assetPaths = Array.from(this.collectSuggestIntentAssetPaths(args.intent)).slice(0, maxAssetsApplied);
+        for (const assetPath of assetPaths) {
+          try {
+            const assetContextResponse = await this.handleInspectAssetEditContext({
+              projectPath: projectRoot,
+              assetPath,
+              includeAssetInfo: true,
+              includeUsages: true,
+              includeGeneratedPreviews: true,
+              includePlacementHints: true,
+              includeRecommendations: false,
+              includeScripts: false,
+              maxUsages: 20,
+              maxPreviews: 5,
+              maxFilesScanned: 50000,
+            });
+            const parsedAssetContext = this.parseMcpTextJson(assetContextResponse);
+            if (parsedAssetContext?.success) {
+              const compactAssetContext = {
+                assetPath: parsedAssetContext.assetPath,
+                asset: parsedAssetContext.asset,
+                assetInfo: parsedAssetContext.assetInfo,
+                usages: parsedAssetContext.usages
+                  ? {
+                      enabled: parsedAssetContext.usages.enabled,
+                      success: parsedAssetContext.usages.success,
+                      matchesFound: parsedAssetContext.usages.matchesFound,
+                      truncated: parsedAssetContext.usages.truncated,
+                    }
+                  : null,
+                generatedPreviews: parsedAssetContext.generatedPreviews,
+                placementHints: parsedAssetContext.placementHints,
+              };
+              assetContexts.push(compactAssetContext);
+              assetContextMap.set(parsedAssetContext.assetPath, compactAssetContext);
+              if (
+                parsedAssetContext.placementHints?.supportsVisualPreview &&
+                parsedAssetContext.generatedPreviews?.success &&
+                parsedAssetContext.generatedPreviews.previewCount === 0
+              ) {
+                issues.push(this.suggestPatchIssue(
+                  'warning',
+                  'NO_ASSET_PREVIEW_FOUND',
+                  'No generated preview was found for this asset.',
+                  {
+                    assetPath: parsedAssetContext.assetPath,
+                    suggestion: 'Run capture_asset_preview before choosing this asset visually.',
+                  }
+                ));
+              }
+            } else if (parsedAssetContext?.error === 'ASSET_PATH_NOT_FOUND') {
+              issues.push(this.suggestPatchIssue('error', 'ASSET_NOT_FOUND', parsedAssetContext.message || 'Asset was not found.', { assetPath }));
+            }
+          } catch (error: any) {
+            issues.push(this.suggestPatchIssue(
+              'warning',
+              'SUGGEST_SCENE_PATCH_FAILED',
+              `Asset context inspection failed for ${assetPath}: ${error?.message || 'Unknown error'}`
+            ));
+          }
+        }
+      }
+
+      const bodySteps = this.convertSuggestIntentToPatchSteps(args.intent, projectRoot, sceneNodePaths, issues);
+      const suggestedSteps = [
+        {
+          type: 'create_checkpoint',
+          checkpointName: 'before_suggested_patch',
+        },
+        ...bodySteps,
+        {
+          type: 'validate_scene',
+        },
+      ];
+
+      if (suggestedSteps.length > maxStepsApplied) {
+        issues.push(this.suggestPatchIssue(
+          'error',
+          'PATCH_STEP_LIMIT_EXCEEDED',
+          `Suggested patch contains ${suggestedSteps.length} steps, exceeding maxSteps ${maxStepsApplied}.`,
+          { suggestedStepCount: suggestedSteps.length, maxStepsApplied }
+        ));
+      }
+
+      const issueSummary = this.summarizeSuggestPatchIssues(issues);
+      const valid = issueSummary.valid;
+      const projectPathForPayload = projectRoot.replace(/\\/g, '/');
+      const dryRunPayload = includeDryRunPayload && valid
+        ? {
+            tool: 'dry_run_scene_patch',
+            arguments: {
+              projectPath: projectPathForPayload,
+              scenePath: scenePathResult.resourcePath,
+              simulateCumulative: true,
+              includeLayoutAfter: true,
+              includeValidationAfter: true,
+              steps: suggestedSteps,
+            },
+          }
+        : null;
+      const applyPayload = includeApplyPayload && valid
+        ? {
+            tool: 'apply_scene_patch',
+            arguments: {
+              projectPath: projectPathForPayload,
+              scenePath: scenePathResult.resourcePath,
+              createCheckpoint: true,
+              checkpointName: 'before_suggested_patch',
+              restoreOnFailure: true,
+              includeLayoutAfter: true,
+              includeValidationAfter: true,
+              steps: suggestedSteps,
+            },
+          }
+        : null;
+
+      const recommendations: string[] = [];
+      if (includeRecommendations) {
+        recommendations.push('Run dry_run_scene_patch with the suggested dryRunPayload before applying.');
+        if (valid && includeApplyPayload) {
+          recommendations.push('Use apply_scene_patch only after the dry-run payload succeeds without errors.');
+        }
+        if (!includeContext) {
+          recommendations.push('Run inspect_scene_edit_context and inspect_asset_edit_context for richer context before applying.');
+        }
+        if (issues.some(issue => issue.code === 'NO_ASSET_PREVIEW_FOUND')) {
+          recommendations.push('Use capture_asset_preview if you want to visually inspect the asset before placement.');
+        }
+        if (issues.some(issue => issue.code === 'SCENE_VALIDATION_HAS_ERRORS')) {
+          recommendations.push('Review validate_scene errors before applying the suggested patch.');
+        }
+        if (!valid) {
+          recommendations.push('Resolve error issues before using the suggested patch payloads.');
+        }
+      }
+
+      const result = {
+        success: true,
+        projectPath: projectPathForPayload,
+        scenePath: scenePathResult.resourcePath,
+        intentType: typeof args.intent.type === 'string' ? args.intent.type : null,
+        valid,
+        severity: issueSummary.severity,
+        issues,
+        context: includeContext
+          ? {
+              scene: sceneContext,
+              asset: assetContexts.length === 1 ? assetContexts[0] : null,
+              assets: assetContexts,
+            }
+          : {
+              scene: { enabled: false },
+              asset: null,
+              assets: [],
+            },
+        suggestedSteps,
+        dryRunPayload,
+        applyPayload,
+        recommendations,
+        summary: {
+          suggestedStepCount: suggestedSteps.length,
+          bodyStepCount: bodySteps.length,
+          errorCount: issueSummary.errorCount,
+          warningCount: issueSummary.warningCount,
+          infoCount: issueSummary.infoCount,
+          payloadsIncluded: {
+            dryRun: Boolean(dryRunPayload),
+            apply: Boolean(applyPayload),
+          },
+        },
+        limits: {
+          maxAssetsRequested,
+          maxAssetsApplied,
+          maxAssetsClamped,
+          maxNodesRequested,
+          maxNodesApplied,
+          maxNodesClamped,
+          maxStepsRequested,
+          maxStepsApplied,
+          maxStepsClamped,
+        },
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.suggestScenePatchErrorResponse(
+        'SUGGEST_SCENE_PATCH_FAILED',
+        `Failed to suggest scene patch: ${error?.message || 'Unknown error'}`
       );
     }
   }

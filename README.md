@@ -137,6 +137,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "get_project_info",
         "inspect_project_capabilities",
         "inspect_scene_edit_context",
+        "suggest_scene_patch",
         "scan_assets",
         "get_asset_info",
         "read_scene_tree",
@@ -298,7 +299,7 @@ Current coverage includes:
 
 - tool registration for the expanded toolchain
 - `inspect_project_capabilities` and `inspect_scene_edit_context`
-- `scan_assets`, `get_asset_info`, `find_asset_usages`, `inspect_asset_edit_context`, `read_scene_tree`, `get_scene_layout`, `capture_scene_preview`, `capture_asset_preview`, `list_generated_previews`, `cleanup_generated_previews`, and `validate_scene`
+- `scan_assets`, `get_asset_info`, `find_asset_usages`, `inspect_asset_edit_context`, `suggest_scene_patch`, `read_scene_tree`, `get_scene_layout`, `capture_scene_preview`, `capture_asset_preview`, `list_generated_previews`, `cleanup_generated_previews`, and `validate_scene`
 - `dry_run_place_asset_in_scene`, `dry_run_align_nodes`, `dry_run_update_node_properties`, and `dry_run_scene_patch`
 - `place_asset_in_scene`, `align_nodes`, `update_node_properties`, and `apply_scene_patch`
 - `create_scene_checkpoint`, `list_scene_checkpoints`, and `restore_scene_checkpoint`
@@ -385,10 +386,10 @@ Output example:
   },
   "toolCapabilities": {
     "readOnlyInspection": ["scan_assets", "get_asset_info", "find_asset_usages", "inspect_asset_edit_context", "read_scene_tree", "validate_scene", "get_scene_layout", "capture_scene_preview", "capture_asset_preview", "list_generated_previews", "list_scene_checkpoints", "inspect_project_capabilities"],
-    "dryRunPlanning": ["dry_run_scene_blueprint", "dry_run_align_nodes", "dry_run_place_asset_in_scene", "dry_run_update_node_properties", "dry_run_scene_patch"],
+    "dryRunPlanning": ["dry_run_scene_blueprint", "dry_run_align_nodes", "dry_run_place_asset_in_scene", "dry_run_update_node_properties", "suggest_scene_patch", "dry_run_scene_patch"],
     "writers": ["create_scene_from_blueprint", "align_nodes", "place_asset_in_scene", "update_node_properties", "apply_scene_patch"],
     "safety": ["create_scene_checkpoint", "restore_scene_checkpoint"],
-    "recommendedTransactionFlow": ["inspect_project_capabilities", "scan_assets", "get_asset_info", "find_asset_usages", "inspect_asset_edit_context", "capture_asset_preview", "list_generated_previews", "read_scene_tree", "get_scene_layout", "dry_run_scene_patch", "apply_scene_patch", "capture_scene_preview", "validate_scene"]
+    "recommendedTransactionFlow": ["inspect_project_capabilities", "scan_assets", "get_asset_info", "find_asset_usages", "inspect_asset_edit_context", "capture_asset_preview", "list_generated_previews", "read_scene_tree", "get_scene_layout", "suggest_scene_patch", "dry_run_scene_patch", "apply_scene_patch", "capture_scene_preview", "validate_scene"]
   },
   "recommendations": [
     "Start with read_scene_tree and get_scene_layout for the main scene (res://scenes/Main.tscn).",
@@ -543,7 +544,7 @@ Output example:
     "Use dry_run_scene_patch before apply_scene_patch."
   ],
   "toolWorkflow": {
-    "safeEditFlow": ["inspect_scene_edit_context", "get_asset_info", "find_asset_usages", "inspect_asset_edit_context", "capture_asset_preview", "dry_run_scene_patch", "apply_scene_patch", "capture_scene_preview", "list_generated_previews", "validate_scene"],
+    "safeEditFlow": ["inspect_scene_edit_context", "get_asset_info", "find_asset_usages", "inspect_asset_edit_context", "capture_asset_preview", "suggest_scene_patch", "dry_run_scene_patch", "apply_scene_patch", "capture_scene_preview", "list_generated_previews", "validate_scene"],
     "rollbackFlow": ["list_scene_checkpoints", "restore_scene_checkpoint"]
   },
   "limits": {
@@ -1255,6 +1256,144 @@ Output example:
 **Safety model:** this tool is read-only. It does not write files, create previews, delete previews, run Godot, import/reimport assets, execute scripts, parse script logic, attach scripts, or call writer tools. Invalid project and asset paths fail the whole call; subsection read issues are returned as compact section errors.
 
 **Workflow fit:** use `scan_assets` to find candidates, `inspect_asset_edit_context` to understand one candidate, `capture_asset_preview` if no preview exists, `dry_run_place_asset_in_scene` or `dry_run_scene_patch` to plan, and writer tools only after dry-run validation.
+
+### `suggest_scene_patch`
+
+Builds a deterministic read-only draft for `dry_run_scene_patch` and `apply_scene_patch` from structured editing intent. It validates project, scene, asset, and node-path inputs, optionally gathers compact scene/asset context, and returns suggested patch steps plus ready-to-call payloads. It does not run the dry-run or apply tools, create checkpoints, create previews, save scenes, delete files, call writer tools, or use an LLM.
+
+Place an asset relative to an existing node:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Main.tscn",
+  "intent": {
+    "type": "place_asset_relative",
+    "assetPath": "res://assets/props/chair.png",
+    "parentPath": "Main",
+    "nodeName": "Chair",
+    "referenceNodePath": "Main/Table",
+    "relation": "right_of",
+    "margin": 8,
+    "properties": {
+      "z_index": 5
+    }
+  }
+}
+```
+
+Update existing node properties:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Main.tscn",
+  "intent": {
+    "type": "update_node",
+    "nodePath": "Main/Title",
+    "properties": {
+      "text": "Hello",
+      "visible": true
+    }
+  }
+}
+```
+
+Composite patch draft:
+
+```json
+{
+  "projectPath": "C:/path/to/project",
+  "scenePath": "res://scenes/Main.tscn",
+  "intent": {
+    "type": "composite",
+    "steps": [
+      {
+        "type": "place_asset_relative",
+        "assetPath": "res://assets/props/chair.png",
+        "parentPath": "Main",
+        "nodeName": "Chair",
+        "referenceNodePath": "Main/Table",
+        "relation": "right_of",
+        "margin": 8
+      },
+      {
+        "type": "update_node",
+        "nodePath": "Main/Chair",
+        "properties": {
+          "z_index": 4
+        }
+      }
+    ]
+  }
+}
+```
+
+Output excerpt:
+
+```json
+{
+  "success": true,
+  "scenePath": "res://scenes/Main.tscn",
+  "intentType": "place_asset_relative",
+  "valid": true,
+  "severity": "warning",
+  "issues": [
+    {
+      "severity": "warning",
+      "code": "NO_ASSET_PREVIEW_FOUND",
+      "message": "No generated preview was found for this asset."
+    }
+  ],
+  "suggestedSteps": [
+    {
+      "type": "create_checkpoint",
+      "checkpointName": "before_suggested_patch"
+    },
+    {
+      "type": "place_asset",
+      "assetPath": "res://assets/props/chair.png",
+      "parentPath": "Main",
+      "nodeName": "Chair",
+      "nodeType": "Sprite2D",
+      "assetProperty": "texture",
+      "placement": {
+        "mode": "relative",
+        "referenceNodePath": "Main/Table",
+        "relation": "right_of",
+        "margin": 8
+      }
+    },
+    {
+      "type": "validate_scene"
+    }
+  ],
+  "dryRunPayload": {
+    "tool": "dry_run_scene_patch",
+    "arguments": {
+      "simulateCumulative": true,
+      "includeLayoutAfter": true,
+      "includeValidationAfter": true,
+      "steps": []
+    }
+  },
+  "applyPayload": {
+    "tool": "apply_scene_patch",
+    "arguments": {
+      "createCheckpoint": true,
+      "checkpointName": "before_suggested_patch",
+      "restoreOnFailure": true,
+      "steps": []
+    }
+  }
+}
+```
+
+Supported intent types are `place_asset`, `place_asset_relative`, `update_node`, `align_nodes`, and `composite`. Asset placement suggestions infer safe defaults such as `Sprite2D`/`texture` for textures, scene `instance` placement for scene assets, `MeshInstance3D`/`mesh` for model assets, audio stream players for audio, and `Label`/`font` for fonts. Script, data, generic resource, and unknown asset types are refused for direct placement suggestions.
+
+**Context behavior:** when `includeContext` is true, the tool reuses read-only scene and asset context patterns to check likely node existence, scene validation state, generated preview availability, placement hints, and asset usage summaries. Missing nodes are warnings because `dry_run_scene_patch` remains the authoritative planner. Unsupported asset types, missing assets, invalid paths, and malformed intent are errors.
+
+**Recommended workflow:** use `inspect_scene_edit_context`, `inspect_asset_edit_context`, `suggest_scene_patch`, then run the returned `dryRunPayload` with `dry_run_scene_patch`. Only use the returned `applyPayload` with `apply_scene_patch` after dry-run success.
 
 ## Scene Inspection
 

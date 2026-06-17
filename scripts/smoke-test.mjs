@@ -29,6 +29,7 @@ const expectedTools = [
   'get_asset_info',
   'find_asset_usages',
   'inspect_asset_edit_context',
+  'suggest_scene_patch',
   'read_scene_tree',
   'get_scene_layout',
   'capture_scene_preview',
@@ -551,6 +552,39 @@ async function runAlwaysSmoke({ godotPathForServer }) {
       'INVALID_MAX_USAGES'
     );
     logPass('inspect_asset_edit_context invalid maxUsages');
+
+    await expectStructuredError(
+      client,
+      'suggest_scene_patch',
+      {
+        projectPath: missingProject,
+        scenePath: 'scenes/Main.tscn',
+        intent: { type: 'update_node', nodePath: 'Main/Title', properties: { visible: true } },
+      },
+      'PROJECT_PATH_NOT_FOUND'
+    );
+    logPass('suggest_scene_patch invalid projectPath');
+
+    await expectStructuredError(
+      client,
+      'suggest_scene_patch',
+      { projectPath: process.cwd(), scenePath: 'scenes/Main.tscn' },
+      'MISSING_INTENT'
+    );
+    logPass('suggest_scene_patch missing intent');
+
+    await expectStructuredError(
+      client,
+      'suggest_scene_patch',
+      {
+        projectPath: process.cwd(),
+        scenePath: 'scenes/Main.tscn',
+        intent: { type: 'update_node', nodePath: 'Main/Title', properties: { visible: true } },
+        maxSteps: 0,
+      },
+      'INVALID_MAX_STEPS'
+    );
+    logPass('suggest_scene_patch invalid maxSteps');
   } finally {
     await client.close();
   }
@@ -652,6 +686,42 @@ async function runIntegrationSmoke({ godotPath }) {
     assert.equal(assetContext.parsed?.placementHints?.recommendedNodeType, 'Sprite2D');
     assertNoDiff(diffSnapshots(assetContextBefore, snapshotProjectFiles(projectRoot)), 'inspect_asset_edit_context');
     logPass('inspect_asset_edit_context');
+
+    const suggestionBefore = snapshotProjectFiles(projectRoot);
+    const suggestion = await client.callTool('suggest_scene_patch', {
+      projectPath: projectRoot,
+      scenePath: 'scenes/Main.tscn',
+      intent: {
+        type: 'place_asset_relative',
+        assetPath: 'assets/props/chair.png',
+        parentPath: 'Main',
+        nodeName: 'SuggestedChair',
+        referenceNodePath: 'Main/Panel',
+        relation: 'right_of',
+        margin: 8,
+        properties: {
+          z_index: 5,
+        },
+      },
+    });
+    assert.equal(suggestion.parsed?.success, true, JSON.stringify(suggestion.parsed, null, 2));
+    assert.equal(suggestion.parsed?.valid, true, JSON.stringify(suggestion.parsed, null, 2));
+    assert.ok(suggestion.parsed?.suggestedSteps?.some((step) => step.type === 'create_checkpoint'), 'suggestion should include checkpoint step');
+    assert.ok(suggestion.parsed?.suggestedSteps?.some((step) => step.type === 'place_asset'), 'suggestion should include place_asset step');
+    assert.ok(suggestion.parsed?.suggestedSteps?.some((step) => step.type === 'validate_scene'), 'suggestion should include validate_scene step');
+    assert.equal(suggestion.parsed?.dryRunPayload?.tool, 'dry_run_scene_patch');
+    assert.equal(suggestion.parsed?.applyPayload?.tool, 'apply_scene_patch');
+    assertNoDiff(diffSnapshots(suggestionBefore, snapshotProjectFiles(projectRoot)), 'suggest_scene_patch');
+    logPass('suggest_scene_patch');
+
+    const suggestedDryRunBefore = snapshotProjectFiles(projectRoot);
+    const suggestedDryRun = await client.callTool(
+      suggestion.parsed.dryRunPayload.tool,
+      suggestion.parsed.dryRunPayload.arguments
+    );
+    assert.equal(suggestedDryRun.parsed?.success, true, JSON.stringify(suggestedDryRun.parsed, null, 2));
+    assertNoDiff(diffSnapshots(suggestedDryRunBefore, snapshotProjectFiles(projectRoot)), 'suggest_scene_patch dry-run payload');
+    logPass('suggest_scene_patch dry-run payload');
 
     const readTree = await client.callTool('read_scene_tree', { projectPath: projectRoot, scenePath: 'scenes/Main.tscn', maxDepth: 20 });
     assert.equal(readTree.parsed?.success, true);
