@@ -318,7 +318,7 @@ Use layout data to choose existing node paths and positions.
         "operations": [
           {
             "type": "place_relative",
-            "nodePath": "Main/Chair",
+            "nodePaths": ["Main/Chair"],
             "referenceNodePath": "Main/Table",
             "relation": "right_of",
             "margin": 16

@@ -31,6 +31,7 @@
     "build": "tsc && node scripts/build.js",
     "docs:tools": "npm run build && node scripts/generate-tool-docs.mjs",
     "check:docs": "node scripts/generate-tool-docs.mjs && git diff --exit-code docs/tools.md",
+    "check:workflows": "npm run build && node scripts/validate-workflow-docs.mjs",
     "smoke": "npm run build && node scripts/smoke-test.mjs",
     "test": "npm run smoke",
     "inspector": "npx @modelcontextprotocol/inspector build/index.js",

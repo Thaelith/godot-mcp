@@ -28,6 +28,9 @@ jobs:
       - name: Check generated tool docs
         run: npm run check:docs
 
+      - name: Check workflow docs examples
+        run: npm run check:workflows
+
       # Full Godot integration smoke tests run locally when Godot is available.
       # CI intentionally covers build plus the no-Godot MCP smoke checks.
       - name: Smoke tests

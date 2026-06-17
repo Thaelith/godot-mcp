@@ -111,6 +111,12 @@ npm run check:docs
 
 Practical AI scene-editing recipes are available in [docs/workflows.md](docs/workflows.md). Use `docs/tools.md` as the schema reference and `docs/workflows.md` as the usage guide for choosing tool order, running dry-runs before writes, managing previews, and restoring checkpoints.
 
+Workflow recipe examples can be checked against the registered tool schemas with:
+
+```bash
+npm run check:workflows
+```
+
 ## Requirements
 
 - [Godot Engine](https://godotengine.org/download) installed on your system
