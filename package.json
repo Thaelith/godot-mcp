@@ -35,6 +35,8 @@
     "check:workflows": "npm run build && node scripts/validate-workflow-docs.mjs",
     "check:package": "node scripts/check-package-files.mjs",
     "smoke": "npm run build && node scripts/smoke-test.mjs",
+    "verify": "node scripts/run-verify.mjs none",
+    "verify:full": "node scripts/run-verify.mjs required",
     "test": "npm run smoke",
     "inspector": "npx @modelcontextprotocol/inspector build/index.js",
     "prepare": "npm run build",

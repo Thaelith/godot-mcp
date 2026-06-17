@@ -293,6 +293,32 @@ The bundled script accepts operation type and parameters as JSON, allowing for f
 
 ## Regression Smoke Tests
 
+### Local Verification
+
+Run the standard local verification, matching the no-Godot CI path, with:
+
+```bash
+npm run verify
+```
+
+This runs build, generated docs freshness, workflow example validation, package contents checks, and smoke tests with `SMOKE_GODOT_MODE=none`.
+
+Run the full Godot integration verification with:
+
+```bash
+npm run verify:full
+```
+
+`verify:full` requires a working Godot executable and runs smoke tests with `SMOKE_GODOT_MODE=required`. Set `GODOT_PATH` first if Godot is not auto-detected:
+
+```bash
+GODOT_PATH=/path/to/godot npm run verify:full
+```
+
+The `verify` scripts set `SMOKE_GODOT_MODE` through Node, so they work on Windows, macOS, and Linux without shell-specific environment variable syntax.
+
+### Smoke Suite
+
 Run the lightweight MCP regression smoke suite with:
 
 ```bash
