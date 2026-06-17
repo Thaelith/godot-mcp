@@ -51,7 +51,7 @@ const expectedTools = [
 ];
 
 const tinyPngBase64 =
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
+  'iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAAD0lEQVR4nGP4TwAwjAwFAIS1/wF0QtmAAAAAAElFTkSuQmCC';
 
 function logPass(name) {
   console.log(`PASS ${name}`);
@@ -225,6 +225,13 @@ function writeNoAssetsProject(projectRoot) {
   );
   writeFileSync(path.join(projectRoot, 'scenes', 'Main.tscn'), '[gd_scene format=3]\n\n[node name="Main" type="Node2D"]\n');
   writeFileSync(path.join(projectRoot, 'art', 'fallback.png'), Buffer.from(tinyPngBase64, 'base64'));
+}
+
+function importFixtureProjectAssets(godotPath, projectRoot) {
+  execFileSync(godotPath, ['--headless', '--path', projectRoot, '--import'], {
+    stdio: 'ignore',
+    timeout: 60000,
+  });
 }
 
 function commandWorks(command, args) {
@@ -590,6 +597,149 @@ async function runAlwaysSmoke({ godotPathForServer }) {
   }
 }
 
+async function runEndToEndEditWorkflowSmoke({
+  client,
+  projectRoot,
+  scenePath,
+  assetPath,
+  sceneAssetPath,
+  originalSceneHash,
+  originalAssetHash,
+  originalSceneAssetHash,
+}) {
+  assert.equal(sha256File(scenePath), originalSceneHash, 'e2e workflow should start from the original scene hash');
+  const scenarioStartSnapshot = snapshotProjectFiles(projectRoot);
+
+  const contextsBefore = snapshotProjectFiles(projectRoot);
+  const sceneContext = await client.callTool('inspect_scene_edit_context', {
+    projectPath: projectRoot,
+    scenePath: 'scenes/Main.tscn',
+  });
+  assert.equal(sceneContext.parsed?.success, true, JSON.stringify(sceneContext.parsed, null, 2));
+  assert.equal(sceneContext.parsed?.sceneTree?.success, true);
+
+  const assetContext = await client.callTool('inspect_asset_edit_context', {
+    projectPath: projectRoot,
+    assetPath: 'assets/props/chair.png',
+  });
+  assert.equal(assetContext.parsed?.success, true, JSON.stringify(assetContext.parsed, null, 2));
+  assert.equal(assetContext.parsed?.asset?.assetType, 'texture');
+  assertNoDiff(diffSnapshots(contextsBefore, snapshotProjectFiles(projectRoot)), 'e2e inspect contexts');
+  logPass('e2e inspect contexts');
+
+  const suggestionBefore = snapshotProjectFiles(projectRoot);
+  const suggestion = await client.callTool('suggest_scene_patch', {
+    projectPath: projectRoot,
+    scenePath: 'scenes/Main.tscn',
+    intent: {
+      type: 'place_asset_relative',
+      assetPath: 'assets/props/chair.png',
+      parentPath: 'Main',
+      nodeName: 'EndToEndChair',
+      referenceNodePath: 'Main/Panel',
+      relation: 'right_of',
+      margin: 12,
+      properties: {
+        z_index: 6,
+      },
+    },
+  });
+  assert.equal(suggestion.parsed?.success, true, JSON.stringify(suggestion.parsed, null, 2));
+  assert.equal(suggestion.parsed?.valid, true, JSON.stringify(suggestion.parsed, null, 2));
+  assert.equal(suggestion.parsed?.dryRunPayload?.tool, 'dry_run_scene_patch');
+  assert.equal(suggestion.parsed?.applyPayload?.tool, 'apply_scene_patch');
+  assertNoDiff(diffSnapshots(suggestionBefore, snapshotProjectFiles(projectRoot)), 'e2e suggest_scene_patch');
+  logPass('e2e suggest patch');
+
+  const dryRunBefore = snapshotProjectFiles(projectRoot);
+  const dryRun = await client.callTool(
+    suggestion.parsed.dryRunPayload.tool,
+    suggestion.parsed.dryRunPayload.arguments
+  );
+  assert.equal(dryRun.parsed?.success, true, JSON.stringify(dryRun.parsed, null, 2));
+  assertNoDiff(diffSnapshots(dryRunBefore, snapshotProjectFiles(projectRoot)), 'e2e dry_run_scene_patch');
+  logPass('e2e dry-run suggested patch');
+
+  const applyBefore = snapshotProjectFiles(projectRoot);
+  const apply = await client.callTool(
+    suggestion.parsed.applyPayload.tool,
+    suggestion.parsed.applyPayload.arguments
+  );
+  assert.equal(apply.parsed?.success, true, JSON.stringify(apply.parsed, null, 2));
+  assert.equal(apply.parsed?.saved, true, JSON.stringify(apply.parsed, null, 2));
+  assert.notEqual(sha256File(scenePath), originalSceneHash, 'e2e apply should modify the scene before restore');
+  assertOnlyAllowedDiff(diffSnapshots(applyBefore, snapshotProjectFiles(projectRoot)), ['scenes/Main.tscn', '.godot_mcp'], 'e2e apply_scene_patch');
+
+  const applyCheckpointPath = apply.parsed?.checkpoint?.checkpointPath || apply.parsed?.checkpoint?.checkpoint_path || apply.parsed?.checkpointPath || apply.parsed?.checkpoint_path;
+  assert.ok(applyCheckpointPath, 'e2e apply_scene_patch should return a checkpoint path');
+  assert.ok(existsSync(godotResourceToFilePath(projectRoot, applyCheckpointPath)), 'e2e apply checkpoint scene should exist');
+  const applyCheckpointMetadataPath = apply.parsed?.checkpoint?.metadataPath || apply.parsed?.checkpoint?.metadata_path;
+  if (applyCheckpointMetadataPath) {
+    assert.ok(existsSync(godotResourceToFilePath(projectRoot, applyCheckpointMetadataPath)), 'e2e apply checkpoint metadata should exist');
+  }
+  assert.equal(apply.parsed?.postValidation?.expectedChangesPassed, true, JSON.stringify(apply.parsed?.postValidation, null, 2));
+  logPass('e2e apply suggested patch');
+
+  const validateAfterApply = await client.callTool('validate_scene', {
+    projectPath: projectRoot,
+    scenePath: 'scenes/Main.tscn',
+    maxDepth: 20,
+  });
+  assert.equal(validateAfterApply.parsed?.success, true, JSON.stringify(validateAfterApply.parsed, null, 2));
+  assert.ok(validateAfterApply.parsed?.summary);
+  logPass('e2e validate after apply');
+
+  const previewBefore = snapshotProjectFiles(projectRoot);
+  const preview = await client.callTool('capture_scene_preview', {
+    projectPath: projectRoot,
+    scenePath: 'scenes/Main.tscn',
+    fileName: 'end_to_end_after_apply',
+    width: 320,
+    height: 180,
+    includeMetadata: true,
+    includeImageContent: true,
+    maxWaitFrames: 2,
+  });
+  assert.equal(preview.parsed?.success, true, JSON.stringify(preview.parsed, null, 2));
+  assert.ok(preview.parsed?.previewPath);
+  assert.ok(existsSync(godotResourceToFilePath(projectRoot, preview.parsed.previewPath)), 'e2e scene preview PNG should exist');
+  assert.ok(preview.parsed?.metadataPath);
+  assert.ok(existsSync(godotResourceToFilePath(projectRoot, preview.parsed.metadataPath)), 'e2e scene preview metadata should exist');
+  assert.equal(preview.parsed?.imageContent?.included, true, JSON.stringify(preview.parsed?.imageContent, null, 2));
+  const previewImageContent = preview.raw?.content?.find((item) => item.type === 'image');
+  assert.equal(previewImageContent?.mimeType, 'image/png');
+  assert.ok(previewImageContent?.data?.length > 0, 'e2e embedded scene preview image data should be non-empty');
+  assertOnlyAllowedDiff(diffSnapshots(previewBefore, snapshotProjectFiles(projectRoot)), ['.godot_mcp/previews'], 'e2e capture_scene_preview');
+  logPass('e2e preview after apply');
+
+  const listPreviewBefore = snapshotProjectFiles(projectRoot);
+  const previews = await client.callTool('list_generated_previews', {
+    projectPath: projectRoot,
+    sourcePath: 'scenes/Main.tscn',
+  });
+  assert.equal(previews.parsed?.success, true, JSON.stringify(previews.parsed, null, 2));
+  assert.ok(
+    previews.parsed?.previews?.some((item) => item.previewPath === preview.parsed.previewPath),
+    'e2e generated preview should be listed for the scene'
+  );
+  assertNoDiff(diffSnapshots(listPreviewBefore, snapshotProjectFiles(projectRoot)), 'e2e list_generated_previews');
+  logPass('e2e list generated preview');
+
+  const restore = await client.callTool('restore_scene_checkpoint', {
+    projectPath: projectRoot,
+    scenePath: 'scenes/Main.tscn',
+    checkpointPath: applyCheckpointPath,
+    createPreRestoreCheckpoint: false,
+    validateAfterRestore: true,
+  });
+  assert.equal(restore.parsed?.success, true, JSON.stringify(restore.parsed, null, 2));
+  assert.equal(sha256File(scenePath), originalSceneHash, 'e2e restore should restore original scene hash');
+  assert.equal(sha256File(assetPath), originalAssetHash, 'e2e workflow should not modify texture assets');
+  assert.equal(sha256File(sceneAssetPath), originalSceneAssetHash, 'e2e workflow should not modify scene assets');
+  assertOnlyAllowedDiff(diffSnapshots(scenarioStartSnapshot, snapshotProjectFiles(projectRoot)), ['.godot_mcp'], 'e2e workflow after restore');
+  logPass('e2e restore original scene');
+}
+
 async function runIntegrationSmoke({ godotPath }) {
   const tempRoot = mkdtempSync(path.join(tmpdir(), 'godot-mcp-smoke-'));
   const projectRoot = path.join(tempRoot, 'Project');
@@ -602,6 +752,7 @@ async function runIntegrationSmoke({ godotPath }) {
   try {
     writeFixtureProject(projectRoot);
     writeNoAssetsProject(noAssetsProjectRoot);
+    importFixtureProjectAssets(godotPath, projectRoot);
     const originalSceneHash = sha256File(scenePath);
     const originalAssetHash = sha256File(assetPath);
     const originalSceneAssetHash = sha256File(sceneAssetPath);
@@ -1063,6 +1214,17 @@ async function runIntegrationSmoke({ godotPath }) {
     assert.equal(restore.parsed?.success, true);
     assert.equal(sha256File(scenePath), originalSceneHash, 'restore_scene_checkpoint should restore original scene hash');
     logPass('restore_scene_checkpoint');
+
+    await runEndToEndEditWorkflowSmoke({
+      client,
+      projectRoot,
+      scenePath,
+      assetPath,
+      sceneAssetPath,
+      originalSceneHash,
+      originalAssetHash,
+      originalSceneAssetHash,
+    });
 
     const afterAssetHash = sha256File(assetPath);
     assert.equal(afterAssetHash, originalAssetHash, 'asset file changed during smoke test');

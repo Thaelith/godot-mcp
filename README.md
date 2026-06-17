@@ -303,9 +303,29 @@ Current coverage includes:
 - `dry_run_place_asset_in_scene`, `dry_run_align_nodes`, `dry_run_update_node_properties`, and `dry_run_scene_patch`
 - `place_asset_in_scene`, `align_nodes`, `update_node_properties`, and `apply_scene_patch`
 - `create_scene_checkpoint`, `list_scene_checkpoints`, and `restore_scene_checkpoint`
+- an end-to-end AI edit workflow: inspect scene/asset context, suggest a patch, dry-run it, apply it, validate, capture/list a preview, and restore the original scene
 - hash/snapshot checks that dry-run tools do not modify scene files, writer tools only touch the target scene and expected checkpoint files, and asset files remain unchanged
 
 The smoke client is implemented in `scripts/smoke-test.mjs` using built-in Node modules. It speaks the newline-delimited JSON-RPC framing used by this MCP SDK version.
+
+### End-to-End AI Edit Workflow
+
+The intended high-safety scene editing loop is:
+
+1. `inspect_project_capabilities`
+2. `inspect_scene_edit_context`
+3. `inspect_asset_edit_context`
+4. `capture_asset_preview` when visual asset selection matters
+5. `suggest_scene_patch`
+6. `dry_run_scene_patch`
+7. `apply_scene_patch`
+8. `capture_scene_preview`
+9. `validate_scene`
+10. `restore_scene_checkpoint` if rollback is needed
+
+`suggest_scene_patch` is read-only and only drafts structured payloads. `dry_run_scene_patch` remains the authoritative planner before any write. `apply_scene_patch` creates a checkpoint by default, applies the cumulative plan in memory, saves once, post-validates expected changes, and can restore on failure. Scene and asset previews are generated files under `res://.godot_mcp/previews`; checkpoints are stored under `res://.godot_mcp/checkpoints`.
+
+The Godot integration smoke suite covers this complete loop with a temporary project: it inspects scene and asset context, suggests a relative asset placement patch, runs the suggested dry-run payload, applies the suggested apply payload, validates the modified scene, captures and lists a post-apply scene preview, restores the scene from the apply checkpoint, and verifies the original scene hash and asset hashes are unchanged after restore.
 
 ## Project Capability Inspection
 
