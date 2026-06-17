@@ -427,6 +427,16 @@ function assertToolSuccess(call, message = `${call.name} should succeed`) {
   );
 }
 
+function assertGeneratedToolDocs() {
+  const docsPath = path.join(repoRoot, 'docs', 'tools.md');
+  assert.ok(existsSync(docsPath), 'docs/tools.md should exist');
+  const docs = readFileSync(docsPath, 'utf8');
+  assert.ok(docs.includes('# MCP Tool Reference'), 'docs/tools.md should have the generated reference title');
+  for (const toolName of ['inspect_project_capabilities', 'suggest_scene_patch', 'apply_scene_patch', 'capture_scene_preview']) {
+    assert.ok(docs.includes(`## ${toolName}`), `docs/tools.md missing ${toolName}`);
+  }
+}
+
 async function runAlwaysSmoke({ godotPathForServer }) {
   const client = new McpStdioClient({ godotPath: godotPathForServer });
   try {
@@ -437,6 +447,9 @@ async function runAlwaysSmoke({ godotPathForServer }) {
       assert.ok(toolNames.includes(tool), `tools/list missing ${tool}`);
     }
     logPass('tools/list');
+
+    assertGeneratedToolDocs();
+    logPass('generated tool docs');
 
     const missingProject = path.join(tmpdir(), `godot-mcp-missing-${Date.now()}`);
     await expectStructuredError(client, 'inspect_project_capabilities', { projectPath: missingProject }, 'PROJECT_PATH_NOT_FOUND');

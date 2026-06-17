@@ -90,6 +90,22 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
   - Get UID for specific files
   - Update UID references by resaving resources
 
+## Tool Reference
+
+The generated MCP tool reference is available in [docs/tools.md](docs/tools.md). It is generated from `src/tools/schemas.ts`, so it reflects the actual tool names, descriptions, required fields, property types, enums, and compact JSON skeletons registered by the server.
+
+Regenerate it after changing tool schemas:
+
+```bash
+npm run docs:tools
+```
+
+`docs/tools.md` should be updated in the same change as any schema edit. To verify the generated file is current, run:
+
+```bash
+npm run check:docs
+```
+
 ## Requirements
 
 - [Godot Engine](https://godotengine.org/download) installed on your system
